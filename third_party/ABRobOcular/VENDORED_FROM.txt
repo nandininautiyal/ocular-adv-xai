@@ -1,0 +1,4 @@
+﻿Source: https://github.com/Bharath-K3/ABRobOcular
+Commit: 7d117b75ed70021c68d8d522dbb749c8ea7197c5
+Vendored on: 2026-09-12
+Note: No LICENSE file present in the source repo at the time of vendoring. The repo's README displays an Apache-2.0 license badge; no separate LICENSE file was found to copy.
