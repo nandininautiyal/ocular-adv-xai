@@ -18,4 +18,5 @@ seaborn>=0.12
 
 pyyaml>=6.0
 tqdm>=4.66
-jupyter>=1.0
+ipykernel>=6.29
+datasets==2.19.1
