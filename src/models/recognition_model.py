@@ -5,7 +5,7 @@ Xception + ArcFace recognition model, matching ABRobOcular's architecture:
 Xception backbone -> Dense(1024, relu) -> Dropout(0.5) -> ArcFace head.
 """
 import tensorflow as tf
-from tensorflow.keras import layers, Model, Input
+from tensorflow.keras import layers, Model, Input  # type: ignore[reportMissingModuleSource]
 
 
 class ArcFace(layers.Layer):

@@ -21,7 +21,7 @@ print("Loading dataset...")
 ds = load_dataset("BharathK333/ABRobOcular_Attacks")["train"]
 
 images = np.stack([np.array(img.convert("RGB").resize((256, 256))) for img in ds["image"]])
-images = images.astype("float32") / 255.0
+images = tf.keras.applications.xception.preprocess_input(images.astype("float32"))
 
 le = LabelEncoder()
 labels = le.fit_transform(ds["label"])
