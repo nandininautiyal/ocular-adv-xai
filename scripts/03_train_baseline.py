@@ -57,7 +57,14 @@ def main():
     args = ap.parse_args()
 
     gpus = tf.config.list_physical_devices("GPU")
-    print("TF", tf.__version__, "| tf.keras:", tf.keras.__version__, "| GPUs:", gpus)
+    # FIX: legacy tf.keras has no __version__, so report which Keras is really in use
+    try:
+        import tf_keras
+        keras_info = f"tf_keras {tf_keras.__version__}"
+    except ImportError:
+        keras_info = "tf_keras NOT installed"
+    print("TF", tf.__version__, "|", keras_info,
+          "| tf.keras comes from:", tf.keras.Model.__module__, "| GPUs:", gpus)
     if not gpus:
         print("WARNING: no GPU found, this will be very slow")
     for g in gpus:
