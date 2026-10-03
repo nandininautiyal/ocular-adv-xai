@@ -1,8 +1,10 @@
 """
-src/models/recognition_model.py
+src/models/recognition_model_phase0.py
 
-Xception + ArcFace recognition model, matching ABRobOcular's architecture:
-Xception backbone -> Dense(1024, relu) -> Dropout(0.5) -> ArcFace head.
+Phase 0 smoke-test model: our own first re-implementation of Xception + ArcFace.
+Kept only as a record of the Phase 0 plumbing check (scripts/00_sanity_check.py).
+It differs from the paper's model (global average pooling instead of Flatten, no
+partial freezing), so do NOT use it for experiments. Use recognition_model.py.
 """
 import tensorflow as tf
 from tensorflow.keras import layers, Model, Input  # type: ignore[reportMissingModuleSource]
@@ -43,7 +45,7 @@ class ArcFace(layers.Layer):
 def build_recognition_model(num_classes, input_shape=(256, 256, 3)):
     """Returns (training_model, embedding_model).
     training_model: [image, one_hot_label] -> class probabilities (use for fit()).
-    embedding_model: image -> 1024-d embedding (use for prediction/XAI later).
+    embedding_model: image -> 1024-d embedding.
     """
     base = tf.keras.applications.Xception(
         include_top=False, weights="imagenet",
