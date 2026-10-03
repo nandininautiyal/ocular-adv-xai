@@ -13,9 +13,10 @@ Usage:
   python scripts/03_train_baseline.py --split-dir /tmp/ocular_small --n-classes 30 --epochs 2 --tag small
   python scripts/03_train_baseline.py --split-dir /tmp/ocular_recognition --n-classes 300 --epochs 10 --tag full
 """
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; must be set before importing tensorflow
 import argparse
 import json
-import os
 import sys
 import time
 
@@ -56,7 +57,7 @@ def main():
     args = ap.parse_args()
 
     gpus = tf.config.list_physical_devices("GPU")
-    print("TF", tf.__version__, "| GPUs:", gpus)
+    print("TF", tf.__version__, "| tf.keras:", tf.keras.__version__, "| GPUs:", gpus)
     if not gpus:
         print("WARNING: no GPU found, this will be very slow")
     for g in gpus:
