@@ -15,7 +15,7 @@ from tensorflow.keras.utils import to_categorical
 
 import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from src.models.recognition_model import build_recognition_model, predict_labels
+from src.models.recognition_model_phase0 import build_recognition_model, predict_labels
 
 print("Loading dataset...")
 ds = load_dataset("BharathK333/ABRobOcular_Attacks")["train"]
