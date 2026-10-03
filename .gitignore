@@ -10,3 +10,8 @@ outputs/*.pt
 outputs/*.h5
 *.ckpt
 .DS_Store
+*.h5
+*.keras
+trained_models/
+ocular_recognition/
+Adversarial_Images/
