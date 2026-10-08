@@ -1,0 +1,45 @@
+TF 2.20.0 | tf_keras 2.20.1 | tf.keras comes from: tf_keras.src.engine.training | GPUs: [PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU'), PhysicalDevice(name='/physical_device:GPU:1', device_type='GPU')]
+Found 41607 images belonging to 300 classes.
+Found 13866 images belonging to 300 classes.
+Found 13868 images belonging to 300 classes.
+classes found: 300 | train/val/test images: 41607/13866/13868
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1791432304.539472     205 gpu_device.cc:2020] Created device /job:localhost/replica:0/task:0/device:GPU:0 with 13756 MB memory:  -> device: 0, name: Tesla T4, pci bus id: 0000:00:04.0, compute capability: 7.5
+I0000 00:00:1791432304.543476     205 gpu_device.cc:2020] Created device /job:localhost/replica:0/task:0/device:GPU:1 with 13756 MB memory:  -> device: 1, name: Tesla T4, pci bus id: 0000:00:05.0, compute capability: 7.5
+Downloading data from https://storage.googleapis.com/tensorflow/keras-applications/xception/xception_weights_tf_dim_ordering_tf_kernels_notop.h5
+    8192/83683744 [..............................] - ETA: 0s 3940352/83683744 [>.............................] - ETA: 1s 6037504/83683744 [=>............................] - ETA: 1s15351808/83683744 [====>.........................] - ETA: 0s23142400/83683744 [=======>......................] - ETA: 0s33898496/83683744 [===========>..................] - ETA: 0s44630016/83683744 [==============>...............] - ETA: 0s54484992/83683744 [==================>...........] - ETA: 0s64962560/83683744 [======================>.......] - ETA: 0s73146368/83683744 [=========================>....] - ETA: 0s83683744/83683744 [==============================] - 1s 0us/step
+model parameters: 155,387,432
+Epoch 1/10
+I0000 00:00:1791432320.244667     254 device_compiler.h:196] Compiled cluster using XLA!  This line is logged at most once for the lifetime of the process.
+1301/1301 - 1369s - loss: 31.1700 - accuracy: 0.0013 - val_loss: 18.0436 - val_accuracy: 0.1866 - lr: 1.0000e-04 - 1369s/epoch - 1s/step
+Epoch 2/10
+1301/1301 - 999s - loss: 15.7623 - accuracy: 0.1021 - val_loss: 6.3142 - val_accuracy: 0.7159 - lr: 1.0000e-04 - 999s/epoch - 768ms/step
+Epoch 3/10
+1301/1301 - 1001s - loss: 6.5577 - accuracy: 0.4836 - val_loss: 3.4894 - val_accuracy: 0.8863 - lr: 1.0000e-04 - 1001s/epoch - 769ms/step
+Epoch 4/10
+1301/1301 - 994s - loss: 3.2882 - accuracy: 0.7690 - val_loss: 2.5215 - val_accuracy: 0.9216 - lr: 1.0000e-04 - 994s/epoch - 764ms/step
+Epoch 5/10
+1301/1301 - 1006s - loss: 2.1536 - accuracy: 0.8650 - val_loss: 1.9111 - val_accuracy: 0.9449 - lr: 1.0000e-04 - 1006s/epoch - 773ms/step
+Epoch 6/10
+1301/1301 - 995s - loss: 1.6975 - accuracy: 0.8986 - val_loss: 1.6994 - val_accuracy: 0.9517 - lr: 1.0000e-04 - 995s/epoch - 765ms/step
+Epoch 7/10
+1301/1301 - 1004s - loss: 1.3679 - accuracy: 0.9185 - val_loss: 1.9994 - val_accuracy: 0.9485 - lr: 1.0000e-04 - 1004s/epoch - 772ms/step
+Epoch 8/10
+1301/1301 - 1003s - loss: 1.1321 - accuracy: 0.9336 - val_loss: 1.6212 - val_accuracy: 0.9568 - lr: 1.0000e-04 - 1003s/epoch - 771ms/step
+Epoch 9/10
+1301/1301 - 1003s - loss: 0.9810 - accuracy: 0.9433 - val_loss: 1.2734 - val_accuracy: 0.9665 - lr: 1.0000e-04 - 1003s/epoch - 771ms/step
+Epoch 10/10
+1301/1301 - 1003s - loss: 0.8891 - accuracy: 0.9475 - val_loss: 1.4785 - val_accuracy: 0.9612 - lr: 1.0000e-04 - 1003s/epoch - 771ms/step
+training took 173.0 min for 10 epochs
+evaluating the best checkpoint
+TEST accuracy, margin-free (real inference): 0.9794
+TEST accuracy, with labels (model.evaluate-style): 0.9634
+{
+  "tag": "full",
+  "n_classes": 300,
+  "epochs_run": 10,
+  "minutes": 173.0,
+  "test_acc_margin_free": 0.979449091433516,
+  "test_acc_with_labels": 0.9633689068358812,
+  "checkpoint": "/kaggle/working/trained_models/Xception_ArcFace_full.keras"
+}
