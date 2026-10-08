@@ -1,0 +1,1 @@
+7f19820 Add CSV logging and verbosity option to training script
