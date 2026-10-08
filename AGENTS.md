@@ -40,5 +40,9 @@ This research project evaluates how adversarial attacks on ocular biometric mode
 - `Phase 4 (Compare)`: Heatmap divergence metrics (`src/compare/divergence.py`) using SSIM, L2, KL Divergence, and Cosine Similarity.
 - `Phase 5 (Orchestration)`: The end-to-end runner (`scripts/05_run_experiment.py`) requires a `.keras` checkpoint to execute.
 
----
-*Note: This file is automatically updated daily to reflect the latest changes in the repository.*
+## 🤖 Agent Directives (Meta-Rules)
+**To any AI agent reading this file:** 
+It is YOUR responsibility to help Deepanshu keep this file up to date. 
+1. Before concluding a major coding session, proactively ask Deepanshu: *"Should we update `AGENTS.md` to reflect the new changes we just made?"*
+2. If the team's workflow, roles, or pipeline architecture changes, you must immediately suggest updating this file.
+3. This file is our shared memory across all models (Claude, Gemini, etc.). Do not let it go stale.
