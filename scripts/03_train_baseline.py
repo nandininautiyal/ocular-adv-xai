@@ -23,7 +23,7 @@ import time
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.callbacks import CSVLogger, EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -51,6 +51,7 @@ def main():
     ap.add_argument("--n-classes", type=int, required=True)
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None)
+    ap.add_argument("--verbose", type=int, default=1)
     ap.add_argument("--tag", default="run")
     ap.add_argument("--out-dir", default="/kaggle/working/trained_models")
     ap.add_argument("--cfg", default=os.path.join(REPO, "configs", "baseline.yml"))
@@ -106,10 +107,12 @@ def main():
         ReduceLROnPlateau(monitor="val_loss", factor=t["reduce_lr_factor"],
                           patience=t["reduce_lr_patience"], min_lr=t["min_lr"]),
         ModelCheckpoint(ckpt, save_best_only=True, monitor="val_loss"),
+        CSVLogger(os.path.join(args.out_dir, f"log_{args.tag}.csv")),
     ]
 
     t0 = time.time()
-    hist = model.fit(train_gen, validation_data=val_gen, epochs=t["epochs"], callbacks=callbacks)
+    hist = model.fit(train_gen, validation_data=val_gen, epochs=t["epochs"], callbacks=callbacks,
+                    verbose=args.verbose)
     minutes = (time.time() - t0) / 60
     pd.DataFrame(hist.history).to_csv(os.path.join(args.out_dir, f"history_{args.tag}.csv"), index=False)
     print(f"training took {minutes:.1f} min for {len(hist.history['loss'])} epochs")
