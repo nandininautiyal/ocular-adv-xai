@@ -34,11 +34,14 @@ ocular-adv-xai/
   - fgsm_sample_run.py
   - ORIGINAL_README.md         original repo's README, untouched
   - VENDORED_FROM.txt          provenance: commit hash, date, notes
-- src/models/    our reproduction of the recognition model (Xception+ArcFace)
+- src/models/    wrapper around the reference model (Xception+ArcFace) and margin-free logits
 - src/attacks/    FGSM/BIM/MIM/PGD/CW, Patch Occlusion, Monocle Blending
-- src/defenses/    JPEG/Strip/EAT, unified defense
-- src/xai/          LayerCAM + Eigen-CAM wrappers, divergence metrics
-- src/compare/       clean vs attacked vs defended comparison pipeline
+- src/defences/    JPEG and bit-depth reduction (inference time); Strip and Patch
+  Augmentation (training time). EAT and the unified defense are training-time too.
+- src/xai/          LayerCAM + Eigen-CAM
+- src/compare/       heatmap divergence metrics (clean vs attacked vs defended)
+- scripts/       00-05: sanity check, manifest, splits, training, clean eval, experiment
+- tests/         pytest suite (CPU, tiny ArcFace model): python -m pytest tests -q
 - notebooks/     exploratory work
 - configs/         experiment configs
 - docs/             scoping report, proposal, meeting notes
