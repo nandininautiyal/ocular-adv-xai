@@ -11,6 +11,13 @@ This research project evaluates how adversarial attacks on ocular biometric mode
 - **Aindrila**: Collaborates on the repository.
 - **Workflow**: All major features should be developed on personal branches, raised as Draft PRs, and merged into `main` after review. Keep PRs small: one module plus its tests.
 - **Never push directly to `main` and never force-push or rewrite its history** (AI agents included). Commit with your real GitHub email (`git config user.email`); a placeholder email once forced a history rewrite of `main`.
+- **No AI attribution in commits or PRs:** no `Co-Authored-By` lines for AI tools and no "Generated with ..." footers. Commits are authored by the team member only.
+
+## Current Status (2026-10-14)
+- Done: baseline training (97.94 % margin-free), clean evaluation (`outputs/baseline_run/correct_test_full.csv`, 13,585 of 13,868 test images correct), reference-attack smoke test (`06`, PR #10).
+- PR #11 (`deepanshu` → `main`, draft): corrected attacks, defences, XAI, divergence, runner `05`, 58 CPU tests, pinned `requirements.txt`. Waiting for review.
+- Not done yet: `05_run_experiment.py` has never been run on the real checkpoint. Next step after PR #11 merges is a Kaggle dry run (`--max-images 20`), checking that attack success rises with epsilon and BIM/PGD are at least as strong as FGSM, then the full run (`--per-class 2`).
+- `06_attack_smoke.py` uses the vendored attacks; its numbers (BIM 6 % < FGSM 37 % at eps 0.001) reflect their bugs and are for paper replication only.
 
 ## Where Things Live
 - **Checkpoint:** `Xception_ArcFace_full.keras` (1.7 GB, 300 classes, test accuracy 97.94 % margin-free) is a Kaggle output, shared as a private Kaggle Dataset. **Never commit `.keras` / `.h5` files** (GitHub's limit is 100 MB; `.gitignore` excludes them).
