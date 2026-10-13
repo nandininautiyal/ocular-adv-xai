@@ -9,6 +9,9 @@ import os
 import sys
 import yaml
 
+# The vendored train.py imports tensorflow; legacy Keras must be selected first.
+os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+
 _THIRD_PARTY = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "third_party", "ABRobOcular")
 )
