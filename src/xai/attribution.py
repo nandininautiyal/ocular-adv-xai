@@ -4,20 +4,34 @@ src/xai/attribution.py
 LayerCAM and Eigen-CAM heatmap generation for the Xception + ArcFace
 dual-input recognition model.
 
-All functions are pure: they accept a model, a preprocessed image, and
-return a heatmap ndarray of shape (H, W) with values in [0, 1].
+All functions are pure: they accept a model and preprocessed image(s) and
+return heatmap(s) with values in [0, 1].
 
 Image contract
 --------------
 - dtype : float32
-- shape : (256, 256, 3)
+- shape : (256, 256, 3), or (N, 256, 256, 3) for a batch
 - range : [0, 1]
 
 Model contract
 --------------
-The model has two inputs: [image_input, label_input].
-During inference / explanation the label input is a zero vector of shape
-(1, n_classes).  All helpers in this module handle that automatically.
+The model has two inputs: [image_input, label_input]. Explanations use the
+margin-free path (zero label vector) through ``src.models.arcface_inference``.
+
+Choices that matter for the heatmap-divergence study
+----------------------------------------------------
+- Target layer: the last 4-D activation before the head (``block14_sepconv2_act``
+  for Xception). The raw ``block14_sepconv2`` output is pre-BatchNorm and can be
+  negative, which both methods assume it is not.
+- Class score: the margin-free cosine logit ``s * cos(theta_k)``. The vendored
+  ArcFace layer applies softmax inside call(); with s = 64 the top probability
+  rounds to 1.0, so gradients of the softmax output are numerical noise.
+- Eigen-CAM sign: an SVD singular vector is only defined up to sign, so the map
+  can come out inverted. The component is flipped to correlate positively with
+  the summed activations, which makes the map deterministic.
+- Resolution: the Xception feature map is only 8 x 8 for a 256 x 256 input.
+  Pass ``size=None`` to get the native map; compare metrics on native maps and
+  upsample only for display.
 """
 
 import os
@@ -26,172 +40,128 @@ os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 import numpy as np
 import tensorflow as tf
 
+from src.models.arcface_inference import as_batch, find_feature_layer, get_margin_free
+
+DEFAULT_SIZE = (256, 256)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_n_classes(model):
-    """Return n_classes from the model's label-input shape."""
-    # model.input is [image_input, label_input]
-    label_shape = model.input[1].shape  # (None, n_classes)
-    return int(label_shape[-1])
+def _min_max(maps):
+    """Scale each map in a (N, h, w) array to [0, 1]; constant maps become 0."""
+    lo = maps.min(axis=(1, 2), keepdims=True)
+    span = maps.max(axis=(1, 2), keepdims=True) - lo
+    return np.where(span > 0, (maps - lo) / np.where(span > 0, span, 1.0), 0.0).astype(np.float32)
 
 
-def _dummy_labels(n_classes, batch=1):
-    """Zero label vector used during inference (no ArcFace margin)."""
-    return np.zeros((batch, n_classes), dtype="float32")
-
-
-def _find_last_conv_layer(model):
-    """Walk the model and return the name of the last Conv2D layer.
-
-    In the Xception + ArcFace architecture this is the final depthwise or
-    pointwise convolution inside the Xception base, which is the correct
-    target for class-activation-map methods.
-    """
-    last_conv = None
-    for layer in model.layers:
-        if isinstance(layer, (tf.keras.layers.Conv2D,
-                              tf.keras.layers.DepthwiseConv2D,
-                              tf.keras.layers.SeparableConv2D)):
-            last_conv = layer.name
-    if last_conv is None:
-        raise ValueError("No Conv2D / DepthwiseConv2D / SeparableConv2D layer found in model")
-    return last_conv
-
-
-def _build_grad_model(model, target_layer_name):
-    """Build a sub-model that outputs [conv_outputs, predictions].
-
-    This avoids re-running a forward pass twice and lets GradientTape
-    watch the conv output tensor.
-    """
-    target_layer = model.get_layer(target_layer_name)
-    grad_model = tf.keras.Model(
-        inputs=model.inputs,
-        outputs=[target_layer.output, model.output],
-    )
-    return grad_model
+def _finish(maps, size, single):
+    """Normalise, optionally resize (bilinear), and drop the batch axis for single images."""
+    maps = _min_max(maps)
+    if size is not None:
+        maps = tf.image.resize(maps[..., np.newaxis], size)[..., 0].numpy()
+        maps = np.clip(maps, 0.0, 1.0).astype(np.float32)
+    return maps[0] if single else maps
 
 
 # ---------------------------------------------------------------------------
 # LayerCAM  (Jiang et al., 2021)
 # ---------------------------------------------------------------------------
 
-def layercam(model, image, target_layer=None, class_idx=None):
+def layercam(model, image, class_idx=None, target_layer=None, size=DEFAULT_SIZE):
     """Generate a LayerCAM heatmap for *image*.
 
     Parameters
     ----------
     model : tf.keras.Model
         The dual-input Xception + ArcFace model.
-    image : np.ndarray, shape (256, 256, 3), dtype float32, range [0, 1]
-        A single preprocessed ocular image.
+    image : np.ndarray, (256, 256, 3) or (N, 256, 256, 3), float32, [0, 1]
+    class_idx : int, sequence of int, or None
+        Class to explain (one per image for a batch). If *None*, the predicted
+        class is used. To study attention shift, explain the true class at every
+        stage (clean, attacked, defended) rather than each stage's prediction.
     target_layer : str or None
-        Name of the convolutional layer to explain.  If *None*, the last
-        Conv2D layer in the model is used automatically.
-    class_idx : int or None
-        Class index to explain.  If *None*, the predicted class is used.
+        Layer to explain. Defaults to the last 4-D activation (block14_sepconv2_act).
+    size : (int, int) or None
+        Output resolution. *None* returns the native feature-map resolution.
 
     Returns
     -------
-    heatmap : np.ndarray, shape (256, 256), dtype float32, range [0, 1]
-        The LayerCAM attribution map, resized to the input resolution.
+    heatmap : np.ndarray, (H, W) or (N, H, W), float32, range [0, 1]
     """
-    if target_layer is None:
-        target_layer = _find_last_conv_layer(model)
-
-    n_classes = _get_n_classes(model)
-    img_tensor = tf.cast(tf.expand_dims(image, 0), tf.float32)
-    dummy = tf.constant(_dummy_labels(n_classes))
-
-    grad_model = _build_grad_model(model, target_layer)
+    x, single = as_batch(image)
+    target_layer = target_layer or find_feature_layer(model)
+    net = get_margin_free(model, target_layer)
 
     with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model([img_tensor, dummy])
+        features, logits = net(x)
         if class_idx is None:
-            class_idx = tf.argmax(predictions[0]).numpy()
-        class_score = predictions[0, class_idx]
+            idx = tf.argmax(logits, axis=1, output_type=tf.int32)
+        else:
+            idx = tf.reshape(tf.constant(class_idx, dtype=tf.int32), [-1])
+            idx = tf.broadcast_to(idx, [tf.shape(x)[0]])
+        score = tf.reduce_sum(tf.gather(logits, idx, axis=1, batch_dims=1))
 
-    grads = tape.gradient(class_score, conv_outputs)          # (1, h, w, c)
-    conv_outputs = conv_outputs[0]                            # (h, w, c)
-    grads = grads[0]                                          # (h, w, c)
+    grads = tape.gradient(score, features)                        # (N, h, w, c)
 
-    # LayerCAM: element-wise product of ReLU(gradients) and activations,
-    # then sum over channels.
-    weights = tf.nn.relu(grads)                               # (h, w, c)
-    cam = tf.reduce_sum(weights * conv_outputs, axis=-1)      # (h, w)
-    cam = tf.nn.relu(cam)                                     # discard negatives
-
-    # Resize to input spatial dimensions
-    cam = tf.image.resize(cam[..., tf.newaxis], (256, 256))[..., 0]
-
-    # Normalise to [0, 1]
-    cam_max = tf.reduce_max(cam)
-    if cam_max > 0:
-        cam = cam / cam_max
-
-    return cam.numpy().astype(np.float32)
+    # LayerCAM: ReLU(gradients) weight each activation location, sum over channels.
+    cams = tf.nn.relu(tf.reduce_sum(tf.nn.relu(grads) * features, axis=-1))
+    return _finish(cams.numpy(), size, single)
 
 
 # ---------------------------------------------------------------------------
 # Eigen-CAM  (Muhammad & Yeasin, 2020)
 # ---------------------------------------------------------------------------
 
-def eigencam(model, image, target_layer=None):
+def _eigen_projection(activations):
+    """Projection of one (h, w, c) activation map on its first singular vector.
+
+    Uncentred, as in the Eigen-CAM paper. The singular vector's sign is
+    arbitrary, so it is aligned with the total activation: the salient region is
+    then always the high end of the map, whatever sign LAPACK returns.
+    """
+    h, w, c = activations.shape
+    flat = activations.reshape(h * w, c).astype(np.float64)
+    _, _, vt = np.linalg.svd(flat, full_matrices=False)
+    projection = flat @ vt[0]
+    if np.dot(projection, flat.sum(axis=1)) < 0:
+        projection = -projection
+    return projection.reshape(h, w)
+
+
+def eigencam(model, image, target_layer=None, size=DEFAULT_SIZE):
     """Generate an Eigen-CAM heatmap for *image*.
 
-    Eigen-CAM is gradient-free: it computes the first principal component of
-    the activation map at the target convolutional layer.
+    Eigen-CAM is gradient-free and class-agnostic: it projects the activations
+    at the target layer onto their first principal component.
 
     Parameters
     ----------
     model : tf.keras.Model
         The dual-input Xception + ArcFace model.
-    image : np.ndarray, shape (256, 256, 3), dtype float32, range [0, 1]
-        A single preprocessed ocular image.
+    image : np.ndarray, (256, 256, 3) or (N, 256, 256, 3), float32, [0, 1]
     target_layer : str or None
-        Name of the convolutional layer to explain.  If *None*, the last
-        Conv2D layer in the model is used automatically.
+        Layer to explain. Defaults to the last 4-D activation (block14_sepconv2_act).
+    size : (int, int) or None
+        Output resolution. *None* returns the native feature-map resolution.
 
     Returns
     -------
-    heatmap : np.ndarray, shape (256, 256), dtype float32, range [0, 1]
-        The Eigen-CAM attribution map, resized to the input resolution.
+    heatmap : np.ndarray, (H, W) or (N, H, W), float32, range [0, 1]
     """
-    if target_layer is None:
-        target_layer = _find_last_conv_layer(model)
+    x, single = as_batch(image)
+    target_layer = target_layer or find_feature_layer(model)
+    features, _ = get_margin_free(model, target_layer)(x)
+    maps = np.stack([_eigen_projection(a) for a in features.numpy()])
+    return _finish(maps, size, single)
 
-    n_classes = _get_n_classes(model)
-    img_tensor = tf.cast(tf.expand_dims(image, 0), tf.float32)
-    dummy = tf.constant(_dummy_labels(n_classes))
 
-    # Forward pass to get conv activations only
-    activation_model = tf.keras.Model(
-        inputs=model.inputs,
-        outputs=model.get_layer(target_layer).output,
-    )
-    activations = activation_model([img_tensor, dummy])       # (1, h, w, c)
-    activations = activations[0].numpy()                      # (h, w, c)
+# ---------------------------------------------------------------------------
+# Registry for easy iteration in evaluation scripts
+# ---------------------------------------------------------------------------
 
-    h, w, c = activations.shape
-    # Reshape to 2-D matrix: (h*w, c) — each spatial location is a sample
-    reshaped = activations.reshape(h * w, c)
-
-    # SVD → first right-singular vector is the first principal component
-    # Project activations onto it to get a (h*w,) saliency vector
-    _, _, Vt = np.linalg.svd(reshaped, full_matrices=False)
-    projection = reshaped @ Vt[0]                             # (h*w,)
-    cam = projection.reshape(h, w)
-
-    # Normalise to [0, 1]
-    cam = cam - cam.min()
-    cam_max = cam.max()
-    if cam_max > 0:
-        cam = cam / cam_max
-
-    # Resize to input resolution
-    cam = tf.image.resize(cam[..., np.newaxis], (256, 256))[..., 0]
-
-    return cam.numpy().astype(np.float32)
+XAI_REGISTRY = {
+    "layercam": layercam,
+    "eigencam": eigencam,
+}
