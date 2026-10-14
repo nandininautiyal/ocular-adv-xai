@@ -1,9 +1,0 @@
-{
-  "tag": "full",
-  "n_classes": 300,
-  "epochs_run": 10,
-  "minutes": 173.0,
-  "test_acc_margin_free": 0.979449091433516,
-  "test_acc_with_labels": 0.9633689068358812,
-  "checkpoint": "/kaggle/working/trained_models/Xception_ArcFace_full.keras"
-}
