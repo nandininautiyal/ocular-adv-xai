@@ -16,6 +16,7 @@ def test_identical_maps():
     r = compare_heatmaps(m, m)
     assert r["spearman"] == pytest.approx(1.0)
     assert r["top10_intersection"] == 1.0
+    assert r["top25_intersection"] == 1.0
     assert r["js"] == pytest.approx(0.0, abs=1e-12)
     assert r["cosine"] == pytest.approx(1.0)
     assert r["l2"] == 0.0
@@ -32,8 +33,8 @@ def test_shifted_attention_is_detected():
     assert r["com_shift"] > 0.2
 
 
-def test_constant_map_gives_no_nan():
-    assert spearman(np.zeros((8, 8)), blob(3, 3)) == 0.0
+def test_constant_map_gives_nan_spearman():
+    assert np.isnan(spearman(np.zeros((8, 8)), blob(3, 3)))
     assert np.isfinite(kl_divergence(blob(3, 3), np.zeros((8, 8))))
     assert centre_of_mass_shift(np.zeros((8, 8)), np.zeros((8, 8))) == 0.0
 

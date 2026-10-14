@@ -32,11 +32,11 @@ def spearman(heatmap_a, heatmap_b):
     Returns
     -------
     score : float in [-1, 1]
-        1.0 = same ranking of locations. 0.0 if either map is constant.
+        1.0 = same ranking of locations. NaN if either map is constant.
     """
     a, b = np.ravel(heatmap_a), np.ravel(heatmap_b)
     if np.ptp(a) == 0 or np.ptp(b) == 0:
-        return 0.0
+        return float("nan")
     return float(spearmanr(a, b).correlation)
 
 
@@ -177,6 +177,7 @@ def centre_of_mass_shift(heatmap_a, heatmap_b):
 METRICS = {
     "spearman": spearman,
     "top10_intersection": top_k_intersection,
+    "top25_intersection": lambda a, b: top_k_intersection(a, b, k=0.25),
     "js": js_divergence,
     "cosine": cosine_similarity,
     "l2": l2_distance,
