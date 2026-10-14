@@ -11,8 +11,9 @@ Image contract
 Two families
 ------------
 fgsm, bim, pgd, mim, cw
-    Standard formulations on the margin-free ArcFace logits (cross-entropy from
-    logits, projection onto the epsilon ball after every step). Use these for
+    Standard formulations on the margin-free ArcFace logits (margin loss by
+    default; cross-entropy remains selectable, projection onto the epsilon ball
+    after every step). Use these for
     the XAI study. ``epsilon`` is an L-inf budget on the [0, 1] pixel scale and
     has no default on purpose: pick it explicitly (e.g. 1/255, 2/255, 8/255).
     Cross-entropy gradients underflow in float32 once the top-1 / top-2 logit
@@ -64,13 +65,29 @@ def _labels(net, x, label):
     return tf.broadcast_to(labels, [tf.shape(x)[0]])
 
 
-def _loss_gradient(net, x, labels):
-    """Gradient of the summed cross-entropy (from logits) w.r.t. the images."""
+def _loss_gradient(net, x, labels, loss="margin"):
+    """Gradient of the attack loss w.r.t. the images.
+
+    loss="ce"     : summed cross-entropy from logits (textbook). With ArcFace scale s = 64 the
+                    softmax of a confident prediction rounds p_y to exactly 1.0 in float32, so the
+                    true-class term of the gradient (p_y - 1) is exactly zero and only the
+                    runner-up terms remain.
+    loss="margin" : (best other logit) - (true logit). Never saturates.
+    """
+    if loss not in ("ce", "margin"):
+        raise ValueError(f"loss must be 'ce' or 'margin', got {loss!r}")
     with tf.GradientTape() as tape:
         tape.watch(x)
-        loss = tf.reduce_sum(
-            tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=net(x)))
-    return tape.gradient(loss, x)
+        logits = net(x)
+        if loss == "ce":
+            value = tf.reduce_sum(
+                tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits))
+        else:
+            one_hot = tf.one_hot(labels, tf.shape(logits)[1])
+            true_logit = tf.reduce_sum(one_hot * logits, axis=1)
+            best_other = tf.reduce_max(logits - 1e9 * one_hot, axis=1)
+            value = tf.reduce_sum(best_other - true_logit)
+    return tape.gradient(value, x)
 
 
 def _project(x_adv, x, epsilon):
@@ -87,7 +104,7 @@ def _output(x, single):
 # Standard attacks — each returns the same shape as its input
 # ---------------------------------------------------------------------------
 
-def fgsm(image, model, epsilon, label=None):
+def fgsm(image, model, epsilon, label=None, loss="margin"):
     """Fast Gradient Sign Method (Goodfellow et al., 2015).
 
     Parameters
@@ -96,6 +113,7 @@ def fgsm(image, model, epsilon, label=None):
     model : tf.keras.Model with dual inputs [image, label]
     epsilon : float — L-inf budget on the [0, 1] scale
     label : int, sequence of int, or None — true class; None uses the clean prediction
+    loss : {"margin", "ce"} — attack loss; defaults to "margin"
 
     Returns
     -------
@@ -103,11 +121,11 @@ def fgsm(image, model, epsilon, label=None):
     """
     x, single = as_batch(image)
     net = get_margin_free(model)
-    gradient = _loss_gradient(net, x, _labels(net, x, label))
+    gradient = _loss_gradient(net, x, _labels(net, x, label), loss)
     return _output(_project(x + epsilon * tf.sign(gradient), x, epsilon), single)
 
 
-def bim(image, model, epsilon, label=None, steps=10, step_size=None):
+def bim(image, model, epsilon, label=None, steps=10, step_size=None, loss="margin"):
     """Basic Iterative Method (Kurakin et al., 2017): iterated FGSM, projected every step.
 
     Parameters
@@ -118,6 +136,7 @@ def bim(image, model, epsilon, label=None, steps=10, step_size=None):
     label : int, sequence of int, or None
     steps : int — number of gradient steps
     step_size : float or None — defaults to epsilon / steps
+    loss : {"margin", "ce"} — attack loss; defaults to "margin"
 
     Returns
     -------
@@ -129,11 +148,11 @@ def bim(image, model, epsilon, label=None, steps=10, step_size=None):
     alpha = epsilon / steps if step_size is None else step_size
     x = tf.identity(x0)
     for _ in range(steps):
-        x = _project(x + alpha * tf.sign(_loss_gradient(net, x, labels)), x0, epsilon)
+        x = _project(x + alpha * tf.sign(_loss_gradient(net, x, labels, loss)), x0, epsilon)
     return _output(x, single)
 
 
-def pgd(image, model, epsilon, label=None, steps=10, step_size=None, random_start=True, seed=0):
+def pgd(image, model, epsilon, label=None, steps=10, step_size=None, random_start=True, seed=0, loss="margin"):
     """Projected Gradient Descent (Madry et al., 2018).
 
     Uniform random start inside the epsilon ball (seeded, so the function is
@@ -149,6 +168,7 @@ def pgd(image, model, epsilon, label=None, steps=10, step_size=None, random_star
     step_size : float or None — defaults to 2.5 * epsilon / steps
     random_start : bool
     seed : int — seed for the random start
+    loss : {"margin", "ce"} — attack loss; defaults to "margin"
 
     Returns
     -------
@@ -164,11 +184,11 @@ def pgd(image, model, epsilon, label=None, steps=10, step_size=None, random_star
                                             minval=-epsilon, maxval=epsilon)
         x = _project(x0 + noise, x0, epsilon)
     for _ in range(steps):
-        x = _project(x + alpha * tf.sign(_loss_gradient(net, x, labels)), x0, epsilon)
+        x = _project(x + alpha * tf.sign(_loss_gradient(net, x, labels, loss)), x0, epsilon)
     return _output(x, single)
 
 
-def mim(image, model, epsilon, label=None, steps=10, decay=1.0, step_size=None):
+def mim(image, model, epsilon, label=None, steps=10, decay=1.0, step_size=None, loss="margin"):
     """Momentum Iterative Method (Dong et al., 2018).
 
     The momentum accumulates L1-normalised gradients; every step is projected.
@@ -182,6 +202,7 @@ def mim(image, model, epsilon, label=None, steps=10, decay=1.0, step_size=None):
     steps : int
     decay : float — momentum decay factor (mu)
     step_size : float or None — defaults to epsilon / steps
+    loss : {"margin", "ce"} — attack loss; defaults to "margin"
 
     Returns
     -------
@@ -194,14 +215,14 @@ def mim(image, model, epsilon, label=None, steps=10, decay=1.0, step_size=None):
     x = tf.identity(x0)
     momentum = tf.zeros_like(x0)
     for _ in range(steps):
-        gradient = _loss_gradient(net, x, labels)
+        gradient = _loss_gradient(net, x, labels, loss)
         l1 = tf.reduce_mean(tf.abs(gradient), axis=[1, 2, 3], keepdims=True)
         momentum = decay * momentum + gradient / tf.maximum(l1, 1e-12)
         x = _project(x + alpha * tf.sign(momentum), x0, epsilon)
     return _output(x, single)
 
 
-def cw(image, model, label=None, kappa=0.0, steps=50, binary_steps=4,
+def cw(image, model, epsilon=None, label=None, kappa=0.0, steps=50, binary_steps=4,
        initial_const=1.0, learning_rate=0.01):
     """Carlini-Wagner L2 attack, untargeted (Carlini & Wagner, 2017).
 
@@ -215,6 +236,7 @@ def cw(image, model, label=None, kappa=0.0, steps=50, binary_steps=4,
     ----------
     image : ndarray (256, 256, 3) or (N, 256, 256, 3), float32, [0, 1]
     model : tf.keras.Model with dual inputs [image, label]
+    epsilon : ignored, CW has no budget (kept so registry calls are uniform)
     label : int, sequence of int, or None
     kappa : float — confidence margin
     steps : int — Adam steps per binary-search step
@@ -320,8 +342,8 @@ def paper_pgd(image, model, epsilon=0.001, num_steps=10, step_size=0.0001):
                   num_steps=num_steps, step_size=step_size)
 
 
-def paper_cw(image, model, learning_rate=0.001, max_iter=10, num_starts=5):
-    """Vendored "CW" (not Carlini-Wagner; non-deterministic). See the module docstring."""
+def paper_cw(image, model, epsilon=None, learning_rate=0.001, max_iter=10, num_starts=5):
+    """Vendored "CW" (not Carlini-Wagner; non-deterministic). Epsilon is ignored for registry uniformity."""
     return _paper("cw_attack_face", image, model, learning_rate=learning_rate,
                   max_iter=max_iter, num_starts=num_starts)
 

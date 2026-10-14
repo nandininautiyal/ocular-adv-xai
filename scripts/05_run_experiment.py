@@ -149,7 +149,7 @@ class Evaluator:
 
 
 def summarise(rows):
-    """Per-condition rates and median metrics."""
+    """Per-condition rates, NaN-aware mean metrics, and per-metric NaN counts."""
     rows = rows.copy()
     rows["epsilon"] = rows["epsilon"].map(lambda e: "" if pd.isna(e) else f"{e:.6g}")
     rows[["attack", "defence"]] = rows[["attack", "defence"]].fillna("")
@@ -178,8 +178,13 @@ def summarise(rows):
     rows["success"] = ~rows["correct"]
     group = KEYS + ["xai", "target", "success"]
     metrics = [c for c in rows.columns if c in METRICS or c.startswith("vs_defended_clean_")]
-    table = rows.groupby(group, dropna=False)[metrics].median()
-    table.insert(0, "n", rows.groupby(group, dropna=False).size())
+    grouped = rows.groupby(group, dropna=False)
+    table = pd.DataFrame(index=grouped.size().index)
+    for metric in metrics:
+        table[metric] = grouped[metric].agg(
+            lambda values: float(np.nanmean(values)) if values.notna().any() else float("nan"))
+        table[f"{metric}_nan_count"] = grouped[metric].agg(lambda values: int(values.isna().sum()))
+    table.insert(0, "n", grouped.size())
     return rates, table.reset_index()
 
 
@@ -287,7 +292,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     rows.to_csv(os.path.join(args.out_dir, f"rows_{args.tag}.csv"), index=False)
     table.to_csv(os.path.join(args.out_dir, f"summary_{args.tag}.csv"), index=False)
-    summary = {"tag": args.tag, "ckpt": args.ckpt, "impl": args.impl, "n_images": int(len(df)),
+    summary = {"tag": args.tag, "ckpt": args.ckpt, "impl": args.impl,
+               "attack_loss": "margin (standard attacks)" if args.impl == "standard" else "vendored paper loss",
+               "n_images": int(len(df)),
                "epsilons": epsilons, "attacks": attacks, "defences": defences, "xai": xai_names,
                "minutes": round((time.time() - t0) / 60, 1), **rates}
     with open(os.path.join(args.out_dir, f"summary_{args.tag}.json"), "w") as f:
