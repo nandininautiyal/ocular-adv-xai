@@ -3,46 +3,61 @@
 This file provides critical context, strict coding guidelines, and the current state of the repository for any AI agent assisting on this project. **Always read this file before suggesting architectural changes.**
 
 ## Project Goal
-This research project evaluates how adversarial attacks on ocular biometric models (specifically **Xception + ArcFace**) affect their Explainable AI (XAI) heatmaps, and whether defences can restore the original heatmaps (Divergence analysis).
+This research project evaluates how adversarial attacks on ocular biometric models (specifically **Xception + ArcFace**) affect their Explainable AI (XAI) heatmaps, and whether defences can restore the original heatmaps (Divergence analysis). The README's longer-term question is whether heatmap shifts can *detect and attribute* attacks without labelled adversarial training data; note that clean-vs-attacked divergence needs the clean image, which a deployed system does not have, so detection needs reference-free signals (e.g. heatmap(x) vs heatmap(JPEG(x))).
 
 ## Team Roles & Workflow
 - **Nandini**: Handles the heavy model training on Kaggle (e.g., `03_train_baseline.py` for 155M parameters, 10 epochs). She provides the `.keras` model checkpoints.
 - **Deepanshu (You)**: Handles the evaluation pipeline, XAI heatmaps, attack wrappers, and defences.
-- **Andrilla**: Collaborates on the repository.
-- **Workflow**: All major features should be developed on personal branches, raised as Draft PRs, and merged into `main` after review.
+- **Aindrila**: Collaborates on the repository.
+- **Workflow**: All major features should be developed on personal branches, raised as Draft PRs, and merged into `main` after review. Keep PRs small: one module plus its tests.
+- **Never push directly to `main` and never force-push or rewrite its history** (AI agents included). Commit with your real GitHub email (`git config user.email`); a placeholder email once forced a history rewrite of `main`.
+- **No AI attribution in commits or PRs:** no `Co-Authored-By` lines for AI tools and no "Generated with ..." footers. Commits are authored by the team member only.
+
+## Current Status (2026-10-14)
+- Done: baseline training (97.94 % margin-free), clean evaluation (`outputs/baseline_run/correct_test_full.csv`, 13,585 of 13,868 test images correct), reference-attack smoke test (`06`, PR #10).
+- PR #11 (`deepanshu` → `main`, draft): corrected attacks, defences, XAI, divergence, runner `05`, 58 CPU tests, pinned `requirements.txt`. Waiting for review.
+- Not done yet: `05_run_experiment.py` has never been run on the real checkpoint. Next step after PR #11 merges is a Kaggle dry run (`--max-images 20`), checking that attack success rises with epsilon and BIM/PGD are at least as strong as FGSM, then the full run (`--per-class 2`).
+- `06_attack_smoke.py` uses the vendored attacks; its numbers (BIM 6 % < FGSM 37 % at eps 0.001) reflect their bugs and are for paper replication only.
+
+## Where Things Live
+- **Checkpoint:** `Xception_ArcFace_full.keras` (1.7 GB, 300 classes, test accuracy 97.94 % margin-free) is a Kaggle output, shared as a private Kaggle Dataset. **Never commit `.keras` / `.h5` files** (GitHub's limit is 100 MB; `.gitignore` excludes them).
+- **Experiments run on Kaggle**, next to the checkpoint and the VISOB data: `01` → `02` → `04_eval_clean.py` (writes the correct-image list) → `05_run_experiment.py`.
+- **Environment:** TF 2.20 with `tf-keras` 2.20.x (the versions the checkpoint was trained with); `opencv-python-headless<5` (OpenCV 5 removed the Haar cascades that Monocle Blending needs).
 
 ## Architecture & Codebase Structure
 - **Vendored Code:** The `third_party/ABRobOcular/` directory contains reference implementations of the ArcFace model, data loaders, and attacks. **NEVER modify files inside `third_party/`**.
-- **Model Signature:** The core model is an Xception base with an ArcFace head. It requires **dual inputs**: `[image, label]`. 
-- **Inference Rules:** During inference, attacks, or XAI generation, the `label` input MUST be a zero vector of shape `(1, 300)` to bypass the ArcFace margin penalty.
-- **Image Contract:** All functions handling images must expect/return shape `(256, 256, 3)`, dtype `float32`, bounded in `[0, 1]`.
+- **Model Signature:** The core model is an Xception base with an ArcFace head. It requires **dual inputs**: `[image, label]`.
+- **Inference Rules:** During inference, attacks, or XAI generation, the `label` input MUST be a zero vector of shape `(N, n_classes)` to bypass the ArcFace margin penalty. Read `n_classes` from the model (`model.inputs[1].shape[-1]`) instead of hard-coding 300.
+- **The vendored ArcFace layer returns softmax probabilities, not logits.** With scale s = 64 the top probability is exactly 1.0 for confident predictions, so its gradient vanishes. Anything that needs gradients (XAI, attacks) must use the margin-free cosine logits from `src/models/arcface_inference.py` (`get_margin_free(model)`). In eager code, never compute cross-entropy on `model.output`: Keras clips probabilities to [1e-7, 1 - 1e-7] and the clip has zero gradient (`model.fit` only works because graph mode reads the logits out of the Softmax op).
+- **Image Contract:** All functions handling images must expect/return shape `(256, 256, 3)` (or a batch `(N, 256, 256, 3)`), dtype `float32`, bounded in `[0, 1]`.
 
 ## Strict Coding Guidelines
-1. **TensorFlow & Keras Legacy:** 
+1. **TensorFlow & Keras Legacy:**
    You MUST set the environment variable `TF_USE_LEGACY_KERAS = "1"` before importing TensorFlow to ensure compatibility with `tf_keras`.
    ```python
    import os
    os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
    import tensorflow as tf
    ```
-2. **Re-use, Don't Re-invent:** 
-   When implementing standard attacks (FGSM, BIM, PGD, CW, MIM), do not write the gradient logic yourself. Instead, write thin wrappers in `src/attacks/whitebox.py` that call the `_face` methods in `third_party.ABRobOcular.AB_Rob_Ocular.AB_Rob_Ocular_Tensor.OcularAdversarialAttacks`.
-   *Note: The `label` input in these methods requires a batch dimension (e.g., `(1, 300)`).*
+2. **Attacks: standard implementations, vendored code only for replication.**
+   `src/attacks/whitebox.py` has standard FGSM, BIM, PGD, MIM and CW-L2 on the margin-free logits; use these for the XAI study, with `epsilon` chosen explicitly. The vendored `_face` attacks have bugs (double softmax; BIM/MIM project onto the epsilon ball only after the last step; PGD ignores `epsilon`; "CW" is sign steps plus N(0, 0.1) noise), so they are exposed only as `paper_*` wrappers to reproduce the paper's ASR table. Load the vendored module from its file (as `whitebox.py` does): the package `__init__` imports PyTorch.
 3. **Pure Functions:**
-   All attack, defence, and XAI attribution methods must be implemented as pure functions without side effects.
+   All attack, defence, and XAI attribution methods must be implemented as pure functions without side effects (seeded randomness, inputs never modified in place).
 4. **XAI Targets:**
-   When generating CAM heatmaps, the target layer must dynamically find the last `Conv2D`, `DepthwiseConv2D`, or **`SeparableConv2D`** (critical for Xception) layer in the model.
+   CAM heatmaps target the last 4-D activation before the head: `block14_sepconv2_act` for Xception (`find_feature_layer`). Do **not** use the raw `SeparableConv2D` output `block14_sepconv2`: it is pre-BatchNorm/ReLU and ~95 % of its activations are negative. Explain the margin-free logit, never the softmax output.
+5. **Tests:** every module ships with tests in `tests/` (pytest on CPU, using the tiny ArcFace model in `tests/conftest.py`). Run `python -m pytest tests -q` before opening a PR.
 
 ## Pipeline Overview
-- `Phase 1 (XAI)`: Heatmap generation (`src/xai/attribution.py`) using LayerCAM and Eigen-CAM.
-- `Phase 2 (Attacks)`: Adversarial generation (`src/attacks/whitebox.py` & `blackbox.py`). Blackbox includes Monocle Blending and Patch Occlusion.
-- `Phase 3 (Defences)`: Inference-time defences (`src/defences/inference.py`) like JPEG compression and Strip defence.
-- `Phase 4 (Compare)`: Heatmap divergence metrics (`src/compare/divergence.py`) using SSIM, L2, KL Divergence, and Cosine Similarity.
-- `Phase 5 (Orchestration)`: The end-to-end runner (`scripts/05_run_experiment.py`) requires a `.keras` checkpoint to execute.
+- `Phase 1 (XAI)`: Heatmap generation (`src/xai/attribution.py`) using LayerCAM and Eigen-CAM (sign-corrected). `size=None` returns the native 8 x 8 map.
+- `Phase 2 (Attacks)`: Adversarial generation (`src/attacks/whitebox.py` & `blackbox.py`). Blackbox includes Monocle Blending (Haar eye box, procedural stand-in for the unreleased monocle image) and Patch Occlusion (positions are (x, y) as in the paper).
+- `Phase 3 (Defences)`: Inference-time defences (`src/defences/inference.py`): JPEG compression and bit-depth reduction. **Strip and Patch Augmentation are training-time defences** (`src/defences/training.py`): they need separately trained models, as does EAT.
+- `Phase 4 (Compare)`: Heatmap divergence metrics (`src/compare/divergence.py`): Spearman and top-k intersection (primary), JS divergence, cosine, L2, global SSIM, centre-of-mass shift, computed on native-resolution maps.
+- `Phase 5 (Orchestration)`: The end-to-end runner (`scripts/05_run_experiment.py`) runs on Kaggle with the `.keras` checkpoint and the correct-image list from `04`. It explains the **true class** at every stage and includes two controls (random noise of the same budget; defence applied to the clean image). Judge restoration against the defended clean map (`vs_defended_clean_*`), not only the clean map: JPEG moves heatmaps of clean images too.
 
 ## 🤖 Agent Directives (Meta-Rules)
-**To any AI agent reading this file:** 
-It is YOUR responsibility to help Deepanshu keep this file up to date. 
+**To any AI agent reading this file:**
+It is YOUR responsibility to help Deepanshu keep this file up to date.
 1. Before concluding a major coding session, proactively ask Deepanshu: *"Should we update `AGENTS.md` to reflect the new changes we just made?"*
 2. If the team's workflow, roles, or pipeline architecture changes, you must immediately suggest updating this file.
 3. This file is our shared memory across all models (Claude, Gemini, etc.). Do not let it go stale.
+4. Run code before claiming it works, and never push to `main` yourself.

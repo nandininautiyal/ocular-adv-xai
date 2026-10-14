@@ -34,14 +34,16 @@ ocular-adv-xai/
   - fgsm_sample_run.py
   - ORIGINAL_README.md         original repo's README, untouched
   - VENDORED_FROM.txt          provenance: commit hash, date, notes
-- src/models/    our reproduction of the recognition model (Xception+ArcFace)
+- src/models/    wrapper around the reference model (Xception+ArcFace) and margin-free logits
 - src/attacks/    FGSM/BIM/MIM/PGD/CW, Patch Occlusion, Monocle Blending
-- src/defenses/    JPEG/Strip/EAT, unified defense
-- src/xai/          LayerCAM + Eigen-CAM wrappers, divergence metrics
-- src/compare/       clean vs attacked vs defended comparison pipeline
-- notebooks/     exploratory work
+- src/defences/    JPEG and bit-depth reduction (inference time); Strip and Patch
+  Augmentation (training time). EAT and the unified defense are training-time too.
+- src/xai/          LayerCAM + Eigen-CAM
+- src/compare/       heatmap divergence metrics (clean vs attacked vs defended)
+- scripts/       00-06: sanity check, manifest, splits, training, clean eval, experiment,
+  reference-attack smoke test
+- tests/         pytest suite (CPU, tiny ArcFace model): python -m pytest tests -q
 - configs/         experiment configs
-- docs/             scoping report, proposal, meeting notes
 - data/             gitignored, see Data section below
 - outputs/           gitignored except tracked summary tables/figures
 - requirements.txt
@@ -57,9 +59,15 @@ pip install -r requirements.txt
 
 ## Data
 
-Datasets (VISOB, UFPR, MICHE, PolyU, CrossEyed) and trained model weights are
-not committed to this repo. They are stored at: [team: fill in shared drive link here].
-Download and place them under data/ locally before running any training or eval scripts.
+Datasets and trained model weights are not committed to this repo (`.keras` / `.h5`
+files are gitignored; the checkpoint is 1.7 GB). The current pipeline uses VISOB only.
+
+- VISOB: used on Kaggle; `scripts/01_build_manifest.py` documents the expected layout.
+- Checkpoint `Xception_ArcFace_full.keras`: a private Kaggle Dataset shared by Nandini;
+  ask her to share it with your Kaggle account.
+
+Training, clean evaluation and experiments run on Kaggle (01 -> 02 -> 03 -> 04 -> 05).
+Locally you only need the pytest suite, which uses a tiny model and no data.
 
 ## Contribution workflow
 
