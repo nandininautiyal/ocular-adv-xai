@@ -1,5 +1,5 @@
 """
-scripts/07_heatmap_demo.py
+scripts/09_heatmap_demo.py
 
 Small end-to-end visual check: clean -> attacked -> defended, with LayerCAM and Eigen-CAM
 heatmaps and divergence metrics, on a handful of correctly classified test images.
@@ -92,6 +92,7 @@ def main():
         "layercam": {k: layercam(model, v, class_idx=y, size=None) for k, v in stages.items()},
         "eigencam": {k: eigencam(model, v, size=None) for k, v in stages.items()},
     }
+    maps["layercam_pred"] = {k: layercam(model, v, class_idx=None, size=None) for k, v in stages.items()}
     print("\nnative map shape:", maps["layercam"]["clean"].shape)
 
     rows = []
@@ -124,8 +125,9 @@ def main():
             for j, k in enumerate(show):
                 ok = "ok" if preds[k][i] == y[i] else "WRONG"
                 overlay(axes[i][j], stages[k][i], maps[cam][k][i], f"{k} | {ok}")
-        fig.suptitle(f"{cam} for the true class, native 8x8 maps")
-        plt.tight_layout()
+        which = "predicted class" if cam == "layercam_pred" else "true class"
+        fig.suptitle(f"{cam}, explaining the {which}, native 8x8 maps", y=0.995)
+        plt.tight_layout(rect=[0, 0, 1, 0.97])
         path = os.path.join(args.out_dir, f"demo_{cam}.png")
         plt.savefig(path, dpi=100)
         plt.close(fig)

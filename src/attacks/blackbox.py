@@ -12,9 +12,8 @@ Image contract
 
 The vendored repo ships no code and no template image for either attack, so
 both follow the paper's text:
-- Patch positions are (X, Y) = (column, row) of the top-left corner, as in the
-  paper's Fig. 7 and Tables 4-5; (96, 96) with a 64 x 64 patch is the most
-  damaging position on VISOB (ASR 58.8 %).
+- Patch positions are (row, col) of the top-left corner, as in the paper's Fig. 7 and
+  Tables 3-5; (96, 96) with a 64 x 64 patch is the most damaging position on VISOB (ASR 58.8 %).
 - Monocle Blending: Haar-cascade eye box -> pupil centre (Eq. 7) -> template
   resized to the eye box and flipped for left eyes -> alpha blend (Eq. 8). The
   paper's monocle image was not released; ``make_monocle_template`` draws a
@@ -40,7 +39,7 @@ def patch_occlusion(image, patch_size=64, position=(96, 96), mask_value=0.0):
     ----------
     image : ndarray (256, 256, 3) or (N, 256, 256, 3), float32, [0, 1]
     patch_size : int, side length of the square patch
-    position : tuple (x, y) — column and row of the top-left corner (paper convention)
+    position : tuple (row, col) of the top-left corner (paper convention)
     mask_value : float in [0, 1], value to fill the patch with (usually black=0)
 
     Returns
@@ -48,7 +47,7 @@ def patch_occlusion(image, patch_size=64, position=(96, 96), mask_value=0.0):
     adv_image : ndarray, same shape as *image*, float32, [0, 1]
     """
     adv = np.array(image, dtype=np.float32, copy=True)
-    x, y = position
+    y, x = position
     x0, y0 = max(x, 0), max(y, 0)
     adv[..., y0:y + patch_size, x0:x + patch_size, :] = mask_value
     return adv
