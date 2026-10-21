@@ -13,15 +13,16 @@ This research project evaluates how adversarial attacks on ocular biometric mode
 - **Never push directly to `main` and never force-push or rewrite its history** (AI agents included). Commit with your real GitHub email (`git config user.email`); a placeholder email once forced a history rewrite of `main`.
 - **No AI attribution in commits or PRs:** no `Co-Authored-By` lines for AI tools and no "Generated with ..." footers. Commits are authored by the team member only.
 
-## Current Status (2026-10-14)
-- Done: baseline training (97.94 % margin-free), clean evaluation (`outputs/baseline_run/correct_test_full.csv`, 13,585 of 13,868 test images correct), reference-attack smoke test (`06`, PR #10).
-- PR #11 (`deepanshu` → `main`, draft): corrected attacks, defences, XAI, divergence, runner `05`, 58 CPU tests, pinned `requirements.txt`. Waiting for review.
-- Not done yet: `05_run_experiment.py` has never been run on the real checkpoint. Next step after PR #11 merges is a Kaggle dry run (`--max-images 20`), checking that attack success rises with epsilon and BIM/PGD are at least as strong as FGSM, then the full run (`--per-class 2`).
+## Current Status (2026-10-22)
+- Done: baseline training (97.94 % margin-free); clean evaluation (13,585 of 13,868 test images correct, 97.96 %); standard attacks checked on the real checkpoint (`08_check_attacks.py`, 100 images: success rises with epsilon, BIM/PGD/MIM reach 100 % at 2/255, FGSM 87 %); a 6-image heatmap demo (`09_heatmap_demo.py`); heuristic concept masks (`src/xai/masks.py`, PR #15) with a visual QC script (`10`).
+- Not done yet: the full `05_run_experiment.py` run on the real checkpoint. Run a `--max-images 20` dry run first, then `--per-class 2`. Default epsilons are 0.001, 0.5/255, 1/255, 2/255, because larger budgets already succeed 100 %.
 - `06_attack_smoke.py` uses the vendored attacks; its numbers (BIM 6 % < FGSM 37 % at eps 0.001) reflect their bugs and are for paper replication only.
+- The concept masks are a classical OpenCV estimate; validate them against a few hand-annotated images before reporting region-level results.
 
 ## Where Things Live
 - **Checkpoint:** `Xception_ArcFace_full.keras` (1.7 GB, 300 classes, test accuracy 97.94 % margin-free) is a Kaggle output, shared as a private Kaggle Dataset. **Never commit `.keras` / `.h5` files** (GitHub's limit is 100 MB; `.gitignore` excludes them).
-- **Experiments run on Kaggle**, next to the checkpoint and the VISOB data: `01` → `02` → `04_eval_clean.py` (writes the correct-image list) → `05_run_experiment.py`.
+- **Kaggle checkpoint dataset:** `nandininautiyal/ocular-xception-arcface-full-baseline` (path `/kaggle/input/datasets/nandininautiyal/ocular-xception-arcface-full-baseline/trained_models/Xception_ArcFace_full.keras`).
+- **Experiments run on Kaggle**, next to the checkpoint and the VISOB data: `01` → `02` → `04_eval_clean.py` (writes the correct-image list) → `05_run_experiment.py`. `notebooks/` holds the Kaggle notebooks with their printed outputs; result files are no longer committed under `outputs/` (removed in PR #13) and live in the Kaggle notebook outputs.
 - **Environment:** TF 2.20 with `tf-keras` 2.20.x (the versions the checkpoint was trained with); `opencv-python-headless<5` (OpenCV 5 removed the Haar cascades that Monocle Blending needs).
 
 ## Architecture & Codebase Structure
@@ -40,7 +41,7 @@ This research project evaluates how adversarial attacks on ocular biometric mode
    import tensorflow as tf
    ```
 2. **Attacks: standard implementations, vendored code only for replication.**
-   `src/attacks/whitebox.py` has standard FGSM, BIM, PGD, MIM and CW-L2 on the margin-free logits; use these for the XAI study, with `epsilon` chosen explicitly. The vendored `_face` attacks have bugs (double softmax; BIM/MIM project onto the epsilon ball only after the last step; PGD ignores `epsilon`; "CW" is sign steps plus N(0, 0.1) noise), so they are exposed only as `paper_*` wrappers to reproduce the paper's ASR table. Load the vendored module from its file (as `whitebox.py` does): the package `__init__` imports PyTorch.
+   `src/attacks/whitebox.py` has standard FGSM, BIM, PGD, MIM and CW-L2 on the margin-free logits; use these for the XAI study, with `epsilon` chosen explicitly. The default attack loss is the margin loss (best other logit minus true logit, which never saturates); `loss="ce"` keeps cross-entropy. CW accepts `epsilon=None` only for uniform calls and ignores it; the runner runs it once. The vendored `_face` attacks have bugs (double softmax; BIM/MIM project onto the epsilon ball only after the last step; PGD ignores `epsilon`; "CW" is sign steps plus N(0, 0.1) noise), so they are exposed only as `paper_*` wrappers to reproduce the paper's ASR table. Load the vendored module from its file (as `whitebox.py` does): the package `__init__` imports PyTorch.
 3. **Pure Functions:**
    All attack, defence, and XAI attribution methods must be implemented as pure functions without side effects (seeded randomness, inputs never modified in place).
 4. **XAI Targets:**
@@ -49,7 +50,7 @@ This research project evaluates how adversarial attacks on ocular biometric mode
 
 ## Pipeline Overview
 - `Phase 1 (XAI)`: Heatmap generation (`src/xai/attribution.py`) using LayerCAM and Eigen-CAM (sign-corrected). `size=None` returns the native 8 x 8 map.
-- `Phase 2 (Attacks)`: Adversarial generation (`src/attacks/whitebox.py` & `blackbox.py`). Blackbox includes Monocle Blending (Haar eye box, procedural stand-in for the unreleased monocle image) and Patch Occlusion (positions are (x, y) as in the paper).
+- `Phase 2 (Attacks)`: Adversarial generation (`src/attacks/whitebox.py` & `blackbox.py`). Blackbox includes Monocle Blending (Haar eye box, procedural stand-in for the unreleased monocle image) and Patch Occlusion (positions are (row, col), matching the paper's Fig. 7; changed in PR #14).
 - `Phase 3 (Defences)`: Inference-time defences (`src/defences/inference.py`): JPEG compression and bit-depth reduction. **Strip and Patch Augmentation are training-time defences** (`src/defences/training.py`): they need separately trained models, as does EAT.
 - `Phase 4 (Compare)`: Heatmap divergence metrics (`src/compare/divergence.py`): Spearman and top-k intersection (primary), JS divergence, cosine, L2, global SSIM, centre-of-mass shift, computed on native-resolution maps.
 - `Phase 5 (Orchestration)`: The end-to-end runner (`scripts/05_run_experiment.py`) runs on Kaggle with the `.keras` checkpoint and the correct-image list from `04`. It explains the **true class** at every stage and includes two controls (random noise of the same budget; defence applied to the clean image). Judge restoration against the defended clean map (`vs_defended_clean_*`), not only the clean map: JPEG moves heatmaps of clean images too.
