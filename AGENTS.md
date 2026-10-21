@@ -13,6 +13,15 @@ This research project evaluates how adversarial attacks on ocular biometric mode
 - **Never push directly to `main` and never force-push or rewrite its history** (AI agents included). Commit with your real GitHub email (`git config user.email`); a placeholder email once forced a history rewrite of `main`.
 - **No AI attribution in commits or PRs:** no `Co-Authored-By` lines for AI tools and no "Generated with ..." footers. Commits are authored by the team member only.
 
+## Deadline & Deliverables
+- **Deadline: before the end of November 2026.** Deliverables: a project report and a journal-level research paper.
+- The supervisor expects novelty over the base paper (ABRobOcular), with explainability as a core part.
+- **Planned contributions (proposed 2026-10-22, to be confirmed by the team):**
+  1. **Corrected re-benchmark:** ABRobOcular's attack code has four bugs; the corrected attacks are much stronger (e.g. BIM success at eps 0.001: 6 % → 75 %).
+  2. **Anatomy-grounded explanation analysis:** how LayerCAM/Eigen-CAM attention moves between pupil, iris, sclera and periocular skin under each attack and defence, against noise and defended-clean controls.
+  3. **Main novelty: training-free detection by explanation consistency.** Score an input by how much its heatmap changes under a mild transform (JPEG, bit depth), which needs no clean reference and no adversarial training data. Evaluate with AUROC and TPR at 5 % FPR, on attacks never seen during calibration. Compare against Feature Squeezing (prediction-only consistency, Xu et al. 2018) and a supervised detector trained on seen attacks, as in ABRobOcular.
+  4. **If time allows:** a second backbone, and an adaptive attack against the detector.
+
 ## Current Status (2026-10-22)
 - Done: baseline training (97.94 % margin-free); clean evaluation (13,585 of 13,868 test images correct, 97.96 %); standard attacks checked on the real checkpoint (`08_check_attacks.py`, 100 images: success rises with epsilon, BIM/PGD/MIM reach 100 % at 2/255, FGSM 87 %); a 6-image heatmap demo (`09_heatmap_demo.py`); heuristic concept masks (`src/xai/masks.py`, PR #15) with a visual QC script (`10`).
 - Not done yet: the full `05_run_experiment.py` run on the real checkpoint. Run a `--max-images 20` dry run first, then `--per-class 2`. Default epsilons are 0.001, 0.5/255, 1/255, 2/255, because larger budgets already succeed 100 %.
