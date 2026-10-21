@@ -50,6 +50,7 @@ sys.path.insert(0, REPO)
 from src.attacks.blackbox import monocle_blending, patch_occlusion  # noqa: E402
 from src.attacks.whitebox import ATTACK_REGISTRY, PAPER_ATTACK_REGISTRY  # noqa: E402
 from src.compare.divergence import METRICS, compare_heatmaps  # noqa: E402
+from src.compare.regions import region_grids, region_mass  # noqa: E402
 from src.defences.inference import DEFENCE_REGISTRY  # noqa: E402
 from src.models.arcface_inference import load_checkpoint, predict_logits  # noqa: E402
 from src.xai.attribution import XAI_REGISTRY  # noqa: E402
@@ -101,13 +102,16 @@ def blackbox_attack(name, images, sides):
 class Evaluator:
     """Scores one batch of image variants against the clean batch and collects rows."""
 
-    def __init__(self, model, xai_names, clean, labels, base_rows):
+    def __init__(self, model, xai_names, clean, labels, base_rows, concept_masks=False):
         self.model, self.xai_names = model, xai_names
         self.clean, self.labels, self.base_rows = clean, labels, base_rows
         self.clean_maps = {}
         for xai in xai_names:
             uses_class = takes(XAI_REGISTRY[xai], "class_idx")
             self.clean_maps[xai] = heatmaps(model, xai, clean, labels if uses_class else None)
+        # Region masses use the anatomy of the clean image for every variant.
+        self.grids = (region_grids(clean, next(iter(self.clean_maps.values())).shape[-1])
+                      if concept_masks else None)
         self.defended_clean_maps = {}
         self.rows = []
         self.examples = {}
@@ -145,6 +149,11 @@ class Evaluator:
                     if extra:
                         row.update({k: v[i] for k, v in extra.items()})
                     row.update(compare_heatmaps(self.clean_maps[xai][i], maps[i]))
+                    if self.grids is not None:
+                        mass = region_mass(maps[i], self.grids[i])
+                        clean_mass = region_mass(self.clean_maps[xai][i], self.grids[i])
+                        row.update(mass)
+                        row.update({f"d{k}": v - clean_mass[k] for k, v in mass.items()})
                     if defended_ref is not None:
                         row.update({f"vs_defended_clean_{k}": v
                                     for k, v in compare_heatmaps(defended_ref[i], maps[i]).items()})
@@ -184,7 +193,8 @@ def summarise(rows):
 
     rows["success"] = ~rows["correct"]
     group = KEYS + ["xai", "target", "success"]
-    metrics = [c for c in rows.columns if c in METRICS or c.startswith("vs_defended_clean_")]
+    metrics = [c for c in rows.columns
+               if c in METRICS or c.startswith(("vs_defended_clean_", "mass_", "dmass_"))]
     grouped = rows.groupby(group, dropna=False)
     table = pd.DataFrame(index=grouped.size().index)
     for metric in metrics:
@@ -214,6 +224,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-examples", type=int, default=4)
+    ap.add_argument("--concept-masks", action="store_true",
+                    help="add mass_<region> (heatmap fraction on pupil/iris/sclera/periocular, "
+                         "masks from the clean image) and dmass_<region> (change vs the clean map)")
     ap.add_argument("--out-dir", default="/kaggle/working/experiment")
     ap.add_argument("--tag", default="full")
     args = ap.parse_args()
@@ -254,7 +267,8 @@ def main():
         labels = batch.true_idx.to_numpy()
         sides = [e if e in ("left", "right") else None for e in batch.get("eye", [None] * len(batch))]
 
-        ev = Evaluator(model, xai_names, clean, labels, batch[base_cols].to_dict("records"))
+        ev = Evaluator(model, xai_names, clean, labels, batch[base_cols].to_dict("records"),
+                       concept_masks=args.concept_masks)
         ev.examples = {i: {} for i in range(len(batch)) if start + i < args.save_examples}
 
         pred = ev(clean, {"condition": "clean"})
@@ -303,7 +317,7 @@ def main():
     table.to_csv(os.path.join(args.out_dir, f"summary_{args.tag}.csv"), index=False)
     summary = {"tag": args.tag, "ckpt": args.ckpt, "impl": args.impl,
                "attack_loss": "margin (standard attacks)" if args.impl == "standard" else "vendored paper loss",
-               "n_images": int(len(df)),
+               "n_images": int(len(df)), "concept_masks": bool(args.concept_masks),
                "epsilons": epsilons, "attacks": attacks, "defences": defences, "xai": xai_names,
                "minutes": round((time.time() - t0) / 60, 1), **rates}
     with open(os.path.join(args.out_dir, f"summary_{args.tag}.json"), "w") as f:
