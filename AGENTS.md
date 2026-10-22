@@ -66,6 +66,8 @@ This research project evaluates how adversarial attacks on ocular biometric mode
 - `Phase 4b (Detection)`: Reference-free, training-free detection (`src/detect/`, `scripts/11_run_detection.py`): scores how much an input's heatmap changes under JPEG / bit depth (`xc_*`), against Feature Squeezing (`fs_l1_*`) and logit cosine (`pred_cos_*`). Thresholds and percentile fusion use clean calibration images only, disjoint from evaluation images. Reports AUROC, TPR at 5 % FPR, a supervised detector on held-out attacks (leave-one-attack-out), and attack clustering (ARI). Maps explain the class predicted for the input, never the true class.
 - `Phase 5 (Orchestration)`: The end-to-end runner (`scripts/05_run_experiment.py`) runs on Kaggle with the `.keras` checkpoint and the correct-image list from `04`. It explains the **true class** at every stage and includes two controls (random noise of the same budget; defence applied to the clean image). Judge restoration against the defended clean map (`vs_defended_clean_*`), not only the clean map: JPEG moves heatmaps of clean images too.
 
+- `Phase 6 (Analysis)`: `scripts/12_analyse.py` (laptop, no model) turns `rows_*.csv` (05) and `features_*.csv` (11) into the paper's tables, figures and `report.md`. Statistics (`src/analysis/stats.py`): 95 % subject-cluster bootstrap CIs, Wilcoxon signed-rank tests on per-subject means, Holm correction, paired bootstrap for AUROC differences. Images of one subject are never treated as independent.
+
 ## 🤖 Agent Directives (Meta-Rules)
 **To any AI agent reading this file:**
 It is YOUR responsibility to help Deepanshu keep this file up to date.
