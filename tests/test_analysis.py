@@ -115,8 +115,8 @@ def test_analyse_end_to_end(tmp_path):
     aurocs = pd.read_csv(out / "detection_auroc.csv")
     assert {"all", "fgsm", "patch"} <= set(aurocs.group)
     versus = pd.read_csv(out / "detection_vs_fs.csv")
-    assert set(versus.ours) == {"fused_explanation", "fused_all"}
+    assert set(versus.ours) == {"fused_explanation", "fused_all"}      # the third pair needs logit columns
     for fig in ("fig_heatmap_shift.png", "fig_detection.png", "fig_regions.png"):
         assert (out / fig).stat().st_size > 0
     report = (out / "report.md").read_text(encoding="utf-8")
-    assert "Heatmap shift" in report and "Feature Squeezing" in report
+    assert "Heatmap shift" in report and "fused_feature_squeezing" in report

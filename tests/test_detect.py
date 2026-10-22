@@ -9,7 +9,8 @@ import pytest
 from PIL import Image
 
 from conftest import REPO
-from src.detect.consistency import PercentileFusion, detection_features, rank_inconsistency, score_columns
+from src.detect.consistency import (PercentileFusion, RobustZFusion, detection_features, rank_inconsistency,
+                                   score_columns)
 from src.detect.evaluate import attack_clustering, auroc, leave_one_attack_out, tpr_at_fpr
 
 
@@ -37,6 +38,14 @@ def test_detection_features_on_tiny_model(model, images):
             assert (values >= -1e-6).all(), name
     families = score_columns(list(feats))
     assert len(families["explanation"]) == 8 and len(families["feature_squeezing"]) == 2
+
+
+def test_robust_z_fusion():
+    fusion = RobustZFusion({"a": np.array([0.0, 1.0, 2.0, 3.0, 4.0]), "b": np.array([10.0, 10.0, 10.0, 12.0, 8.0])})
+    assert fusion.centre == {"a": 2.0, "b": 10.0}
+    z = fusion({"a": np.array([2.0, 100.0]), "b": np.array([10.0, 10.0])}, ["a", "b"])
+    assert z[0] == pytest.approx(0.0) and z[1] > 10          # no saturation above the calibration range
+    assert np.isfinite(RobustZFusion({"c": np.zeros(5)}).z("c", [1.0])).all()
 
 
 def test_percentile_fusion():
@@ -108,6 +117,6 @@ def test_run_detection_end_to_end(tmp_path, model, images, labels):
     summary = json.loads((out_dir / "summary_tiny.json").read_text())
     assert summary["n_calibration"] == 5 and summary["n_clean_eval"] == 5
     assert summary["attack_success_rate"]["pgd@0.03"] > 0
-    assert set(summary["pooled_auroc"]) == {"fused_explanation", "fused_feature_squeezing",
-                                            "fused_prediction", "fused_all"}
+    assert set(summary["pooled_auroc"]) == {"fused_explanation", "fused_feature_squeezing", "fused_prediction",
+                                            "fused_all", "fused_prediction_explanation"}
     assert "supervised_logistic" in summary["unseen_attack_auroc"]
