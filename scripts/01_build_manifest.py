@@ -55,7 +55,7 @@ def build(root):
                 sdir = os.path.join(pdir_path, subj)
                 if not os.path.isdir(sdir):
                     continue
-                for fname in os.listdir(sdir):
+                for fname in sorted(os.listdir(sdir)):   # sorted: row order must not depend on the disk
                     rel = os.path.relpath(os.path.join(sdir, fname), root)
                     fm = FNAME_RE.match(fname)
                     if not fm:
