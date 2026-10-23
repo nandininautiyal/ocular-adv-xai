@@ -23,6 +23,18 @@ def test_masks_accept_uint8_and_leave_input_untouched(images):
     assert masks["periocular"].any()
 
 
+def test_masks_return_info_keeps_masks_and_reports_qc(images):
+    plain = get_concept_masks(images[0])
+    masks, info = get_concept_masks(images[0], return_info=True)
+    for name in plain:
+        np.testing.assert_array_equal(masks[name], plain[name])
+    for key in ("fallback_used", "centre_in_opening", "n_candidates", "circle_score",
+                "pupil_found", "pupil_threshold", "pupil_share_of_disc"):
+        assert key in info
+    assert isinstance(info["fallback_used"], bool)
+    assert info["pupil_found"] == bool(masks["pupil"].any())
+
+
 def test_masks_reject_bad_input():
     with pytest.raises(ValueError):
         get_concept_masks(np.zeros((256, 256), np.float32))
