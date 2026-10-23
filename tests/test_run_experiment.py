@@ -29,7 +29,8 @@ def test_run_experiment_end_to_end(tmp_path, model, images, labels):
     cmd = [sys.executable, os.path.join(REPO, "scripts", "05_run_experiment.py"),
            "--ckpt", str(ckpt), "--correct-csv", str(correct_csv), "--per-class", "1",
            "--attacks", "fgsm,pgd,cw,patch,monocle", "--epsilons", "0.004,0.03",
-           "--batch-size", "3", "--save-examples", "1", "--out-dir", str(out_dir), "--tag", "tiny"]
+           "--batch-size", "3", "--save-examples", "1", "--out-dir", str(out_dir), "--tag", "tiny",
+           "--concept-masks"]
     result = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True, timeout=900)
     assert result.returncode == 0, result.stderr[-3000:]
 
@@ -42,11 +43,14 @@ def test_run_experiment_end_to_end(tmp_path, model, images, labels):
     defended = table[table.condition == "attack+defence"]
     assert defended.vs_defended_clean_spearman.notna().all()
     assert table[table.condition != "attack+defence"].vs_defended_clean_spearman.isna().all()
+    mass = table[[f"mass_{r}" for r in ("pupil", "iris", "sclera", "periocular")]]
+    assert np.allclose(mass.sum(axis=1), 1.0, atol=1e-5)
+    assert (clean.filter(like="dmass_").abs() < 1e-9).all().all()
     linf = table[(table.condition == "attack") & (table.attack == "fgsm")].groupby("epsilon").linf.max()
     assert (linf <= linf.index + 1e-6).all()
 
     summary = json.loads((out_dir / "summary_tiny.json").read_text())
-    assert summary["n_images"] == 5
+    assert summary["n_images"] == 5 and summary["concept_masks"] is True
     assert summary["attack_success_rate"]["pgd@0.03"]["rate"] > 0
     assert summary["attack_success_rate"]["cw"]["rate"] > 0
     assert not any(k.startswith("cw@") for k in summary["attack_success_rate"])   # CW runs once
