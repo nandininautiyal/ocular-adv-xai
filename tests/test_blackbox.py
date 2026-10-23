@@ -4,12 +4,12 @@ import pytest
 from src.attacks.blackbox import detect_eye, make_monocle_template, monocle_blending, patch_occlusion
 
 
-def test_patch_position_is_x_then_y(images):
+def test_patch_position_is_row_then_col(images):
     adv = patch_occlusion(images[0], patch_size=20, position=(10, 50))
     changed = np.argwhere((adv != images[0]).any(axis=2))
-    assert changed[:, 0].min() >= 50 and changed[:, 0].max() < 70     # rows = y
-    assert changed[:, 1].min() >= 10 and changed[:, 1].max() < 30     # cols = x
-    assert (adv[50:70, 10:30] == 0).all()
+    assert changed[:, 0].min() >= 10 and changed[:, 0].max() < 30     # rows
+    assert changed[:, 1].min() >= 50 and changed[:, 1].max() < 70     # cols
+    assert (adv[10:30, 50:70] == 0).all()
 
 
 def test_patch_batch_and_input_untouched(images):

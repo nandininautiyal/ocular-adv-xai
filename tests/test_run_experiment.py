@@ -49,6 +49,7 @@ def test_run_experiment_end_to_end(tmp_path, model, images, labels):
     assert summary["n_images"] == 5
     assert summary["attack_success_rate"]["pgd@0.03"]["rate"] > 0
     assert summary["attack_success_rate"]["cw"]["rate"] > 0
+    assert not any(k.startswith("cw@") for k in summary["attack_success_rate"])   # CW runs once
     assert summary["restoration_rate_among_successful_attacks"]
     assert "noise@0.03" in summary["noise_control_flip_rate"]
     assert set(summary["defence_on_clean_flip_rate"]) == {"clean+jpeg", "clean+bit_depth"}

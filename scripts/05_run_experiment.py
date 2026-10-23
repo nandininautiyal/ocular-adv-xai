@@ -79,6 +79,13 @@ def takes(fn, name):
     return name in inspect.signature(fn).parameters
 
 
+def has_budget(fn):
+    """True if the attack uses an L-inf epsilon. CW accepts ``epsilon=None`` only so that
+    registry calls are uniform; it has no budget and must run once, not once per epsilon."""
+    params = inspect.signature(fn).parameters
+    return "epsilon" in params and params["epsilon"].default is not None
+
+
 def heatmaps(model, xai, images, class_idx):
     fn = XAI_REGISTRY[xai]
     kwargs = {"class_idx": class_idx} if takes(fn, "class_idx") else {}
@@ -198,8 +205,10 @@ def main():
     ap.add_argument("--impl", choices=["standard", "paper"], default="standard",
                     help="white-box implementation: standard (ours) or paper (vendored, eps=0.001)")
     ap.add_argument("--attacks", default="fgsm,bim,pgd,mim,cw,patch,monocle")
-    ap.add_argument("--epsilons", default="0.001,0.0078431,0.0313725",
-                    help="L-inf budgets: the paper's 0.001, 2/255, 8/255")
+    ap.add_argument("--epsilons", default="0.001,0.0019608,0.0039216,0.0078431",
+                    help="L-inf budgets: the paper's 0.001, then 0.5/255, 1/255, 2/255. Standard "
+                         "BIM/PGD/MIM already reach 100%% success at 2/255 on the full baseline "
+                         "(scripts/08_check_attacks.py), so larger budgets add little")
     ap.add_argument("--defences", default="jpeg,bit_depth")
     ap.add_argument("--xai", default="layercam,eigencam")
     ap.add_argument("--batch-size", type=int, default=16)
@@ -266,7 +275,7 @@ def main():
                 kwargs = {"label": labels} if takes(fn, "label") else {}
                 if takes(fn, "seed"):
                     kwargs["seed"] = start
-                if not takes(fn, "epsilon"):
+                if not has_budget(fn):
                     budgets = [None]                                   # CW: no epsilon
                 elif args.impl == "standard":
                     budgets = epsilons
