@@ -29,6 +29,7 @@ This research project evaluates how adversarial attacks on ocular biometric mode
 - The concept masks are a classical OpenCV estimate; validate them against a few hand-annotated images before reporting region-level results.
 
 ## Where Things Live
+- **Test split is pinned:** `splits/visob_test.csv` lists the 13,868 test images of the run that trained the checkpoint; `02_make_splits.py` always uses it (rows sorted, remaining images split 75/25 into train/validation). **Never evaluate the checkpoint on a freshly randomised split**: before 2026-10-22 the split depended on disk file order, and a new Kaggle session put about 70 % of the original train/validation images into "test" (accuracy 98.61 % instead of the true 97.96 %).
 - **Checkpoint:** `Xception_ArcFace_full.keras` (1.7 GB, 300 classes, test accuracy 97.94 % margin-free) is a Kaggle output, shared as a private Kaggle Dataset. **Never commit `.keras` / `.h5` files** (GitHub's limit is 100 MB; `.gitignore` excludes them).
 - **Kaggle checkpoint dataset:** `nandininautiyal/ocular-xception-arcface-full-baseline` (path `/kaggle/input/datasets/nandininautiyal/ocular-xception-arcface-full-baseline/trained_models/Xception_ArcFace_full.keras`).
 - **Experiments run on Kaggle**, next to the checkpoint and the VISOB data: `01` → `02` → `04_eval_clean.py` (writes the correct-image list) → `05_run_experiment.py`. `notebooks/` holds the Kaggle notebooks with their printed outputs; result files are no longer committed under `outputs/` (removed in PR #13) and live in the Kaggle notebook outputs.
