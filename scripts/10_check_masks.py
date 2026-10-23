@@ -2,8 +2,9 @@
 scripts/10_check_masks.py
 
 Visual and numeric check of src/xai/masks.py on a sample of test images, stratified by lighting.
-Writes an overlay grid (pupil red, iris green, sclera blue, periocular uncoloured) and
-prints QC statistics per lighting condition.
+Writes an overlay grid (pupil red, iris green, sclera blue, periocular uncoloured; "FB" in a
+title marks the geometric fallback circle) and prints QC statistics per lighting condition,
+including how often iris detection fell back to the fixed circle (get_concept_masks(return_info=True)).
 """
 import argparse
 import os
@@ -45,9 +46,10 @@ def main():
     rows, shown = [], []
     for r in df.itertuples():
         raw = np.asarray(Image.open(r.link_path).convert("RGB"), dtype=np.uint8)
-        masks = get_concept_masks(raw)
+        masks, info = get_concept_masks(raw, return_info=True)
         base = np.asarray(Image.fromarray(raw).resize((256, 256), Image.BILINEAR), dtype=np.float32) / 255.0
-        shown.append((overlay(base, masks), f"{r.lighting} | {r.device}"))
+        flag = " | FB" if info["fallback_used"] else ""
+        shown.append((overlay(base, masks), f"{r.lighting} | {r.device}{flag}"))
 
         names = ("pupil", "iris", "sclera", "periocular")
         stack = np.stack([masks[k] for k in names]).astype(int)
@@ -59,15 +61,19 @@ def main():
                      "grid_sums_to_1": bool(np.allclose(grid.sum(0), 1.0, atol=1e-5)),
                      "pupil_found": area["pupil"] > 0, "iris_found": ip > 0,
                      "pupil_share_of_iris_pupil": area["pupil"] / ip if ip > 0 else np.nan,
-                     **{f"area_{k}": v for k, v in area.items()}})
+                     **{f"area_{k}": v for k, v in area.items()},
+                     **{k: info[k] for k in ("fallback_used", "centre_in_opening", "n_candidates",
+                                             "circle_score", "pupil_threshold")}})
 
     qc = pd.DataFrame(rows)
     pd.set_option("display.width", 200)
     print("images checked:", len(qc))
     print("partition ok (masks mutually exclusive and exhaustive):", bool(qc.partition_ok.all()))
     print("masks_to_grid channels sum to 1 in every cell:", bool(qc.grid_sums_to_1.all()))
+    print(f"iris circle from the geometric fallback: {int(qc.fallback_used.sum())} of {len(qc)} "
+          f"({qc.fallback_used.mean():.1%}); centre outside the eye opening: {int((~qc.centre_in_opening).sum())}")
     print("\nper lighting (means; pupil_share = pupil / (pupil + iris), a real pupil is roughly 0.1-0.35):")
-    print(qc.groupby("lighting")[["pupil_found", "iris_found", "pupil_share_of_iris_pupil",
+    print(qc.groupby("lighting")[["fallback_used", "pupil_found", "iris_found", "pupil_share_of_iris_pupil",
                                   "area_pupil", "area_iris", "area_sclera", "area_periocular"]].mean().round(3).to_string())
 
     os.makedirs(args.out_dir, exist_ok=True)
