@@ -125,3 +125,29 @@ class PercentileFusion:
     def __call__(self, scores, names):
         """Max percentile over *names*; scores : dict name -> ndarray."""
         return np.max(np.stack([self.percentile(n, scores[n]) for n in names]), axis=0)
+
+
+class RobustZFusion:
+    """Training-free fusion: each score becomes a robust z-score against clean calibration
+    images, ``(s - median) / (1.4826 * MAD)``, and the fused score is their mean.
+
+    Unlike :class:`PercentileFusion` (max of percentiles), it does not saturate at the
+    largest calibration value, so thresholds above it still separate adversarial inputs,
+    and averaging keeps one weak score from dominating. Only clean images are used.
+    """
+
+    def __init__(self, clean_scores):
+        """clean_scores : dict name -> ndarray of calibration (clean) scores."""
+        self.centre, self.scale = {}, {}
+        for name, values in clean_scores.items():
+            values = np.asarray(values, dtype=np.float64)
+            median = float(np.median(values))
+            mad = float(np.median(np.abs(values - median))) * 1.4826
+            self.centre[name], self.scale[name] = median, max(mad, 1e-12)
+
+    def z(self, name, values):
+        return (np.asarray(values, dtype=np.float64) - self.centre[name]) / self.scale[name]
+
+    def __call__(self, scores, names):
+        """Mean robust z over *names*; scores : dict name -> ndarray."""
+        return np.mean(np.stack([self.z(n, scores[n]) for n in names]), axis=0)

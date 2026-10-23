@@ -9,7 +9,7 @@ attacks it has not seen.
 Run it on Kaggle next to the checkpoint, after 04_eval_clean.py has written the
 correct-image list. Per class, disjoint images are drawn for
 
-  calibration   clean only: sets thresholds and percentile fusion (no attacks)
+  calibration   clean only: sets thresholds and robust-z fusion (no attacks)
   evaluation    clean, plus every attack x epsilon applied to it
 
 Only successful adversarial examples count as positives.
@@ -41,7 +41,7 @@ sys.path.insert(0, REPO)
 
 from src.attacks.blackbox import monocle_blending, patch_occlusion  # noqa: E402
 from src.attacks.whitebox import ATTACK_REGISTRY  # noqa: E402
-from src.detect.consistency import PercentileFusion, detection_features, score_columns  # noqa: E402
+from src.detect.consistency import RobustZFusion, detection_features, score_columns  # noqa: E402
 from src.detect.evaluate import attack_clustering, auroc, leave_one_attack_out, tpr_at_fpr  # noqa: E402
 from src.models.arcface_inference import load_checkpoint  # noqa: E402
 
@@ -184,10 +184,12 @@ def main():
     singles = [c for cols in families.values() for c in cols]
     calib_mask, clean_mask = rows.kind == "calibration", rows.kind == "clean"
 
-    fusion = PercentileFusion({c: rows.loc[calib_mask, c].to_numpy() for c in singles})
+    fusion = RobustZFusion({c: rows.loc[calib_mask, c].to_numpy() for c in singles})
     scores = {c: rows[c].to_numpy() for c in singles}
     fused = {f"fused_{family}": fusion(scores, cols) for family, cols in families.items() if cols}
     fused["fused_all"] = fusion(scores, singles)
+    if families["prediction"] and families["explanation"]:
+        fused["fused_prediction_explanation"] = fusion(scores, families["prediction"] + families["explanation"])
     for name, values in fused.items():
         rows[name] = values
 

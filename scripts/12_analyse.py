@@ -36,7 +36,11 @@ from src.analysis.stats import (auroc_ci, cluster_bootstrap_ci, holm,  # noqa: E
                                 paired_auroc_difference, paired_subject_test)
 
 REGIONS = ("pupil", "iris", "sclera", "periocular")
-FUSED = ("fused_explanation", "fused_feature_squeezing", "fused_prediction", "fused_all")
+FUSED = ("fused_explanation", "fused_feature_squeezing", "fused_prediction", "fused_prediction_explanation",
+         "fused_all")
+# (ours, baseline): does explanation consistency beat Feature Squeezing, and does it add to logits?
+COMPARISONS = (("fused_explanation", "fused_feature_squeezing"), ("fused_all", "fused_feature_squeezing"),
+               ("fused_prediction_explanation", "fused_prediction"))
 
 
 def _same_eps(series, eps):
@@ -124,12 +128,11 @@ def detection(features, n_boot):
         for s in scores:
             est, lo, hi = auroc_ci(clean[s], g[s], clean.true_idx, g.true_idx, n_boot=n_boot)
             aurocs.append({"group": name, "score": s, "n_adv": len(g), "auroc": est, "ci_low": lo, "ci_high": hi})
-        for ours in ("fused_explanation", "fused_all"):
-            if ours in g and "fused_feature_squeezing" in g:
-                d = paired_auroc_difference(clean[ours], g[ours], clean.fused_feature_squeezing,
-                                            g.fused_feature_squeezing, clean.true_idx, g.true_idx, n_boot=n_boot)
-                versus.append({"group": name, "ours": ours, "baseline": "fused_feature_squeezing",
-                               "n_adv": len(g), **d})
+        for ours, base in COMPARISONS:
+            if ours in g and base in g:
+                d = paired_auroc_difference(clean[ours], g[ours], clean[base], g[base],
+                                            clean.true_idx, g.true_idx, n_boot=n_boot)
+                versus.append({"group": name, "ours": ours, "baseline": base, "n_adv": len(g), **d})
     versus = pd.DataFrame(versus)
     if len(versus):
         versus["p_holm"] = holm(versus.p)
@@ -181,7 +184,8 @@ def plot_detection(table, path):
     if not len(t):
         return False
     labels = {"fused_explanation": "explanation consistency (ours)", "fused_feature_squeezing": "Feature Squeezing",
-              "fused_prediction": "logit consistency", "fused_all": "combined (ours)"}
+              "fused_prediction": "logit consistency", "fused_prediction_explanation": "logit + explanation",
+              "fused_all": "combined (ours)"}
     present = [s for s in FUSED if s in set(t.score)]
     width = 0.8 / len(present)
     fig, ax = plt.subplots(figsize=(max(6, 1.2 * len(families)), 4))
@@ -254,7 +258,7 @@ def report(shift, restored, regions, aurocs, versus):
     if len(versus):
         for r in versus[versus.group == "all"].itertuples():
             verdict = "better than" if r.low > 0 else ("worse than" if r.high < 0 else "not significantly different from")
-            lines.append(f"- {r.ours} vs Feature Squeezing: {r.diff:+.3f} AUROC [{r.low:+.3f}, {r.high:+.3f}], "
+            lines.append(f"- {r.ours} vs {r.baseline}: {r.diff:+.3f} AUROC [{r.low:+.3f}, {r.high:+.3f}], "
                          f"p = {r.p:.3g}: {verdict} the baseline.")
     return "\n".join(lines) + "\n"
 
