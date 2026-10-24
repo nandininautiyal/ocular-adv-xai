@@ -77,3 +77,9 @@ It is YOUR responsibility to help Deepanshu keep this file up to date.
 2. If the team's workflow, roles, or pipeline architecture changes, you must immediately suggest updating this file.
 3. This file is our shared memory across all models (Claude, Gemini, etc.). Do not let it go stale.
 4. Run code before claiming it works, and never push to `main` yourself.
+5. **Check every stage before moving on.**
+   - Start each session by finding out what changed since the last one: `git fetch`, `git log origin/main`, open PRs and their CI, and unmerged teammate branches that touch the same files.
+   - Confirm a step's prerequisites before starting it, and check its output before building on it.
+   - Begin every long run (Kaggle) with a 2–3 minute smoke run that checks its inputs and prints a time estimate.
+   - If a step only makes sense after a team or supervisor decision, flag it instead of starting it.
+   - Say which checks passed.
