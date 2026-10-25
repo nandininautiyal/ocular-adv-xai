@@ -14,6 +14,19 @@ correct-image list. Per class, disjoint images are drawn for
 
 Only successful adversarial examples count as positives.
 
+8-bit realism: by default every attacked image is rounded to the 8-bit grid a saved
+PNG or camera frame has, before success and detection scores are computed. Without
+this, perturbations below 1/255 are float noise that the JPEG and bit-depth
+transforms (and so Feature Squeezing and the explanation-consistency scores) remove
+for free, which would inflate detection at small budgets. Budgets below 1/255 are
+therefore not meaningful here; use ``--no-quantise`` only for a float-domain
+reproduction.
+
+Pilot and final run must not share images or a seed:
+  pilot : --seed 1 --max-images 40 --tag pilot
+  final : --seed 2 --exclude-from /kaggle/working/detection/features_pilot.csv --tag full
+Choose the fusion rule before the final run, not after looking at it.
+
 Writes to --out-dir:
   features_<tag>.csv     one row per image variant, every score
   detection_<tag>.csv    AUROC and TPR at 5 % FPR per attack@epsilon x score
@@ -48,12 +61,19 @@ from src.models.arcface_inference import load_checkpoint  # noqa: E402
 BLACKBOX = ("patch", "monocle")
 NO_BUDGET = ("cw",)
 FPR = 0.05
+ONE_LEVEL = 1.0 / 255.0       # the smallest 8-bit step
 
 
 def load_image(path):
     """(256, 256, 3) float32 in [0, 1], loaded like flow_from_directory does (nearest)."""
     img = tf.keras.utils.load_img(path, target_size=(256, 256))
     return np.asarray(img, dtype=np.float32) / 255.0
+
+
+def quantise(images):
+    """Round to the 8-bit grid a saved image has: what a deployed system actually receives."""
+    images = np.asarray(images, dtype=np.float32)
+    return (np.round(np.clip(images, 0.0, 1.0) * 255.0) / 255.0).astype(np.float32)
 
 
 def resolve_path(row, data_root):
@@ -118,9 +138,16 @@ def main():
     ap.add_argument("--per-class", type=int, default=1, help="evaluation images per class")
     ap.add_argument("--calib-per-class", type=int, default=1, help="clean calibration images per class")
     ap.add_argument("--max-images", type=int, default=None, help="debug: cap evaluation and calibration sizes")
+    ap.add_argument("--exclude-from", default=None,
+                    help="CSV with a link_path column (features_<tag>.csv of an earlier run); those "
+                         "images are not used, e.g. to keep a final run disjoint from its pilot")
     ap.add_argument("--attacks", default="fgsm,bim,pgd,mim,cw,patch,monocle")
-    ap.add_argument("--epsilons", default="0.001,0.0019608,0.0039216,0.0078431",
-                    help="L-inf budgets: the paper's 0.001, then 0.5/255, 1/255, 2/255")
+    ap.add_argument("--epsilons", default="0.0039216,0.0078431",
+                    help="L-inf budgets: 1/255 and 2/255. Budgets below 1/255 are not representable in "
+                         "8 bits and are only meaningful with --no-quantise")
+    ap.add_argument("--no-quantise", action="store_true",
+                    help="keep attacked images in float32. Default: round every attacked image to the "
+                         "8-bit grid before success and detection scores are computed")
     ap.add_argument("--transforms", default="jpeg,bit_depth")
     ap.add_argument("--xai", default="layercam,eigencam")
     ap.add_argument("--batch-size", type=int, default=16)
@@ -142,13 +169,30 @@ def main():
     for name in attacks:
         assert name in ATTACK_REGISTRY or name in BLACKBOX, f"unknown attack {name}"
 
+    quantised = not args.no_quantise
+    q = quantise if quantised else (lambda images: np.asarray(images, dtype=np.float32))
+    if quantised and any(e < ONE_LEVEL - 1e-7 for e in epsilons):
+        print("WARNING: budgets below 1/255 cannot be represented in 8 bits; their results are "
+              "quantisation artefacts. Use them only with --no-quantise.")
+
     model = load_checkpoint(args.ckpt)
-    calib, evaluation = split_per_class(pd.read_csv(args.correct_csv), args.calib_per_class,
-                                        args.per_class, args.seed)
+    correct = pd.read_csv(args.correct_csv)
+    if args.exclude_from:
+        seen = set(pd.read_csv(args.exclude_from, usecols=["link_path"]).link_path)
+        before = len(correct)
+        correct = correct[~correct.link_path.isin(seen)]
+        print(f"excluded {before - len(correct)} images listed in {args.exclude_from}")
+    if correct.empty:
+        raise SystemExit("no images left to sample (check --correct-csv and --exclude-from)")
+    calib, evaluation = split_per_class(correct, args.calib_per_class, args.per_class, args.seed)
     if args.max_images:
         calib, evaluation = calib.head(args.max_images), evaluation.head(args.max_images)
+    if calib.empty or evaluation.empty:
+        raise SystemExit("not enough images per class for --calib-per-class + --per-class "
+                         "(after --exclude-from?); lower them or use a larger --correct-csv")
     print(f"calibration: {len(calib)} clean | evaluation: {len(evaluation)} images | attacks: {attacks} "
-          f"| epsilons: {epsilons} | transforms: {transforms} | xai: {xai_names}")
+          f"| epsilons: {epsilons} | transforms: {transforms} | xai: {xai_names} "
+          f"| 8-bit: {quantised} | seed: {args.seed}")
 
     t0 = time.time()
     rows = []
@@ -169,7 +213,7 @@ def main():
         for name in attacks:
             budgets = [None] if name in BLACKBOX + NO_BUDGET else epsilons
             for eps in budgets:
-                adv = run_attack(name, eps, clean, labels, sides, model, args.seed + start)
+                adv = q(run_attack(name, eps, clean, labels, sides, model, args.seed + start))
                 feats = detection_features(model, adv, xai_names, transforms)
                 success = feats["pred"] != labels
                 linf = np.abs(adv - clean).reshape(len(adv), -1).max(axis=1)
@@ -208,6 +252,7 @@ def main():
         "tag": args.tag, "ckpt": args.ckpt, "n_calibration": int(calib_mask.sum()),
         "n_clean_eval": int(clean_mask.sum()), "n_adversarial_successful": int(len(adv)),
         "attacks": attacks, "epsilons": epsilons, "transforms": transforms, "xai": xai_names,
+        "quantised_8bit": bool(quantised), "seed": args.seed, "exclude_from": args.exclude_from,
         "attack_success_rate": {k: float(g.success.mean()) for k, g in adv_all.groupby("variant")},
         "pooled_auroc": {name: float(pooled.loc[name, "auroc"]) for name in fused},
         "pooled_tpr_at_5fpr": {name: float(pooled.loc[name, "tpr_at_5fpr"]) for name in fused},
