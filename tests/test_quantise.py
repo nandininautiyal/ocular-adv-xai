@@ -28,3 +28,13 @@ def test_quantise_stays_on_grid_and_within_budget(script):
     assert np.abs(quantise(clean + 0.001, clean, 0.001) - clean).max() < 1e-6  # below one level: erased
     # without a reference it is plain rounding
     assert quantise(np.array([0.5 / 255 + 1e-4]))[0] == pytest.approx(1 / 255)
+
+
+@pytest.mark.parametrize("script", ["05_run_experiment", "11_run_detection"])
+def test_default_budgets_keep_their_levels(script):
+    # the defaults are 1, 2 and 4 levels written as rounded decimals; none may lose a level
+    quantise = _quantise(script)
+    clean = np.full((1, 4, 4, 3), 128 / 255, dtype=np.float32)
+    for eps, levels in zip((0.0039216, 0.0078431, 0.0156863), (1, 2, 4)):
+        q = quantise(clean + eps, clean, eps)
+        assert np.abs(q - clean).max() * 255 == pytest.approx(levels, abs=1e-3)
