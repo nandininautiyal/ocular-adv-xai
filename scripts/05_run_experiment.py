@@ -89,7 +89,8 @@ def quantise(images, reference=None, epsilon=None):
     images = np.asarray(images, dtype=np.float32)
     out = np.round(np.clip(images, 0.0, 1.0) * 255.0) / 255.0
     if reference is not None and epsilon is not None:
-        levels = np.floor(epsilon * 255.0 + 1e-6) / 255.0
+        # budgets are written to ~5 decimals (0.0078431 * 255 = 1.99999), so allow for that
+        levels = np.floor(epsilon * 255.0 + 1e-3) / 255.0
         reference = np.asarray(reference, dtype=np.float32)
         out = np.clip(out, reference - levels, reference + levels)
     return out.astype(np.float32)
