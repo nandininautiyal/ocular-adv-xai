@@ -254,9 +254,10 @@ def main():
     ap.add_argument("--impl", choices=["standard", "paper"], default="standard",
                     help="white-box implementation: standard (ours) or paper (vendored, eps=0.001)")
     ap.add_argument("--attacks", default="fgsm,bim,pgd,mim,cw,patch,monocle")
-    ap.add_argument("--epsilons", default="0.0039216,0.0078431",
-                    help="L-inf budgets: 1/255 and 2/255. Standard BIM/PGD/MIM already reach 100%% "
-                         "success at 2/255 on the full baseline (scripts/08_check_attacks.py). Budgets "
+    ap.add_argument("--epsilons", default="0.0039216,0.0078431,0.0156863",
+                    help="L-inf budgets: 1/255, 2/255 and 4/255. Standard BIM/PGD/MIM already reach 100%% "
+                         "success at 2/255 on the full baseline (scripts/08_check_attacks.py); 4/255 shows how "
+                         "heatmap shift and restoration keep changing once success saturates. Budgets "
                          "below 1/255 are not representable in 8 bits and are only meaningful with "
                          "--no-quantise")
     ap.add_argument("--no-quantise", action="store_true",

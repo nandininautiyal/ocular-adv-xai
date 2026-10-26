@@ -152,8 +152,8 @@ def main():
                     help="CSV with a link_path column (features_<tag>.csv of an earlier run); those "
                          "images are not used, e.g. to keep a final run disjoint from its pilot")
     ap.add_argument("--attacks", default="fgsm,bim,pgd,mim,cw,patch,monocle")
-    ap.add_argument("--epsilons", default="0.0039216,0.0078431",
-                    help="L-inf budgets: 1/255 and 2/255. Budgets below 1/255 are not representable in "
+    ap.add_argument("--epsilons", default="0.0039216,0.0078431,0.0156863",
+                    help="L-inf budgets: 1/255, 2/255 and 4/255. Budgets below 1/255 are not representable in "
                          "8 bits and are only meaningful with --no-quantise")
     ap.add_argument("--no-quantise", action="store_true",
                     help="keep attacked images in float32. Default: round every attacked image to the "
