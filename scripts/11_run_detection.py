@@ -70,10 +70,20 @@ def load_image(path):
     return np.asarray(img, dtype=np.float32) / 255.0
 
 
-def quantise(images):
-    """Round to the 8-bit grid a saved image has: what a deployed system actually receives."""
+def quantise(images, reference=None, epsilon=None):
+    """Round to the 8-bit grid a saved image has: what a deployed system actually receives.
+
+    With *reference* (the clean images, already on the grid) and *epsilon*, the result is
+    also clipped to the largest whole number of 8-bit levels within the budget, so rounding
+    never pushes a perturbation past epsilon (e.g. epsilon = 0.03 allows 7 levels, not 8).
+    """
     images = np.asarray(images, dtype=np.float32)
-    return (np.round(np.clip(images, 0.0, 1.0) * 255.0) / 255.0).astype(np.float32)
+    out = np.round(np.clip(images, 0.0, 1.0) * 255.0) / 255.0
+    if reference is not None and epsilon is not None:
+        levels = np.floor(epsilon * 255.0 + 1e-6) / 255.0
+        reference = np.asarray(reference, dtype=np.float32)
+        out = np.clip(out, reference - levels, reference + levels)
+    return out.astype(np.float32)
 
 
 def resolve_path(row, data_root):
@@ -142,8 +152,8 @@ def main():
                     help="CSV with a link_path column (features_<tag>.csv of an earlier run); those "
                          "images are not used, e.g. to keep a final run disjoint from its pilot")
     ap.add_argument("--attacks", default="fgsm,bim,pgd,mim,cw,patch,monocle")
-    ap.add_argument("--epsilons", default="0.0039216,0.0078431",
-                    help="L-inf budgets: 1/255 and 2/255. Budgets below 1/255 are not representable in "
+    ap.add_argument("--epsilons", default="0.0039216,0.0078431,0.0156863",
+                    help="L-inf budgets: 1/255, 2/255 and 4/255. Budgets below 1/255 are not representable in "
                          "8 bits and are only meaningful with --no-quantise")
     ap.add_argument("--no-quantise", action="store_true",
                     help="keep attacked images in float32. Default: round every attacked image to the "
@@ -170,7 +180,7 @@ def main():
         assert name in ATTACK_REGISTRY or name in BLACKBOX, f"unknown attack {name}"
 
     quantised = not args.no_quantise
-    q = quantise if quantised else (lambda images: np.asarray(images, dtype=np.float32))
+    q = quantise if quantised else (lambda images, *budget: np.asarray(images, dtype=np.float32))
     if quantised and any(e < ONE_LEVEL - 1e-7 for e in epsilons):
         print("WARNING: budgets below 1/255 cannot be represented in 8 bits; their results are "
               "quantisation artefacts. Use them only with --no-quantise.")
@@ -213,7 +223,8 @@ def main():
         for name in attacks:
             budgets = [None] if name in BLACKBOX + NO_BUDGET else epsilons
             for eps in budgets:
-                adv = q(run_attack(name, eps, clean, labels, sides, model, args.seed + start))
+                adv = q(run_attack(name, eps, clean, labels, sides, model, args.seed + start),
+                        *((clean, eps) if eps is not None else ()))
                 feats = detection_features(model, adv, xai_names, transforms)
                 success = feats["pred"] != labels
                 linf = np.abs(adv - clean).reshape(len(adv), -1).max(axis=1)
