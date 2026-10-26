@@ -79,10 +79,20 @@ def load_image(path):
     return np.asarray(img, dtype=np.float32) / 255.0
 
 
-def quantise(images):
-    """Round to the 8-bit grid a saved image has: what a deployed system actually receives."""
+def quantise(images, reference=None, epsilon=None):
+    """Round to the 8-bit grid a saved image has: what a deployed system actually receives.
+
+    With *reference* (the clean images, already on the grid) and *epsilon*, the result is
+    also clipped to the largest whole number of 8-bit levels within the budget, so rounding
+    never pushes a perturbation past epsilon (e.g. epsilon = 0.03 allows 7 levels, not 8).
+    """
     images = np.asarray(images, dtype=np.float32)
-    return (np.round(np.clip(images, 0.0, 1.0) * 255.0) / 255.0).astype(np.float32)
+    out = np.round(np.clip(images, 0.0, 1.0) * 255.0) / 255.0
+    if reference is not None and epsilon is not None:
+        levels = np.floor(epsilon * 255.0 + 1e-6) / 255.0
+        reference = np.asarray(reference, dtype=np.float32)
+        out = np.clip(out, reference - levels, reference + levels)
+    return out.astype(np.float32)
 
 
 def resolve_path(row, data_root):
@@ -282,7 +292,7 @@ def main():
     if args.impl == "paper" and quantised:
         print("note: --impl paper reproduces the vendored float-domain setting, so 8-bit rounding is off")
         quantised = False
-    q = quantise if quantised else (lambda images: np.asarray(images, dtype=np.float32))
+    q = quantise if quantised else (lambda images, *budget: np.asarray(images, dtype=np.float32))
     if quantised and any(e < ONE_LEVEL - 1e-7 for e in epsilons):
         print("WARNING: budgets below 1/255 cannot be represented in 8 bits; their results are "
               "quantisation artefacts. Use them only with --no-quantise.")
@@ -327,7 +337,7 @@ def main():
 
         for eps in epsilons:
             noise = eps * np.sign(rng.uniform(-1.0, 1.0, clean.shape)).astype(np.float32)
-            ev(q(np.clip(clean + noise, 0.0, 1.0)), {"condition": "noise", "epsilon": eps})
+            ev(q(np.clip(clean + noise, 0.0, 1.0), clean, eps), {"condition": "noise", "epsilon": eps})
         for d in defences:
             ev(DEFENCE_REGISTRY[d](clean), {"condition": "defence_on_clean", "defence": d})
 
@@ -345,7 +355,8 @@ def main():
                     budgets = epsilons
                 else:
                     budgets = [inspect.signature(fn).parameters["epsilon"].default]  # paper: 0.001
-                runs = [(eps, q(fn(clean, model, **({"epsilon": eps} if eps is not None else {}), **kwargs)))
+                runs = [(eps, q(fn(clean, model, **({"epsilon": eps} if eps is not None else {}), **kwargs),
+                                *((clean, eps) if eps is not None else ())))
                         for eps in budgets]
             for eps, adv in runs:
                 info = {"condition": "attack", "attack": name, "epsilon": eps}

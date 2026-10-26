@@ -41,7 +41,9 @@ def test_run_experiment_end_to_end(tmp_path, model, images, labels):
     clean = table[table.condition == "clean"]
     assert clean.correct.all() and (clean.spearman.round(6) == 1.0).all()
     defended = table[table.condition == "attack+defence"]
-    assert defended.vs_defended_clean_spearman.notna().all()
+    own_class = defended.target != "pred"          # the defended-clean reference exists for true-class maps only
+    assert defended[own_class].vs_defended_clean_spearman.notna().all()
+    assert defended[~own_class].vs_defended_clean_spearman.isna().all()
     assert table[table.condition != "attack+defence"].vs_defended_clean_spearman.isna().all()
     mass = table[[f"mass_{r}" for r in ("pupil", "iris", "sclera", "periocular")]]
     assert np.allclose(mass.sum(axis=1), 1.0, atol=1e-5)

@@ -1,0 +1,30 @@
+"""8-bit rounding of attacked images must keep them on the grid and inside the attack budget."""
+import importlib.util
+import os
+
+import numpy as np
+import pytest
+
+from conftest import REPO
+
+
+def _quantise(script):
+    spec = importlib.util.spec_from_file_location(script, os.path.join(REPO, "scripts", f"{script}.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.quantise
+
+
+@pytest.mark.parametrize("script", ["05_run_experiment", "11_run_detection"])
+def test_quantise_stays_on_grid_and_within_budget(script):
+    quantise = _quantise(script)
+    rng = np.random.default_rng(0)
+    clean = np.round(rng.uniform(0, 1, (2, 8, 8, 3)) * 255) / 255
+    for eps in (1 / 255, 2 / 255, 0.03, 0.001):
+        adv = np.clip(clean + eps * np.sign(rng.uniform(-1, 1, clean.shape)), 0, 1)
+        q = quantise(adv, clean, eps)
+        assert np.allclose(q * 255, np.round(q * 255), atol=1e-4)            # on the 8-bit grid
+        assert np.abs(q - clean).max() <= eps + 1e-6                        # never past the budget
+    assert np.abs(quantise(clean + 0.001, clean, 0.001) - clean).max() < 1e-6  # below one level: erased
+    # without a reference it is plain rounding
+    assert quantise(np.array([0.5 / 255 + 1e-4]))[0] == pytest.approx(1 / 255)
