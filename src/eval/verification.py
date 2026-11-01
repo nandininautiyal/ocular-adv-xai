@@ -23,7 +23,9 @@ with right), in one of two ways:
 - all pairs within one set (pair_counts), e.g. the pinned test set;
 - enrolment templates against probes (build_templates, template_scores): a
   template is the mean of one subject's enrolment embeddings of one eye,
-  renormalised.
+  renormalised. Where classes are not persons (cross-dataset UBIPr, one class
+  per eye), exclude_same_person drops a probe's comparisons with the other
+  classes of its person.
 
 Large score sets
 ----------------
@@ -190,6 +192,24 @@ def template_scores(templates, template_subjects, probes, probe_subjects, templa
     scores = np.where(same_group, cosine_scores(probes, templates), np.nan).astype(np.float32)
     own = same_group & (np.asarray(probe_subjects)[:, None] == np.asarray(template_subjects)[None, :])
     return scores, own
+
+
+def exclude_same_person(scores, own, probe_persons, template_persons):
+    """Leave out the comparisons of a probe with another class of its own person.
+
+    For datasets whose classes are not persons (UBIPr: one class per eye, and a few persons under
+    two IDs), a probe scored against a template of another class of its person is neither a
+    genuine nor an impostor comparison. Those scores become NaN, which template_counts, ranks and
+    the score samples skip.
+
+    Returns
+    -------
+    (scores with those entries NaN (float32), number of comparisons left out)
+    """
+    scores = np.asarray(scores, np.float32)
+    other = ((np.asarray(probe_persons)[:, None] == np.asarray(template_persons)[None, :])
+             & ~np.asarray(own, bool) & ~np.isnan(scores))
+    return np.where(other, np.nan, scores).astype(np.float32), int(other.sum())
 
 
 def template_counts(scores, own, subjects, max_block=1 << 24):

@@ -21,6 +21,14 @@ Protocols (--modes, any combination):
   p2  the same template / probe protocol on the training classes. Only meaningful for a
       model trained with 02_make_splits.py --protocol cross_session, which never saw a
       verification image; the existing checkpoint trained on about 60 % of them.
+  x1  zero-shot cross-dataset open-set verification on an external dataset prepared by
+      20_prepare_ubipr.py (--external-manifest): UBIPr, Canon EOS 5D at 4-8 m against the
+      smartphone images the model was trained on. Templates are the session-1 images of each
+      class (one eye of one person), probes its session-2 images; rows marked unusable in the
+      manifest are left out. Genuine: probe and template of the same class; impostor: a
+      template of another person (a probe is never scored against another class of its own
+      person). Bootstrap clusters and n_subjects are persons. Subsets: --external-subsets
+      (default camera distance and glasses), by the probe.
 
 Probes are compared only with templates (p1: images) of the same eye; a probe whose
 subject has no enrollment template for that eye is left out and counted. Per-device and
@@ -33,12 +41,16 @@ Writes to --out-dir:
   verification_roc_det_<tag>.png   ROC and DET curves of every mode
   verification_summary_<tag>.json  headline numbers, CMC, counts, caveats, git commit, timing
   embeddings_<tag>.npz             with --save-embeddings: float16 embeddings and relpaths
+  embeddings_<name>_<tag>.npz      x1 with --save-embeddings: the same for the external images
 
 Usage (Kaggle, checkpoint dataset and VISOB attached, 01 already run):
   python scripts/15_eval_verification.py \
       --ckpt /kaggle/input/<checkpoint-dataset>/Xception_ArcFace_full.keras \
       --manifest /kaggle/working/manifest_raw.csv --modes p1,p3 --tag full
   smoke run (2-3 min): add --max-subjects 10 --n-boot 100 --tag smoke
+Cross-dataset (VISOB not needed; 20_prepare_ubipr.py already run):
+  python scripts/15_eval_verification.py --ckpt <checkpoint>.keras --modes x1 \
+      --external-manifest /kaggle/working/ubipr/ubipr_manifest.csv --tag ubipr
 """
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; set before importing tensorflow
@@ -57,8 +69,9 @@ import tensorflow as tf
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
 from src.eval.verification import (BINS_PER_UNIT, FARS, bootstrap_metrics, build_templates, cmc,  # noqa: E402
-                                   embed, error_rates_from_counts, far_key, metrics_from_counts, pair_counts,
-                                   rank1_ci, ranks, roc_from_counts, template_counts, template_scores)
+                                   embed, error_rates_from_counts, exclude_same_person, far_key,
+                                   metrics_from_counts, pair_counts, rank1_ci, ranks, roc_from_counts,
+                                   template_counts, template_scores)
 from src.models.arcface_inference import load_checkpoint  # noqa: E402
 
 DEFAULT_TEST_LIST = os.path.join(REPO, "splits", "visob_test.csv")
@@ -68,10 +81,15 @@ PROTOCOLS = {
     "p1": "closed-set verification: all same-eye pairs of the pinned random-split test set",
     "p2": "closed-set cross-session verification: enrollment templates vs verification probes, training subjects",
     "p3": "open-set cross-session verification: enrollment templates vs verification probes, unseen subjects",
+    "x1": "zero-shot cross-dataset open-set verification: session-1 templates vs session-2 probes of an external "
+          "dataset",
 }
+X1_CAVEAT = ("zero-shot cross-dataset and cross-sensor: a VISOB (smartphone) model on {name} images, eye crops "
+             "re-framed from landmarks by 20_prepare_ubipr.py; n_subjects counts persons")
+VISOB_MODES = ("p1", "p2", "p3")
 P1_CAVEAT = ("inflated by near-duplicate frames: consecutive frames of one bucket sit on both sides of a pair "
              "and in training; reproduces the base-paper protocol only")
-COLORS = {"p1": "#2a78d6", "p2": "#eb6834", "p3": "#1baf7a"}      # fixed per protocol, never by rank
+COLORS = {"p1": "#2a78d6", "p2": "#eb6834", "p3": "#1baf7a", "x1": "#8a5cd6"}   # fixed per protocol, never by rank
 INK = {"surface": "#fcfcfb", "primary": "#0b0b0b", "secondary": "#52514e", "muted": "#898781",
        "grid": "#e1e0d9", "axis": "#c3c2b7"}
 
@@ -110,6 +128,34 @@ def image_table(relpaths):
                      "eye": m["eye"].lower(), "device": device, "lighting": lighting,
                      "condition": m["condition"]})
     return pd.DataFrame(rows, columns=["relpath", "subject", "phase", "eye", "device", "lighting", "condition"])
+
+
+def external_table(manifest, subset_cols=()):
+    """Image table of an external manifest (20_prepare_ubipr.py), sorted by relpath.
+
+    subject = class_id (one eye of one person), person = person_id (class_id if absent), phase =
+    enrollment for session 1 and verification for session 2, eye as given; rows with usable = 0 are
+    dropped. Returns (table, number of rows dropped as unusable).
+    """
+    df = pd.read_csv(manifest)
+    missing = ({"relpath", "class_id", "eye", "session"} | set(subset_cols)) - set(df.columns)
+    if missing:
+        raise SystemExit(f"{manifest} lacks the columns {sorted(missing)} (write it with 20_prepare_ubipr.py)")
+    unusable = (df.usable == 0).to_numpy() if "usable" in df.columns else np.zeros(len(df), bool)
+    df = df[~unusable]
+    if not df.session.isin([1, 2]).all():
+        raise SystemExit(f"{manifest}: sessions must be 1 (templates) or 2 (probes), found "
+                         f"{sorted(df.session.unique().tolist())}")
+    table = pd.DataFrame({"relpath": df.relpath.astype(str).str.replace("\\", "/", regex=False),
+                          "subject": df.class_id.astype(int).to_numpy(),
+                          "person": (df.person_id if "person_id" in df.columns else df.class_id).astype(int).to_numpy(),
+                          "phase": np.where(df.session == 1, "enrollment", "verification"),
+                          "eye": df.eye.astype(str).to_numpy()})
+    for col in subset_cols:
+        table[col] = df[col].to_numpy()
+    if table.relpath.duplicated().any():
+        raise SystemExit(f"{manifest}: duplicate relpaths")
+    return table.sort_values("relpath").reset_index(drop=True), int(unusable.sum())
 
 
 def in_paper_classes(subjects):
@@ -164,7 +210,7 @@ def training_info(ckpt, class_index=None):
     return seen, source, phases
 
 
-def caveats(mode, train_phases):
+def caveats(mode, train_phases, external_name="ubipr"):
     """What a reader must know before quoting this mode's numbers for this checkpoint."""
     if mode == "p1":
         notes = [P1_CAVEAT]
@@ -183,6 +229,8 @@ def caveats(mode, train_phases):
         if train_phases.get("verification"):
             return [f"this checkpoint was trained on {train_phases['verification']} verification images, so p2 "
                     "is not cross-session for it and is inflated"]
+    if mode == "x1":
+        return [X1_CAVEAT.format(name=external_name)]
     return []
 
 
@@ -204,11 +252,20 @@ def select_images(modes, args, seen):
             raise SystemExit(f"{args.p3_list} holds {int((~unseen).sum())} images of training subjects; "
                              "p3 must be open-set (use 02 --protocol open_set)")
         selected["p3"] = table[unseen]
+    if "x1" in modes:                     # the external dataset: its own manifest and root
+        selected["x1"], args.external_unusable = external_table(args.external_manifest,
+                                                                external_subset_cols(args))
     for mode, df in selected.items():
         if args.max_subjects:
-            df = df[df.subject.isin(sorted(df.subject.unique())[:args.max_subjects])]
+            col = "person" if mode == "x1" else "subject"     # x1: keep both eyes of each person
+            df = df[df[col].isin(sorted(df[col].unique())[:args.max_subjects])]
         selected[mode] = df.reset_index(drop=True)
     return selected
+
+
+def external_subset_cols(args):
+    """Manifest columns that split x1 into subsets (--external-subsets)."""
+    return tuple(c.strip() for c in (getattr(args, "external_subsets", None) or "").split(",") if c.strip())
 
 
 def embed_images(model, relpaths, root, batch_size, workers):
@@ -229,10 +286,10 @@ def embed_images(model, relpaths, root, batch_size, workers):
     return emb
 
 
-def subsets(images):
-    """('all', mask), then one (name, mask) per device and per lighting."""
+def subsets(images, cols=("device", "lighting")):
+    """('all', mask), then one (name, mask) per value of each column (device and lighting for VISOB)."""
     out = [("all", np.ones(len(images), bool))]
-    for col in ("device", "lighting"):
+    for col in cols:
         out += [(f"{col}={v}", (images[col] == v).to_numpy()) for v in sorted(images[col].unique())]
     return out
 
@@ -284,8 +341,12 @@ def evaluate_pairs(images, emb, args):
     return rows, out_curve, sample_pair_scores(images, emb, args.sample_scores, args.seed), {}
 
 
-def evaluate_templates(images, emb, args, mode):
-    """p2 / p3: enrollment templates vs verification probes. Returns (rows, curve, score sample, extra)."""
+def evaluate_templates(images, emb, args, mode, external=False):
+    """p2 / p3 / x1: enrollment templates vs verification probes. Returns (rows, curve, score sample, extra).
+
+    external (x1): a probe's comparisons with the other classes of its person are left out, persons are the
+    bootstrap clusters and n_subjects, and the subsets come from --external-subsets.
+    """
     enrol, probes = images[images.phase == "enrollment"], images[images.phase == "verification"]
     templates, t_subjects, t_eyes = build_templates(emb[enrol.row.to_numpy()], enrol.subject.to_numpy(),
                                                     enrol.eye.to_numpy())
@@ -296,10 +357,16 @@ def evaluate_templates(images, emb, args, mode):
         raise SystemExit(f"{mode}: no verification probe has an enrollment template of its eye")
     scores, own = template_scores(templates, t_subjects, emb[probes.row.to_numpy()], probes.subject.to_numpy(),
                                   t_eyes, probes.eye.to_numpy())
+    clusters, subset_cols, n_same_person = probes.subject.to_numpy(), ("device", "lighting"), 0
+    if external:
+        person_of = dict(zip(enrol.subject, enrol.person))
+        scores, n_same_person = exclude_same_person(scores, own, probes.person.to_numpy(),
+                                                    np.array([person_of[s] for s in t_subjects]))
+        clusters, subset_cols = probes.person.to_numpy(), external_subset_cols(args)
     probe_ranks = ranks(scores, own)
     rows, global_thr, out_curve = [], {}, None
-    for name, mask in subsets(probes):
-        subjects = probes.subject.to_numpy()[mask]
+    for name, mask in subsets(probes, subset_cols):
+        subjects = clusters[mask]
         counts = template_counts(scores[mask], own[mask], subjects)
         row = {"subset": name, "subset_rule": "probe", "n_subjects": len(counts["subjects"]),
                "n_probes": int(mask.sum()), "n_templates": len(templates),
@@ -307,6 +374,8 @@ def evaluate_templates(images, emb, args, mode):
         row["rank1"], row["rank1_ci_low"], row["rank1_ci_high"] = rank1_ci(
             (probe_ranks[mask] == 1).astype(np.float64), subjects, n_boot=args.n_boot, seed=args.seed)
         row["rank1_method"] = "own template among the templates of the probe's eye"
+        if external:
+            row["rank1_method"] += " (other classes of the probe's person left out)"
         if name == "all":
             global_thr = {far_key(f): row[f"thr_at_far_{far_key(f)}"] for f in FARS}
             out_curve = curve(counts["genuine"], counts["impostor"], row)
@@ -316,14 +385,21 @@ def evaluate_templates(images, emb, args, mode):
               f"TAR@FAR=1e-3 {row['tar_at_far_1e-3']:.4f} | rank-1 {row['rank1']:.4f}", flush=True)
     extra = {"n_enrollment_images": len(enrol), "n_probes_without_template": int((~keep).sum()),
              "cmc_rank_1_to_20": [round(float(v), 6) for v in cmc(probe_ranks, 20)]}
+    if external:
+        extra.update({"n_classes_with_template": len(templates), "n_probe_classes": int(probes.subject.nunique()),
+                      "n_persons": int(probes.person.nunique()),
+                      "n_same_person_comparisons_left_out": n_same_person,
+                      "n_unusable_images_left_out": int(getattr(args, "external_unusable", 0)),
+                      "subsets": list(subset_cols), "bootstrap_clusters": "persons"})
+    sample_cols = ("relpath", "subject", "person", "eye") + tuple(subset_cols) if external else None
     sample = sample_template_scores(probes, templates, t_subjects, t_eyes, scores, own, args.sample_scores,
-                                    args.seed, mode)
+                                    args.seed, mode, cols=sample_cols)
     return rows, out_curve, sample, extra
 
 
-def _sample_frame(mode, kind, score, images, first, other, other_subject):
+def _sample_frame(mode, kind, score, images, first, other, other_subject, cols=None):
     """Sampled comparisons: the first image's metadata, what it was compared with, and the score."""
-    cols = {c: images[c].to_numpy()[first] for c in ("relpath", "subject", "eye", "device", "lighting")}
+    cols = {c: images[c].to_numpy()[first] for c in (cols or ("relpath", "subject", "eye", "device", "lighting"))}
     return pd.DataFrame({"mode": mode, "kind": kind, "score": np.round(score, 6), **cols, "other": other,
                          "other_subject": other_subject})
 
@@ -365,8 +441,8 @@ def sample_pair_scores(images, emb, n, seed):
     return pd.concat(frames)
 
 
-def sample_template_scores(probes, templates, t_subjects, t_eyes, scores, own, n, seed, mode):
-    """Uniform samples of genuine and impostor probe-template scores of p2 / p3."""
+def sample_template_scores(probes, templates, t_subjects, t_eyes, scores, own, n, seed, mode, cols=None):
+    """Uniform samples of genuine and impostor probe-template scores of p2 / p3 / x1 (cols: probe metadata)."""
     rng = np.random.default_rng(seed)
     gp = rng.choice(len(probes), min(n, len(probes)), replace=False)
     gt = own.argmax(axis=1)[gp]                                  # the probe's own template
@@ -375,7 +451,7 @@ def sample_template_scores(probes, templates, t_subjects, t_eyes, scores, own, n
     frames = []
     for kind, p, t in (("genuine", gp, gt), ("impostor", ip, it)):
         names = [f"template {s}/{e}" for s, e in zip(t_subjects[t], t_eyes[t])]
-        frames.append(_sample_frame(mode, kind, scores[p, t], probes, p, names, t_subjects[t]))
+        frames.append(_sample_frame(mode, kind, scores[p, t], probes, p, names, t_subjects[t], cols))
     return pd.concat(frames)
 
 
@@ -444,7 +520,8 @@ def main():
     ap.add_argument("--modes", default="p1,p3",
                     help="comma-separated: p1 (all pairs of the pinned test set; inflated, reproduction only), "
                          "p2 (templates vs probes, training subjects; for cross-session models), p3 (templates vs "
-                         "probes, unseen subjects)")
+                         "probes, unseen subjects), x1 (zero-shot cross-dataset: session-1 templates vs session-2 "
+                         "probes of --external-manifest)")
     ap.add_argument("--manifest", default="/kaggle/working/manifest_raw.csv",
                     help="manifest_raw.csv from 01_build_manifest.py (needed by p2, and by p3 without --p3-list)")
     ap.add_argument("--data-root", default=None, help="VISOB root of the relpaths (default: found under /kaggle/input)")
@@ -455,7 +532,16 @@ def main():
     ap.add_argument("--class-index", default=None,
                     help="class_index_<tag>.json from 03 (default: next to the checkpoint if present, else subject "
                          "IDs 1141-3279 plus 7000)")
-    ap.add_argument("--max-subjects", type=int, default=None, help="smoke run: keep the first N subjects of each mode")
+    ap.add_argument("--external-manifest", default=None,
+                    help="x1 images: ubipr_manifest.csv from 20_prepare_ubipr.py (relpath, class_id, person_id, eye, "
+                         "session, usable, subset columns)")
+    ap.add_argument("--external-root", default=None,
+                    help="root of the external relpaths (default: the folder of --external-manifest)")
+    ap.add_argument("--external-name", default="ubipr", help="name of the external dataset in outputs and notes")
+    ap.add_argument("--external-subsets", default="cam_distance,glasses",
+                    help="comma-separated manifest columns that split x1 into subsets (by the probe)")
+    ap.add_argument("--max-subjects", type=int, default=None,
+                    help="smoke run: keep the first N subjects of each mode (x1: the first N persons)")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=8, help="threads that read images")
     ap.add_argument("--n-boot", type=int, default=1000, help="bootstrap resamples for the CIs (0: no CIs)")
@@ -474,6 +560,11 @@ def main():
     if unknown or not requested:
         raise SystemExit(f"unknown modes {sorted(unknown)}; choose from {sorted(PROTOCOLS)}")
     modes = [m for m in PROTOCOLS if m in requested]
+    if "x1" in modes and not args.external_manifest:
+        raise SystemExit("x1 needs --external-manifest (ubipr_manifest.csv from 20_prepare_ubipr.py)")
+    if "x1" in modes and not os.path.exists(args.external_manifest):
+        raise SystemExit(f"{args.external_manifest} not found: run scripts/20_prepare_ubipr.py first")
+    external_root = args.external_root or os.path.dirname(os.path.abspath(args.external_manifest or "."))
 
     gpus = tf.config.list_physical_devices("GPU")
     print("TF", tf.__version__, "| tf.keras comes from:", tf.keras.Model.__module__, "| GPUs:", len(gpus))
@@ -488,39 +579,56 @@ def main():
                                  else "not recorded: trained before the cross-session protocol existed")
     print(f"training subjects: {len(seen) if seen else 300} from {seen_source} | training images by phase: "
           f"{described}")
-    root = args.data_root or find_root()
+    visob = [m for m in modes if m in VISOB_MODES]
+    root = (args.data_root or find_root()) if visob else args.data_root      # x1 alone needs no VISOB
     selected = select_images(modes, args, seen)
     for mode, df in selected.items():
         if df.empty:
-            raise SystemExit(f"{mode}: no images selected (check --manifest, --test-list, --p3-list)")
+            raise SystemExit(f"{mode}: no images selected (check --manifest, --test-list, --p3-list"
+                             f"{', --external-manifest' if mode == 'x1' else ''})")
         print(f"{mode}: {len(df)} images of {df.subject.nunique()} subjects "
               f"({int((df.phase == 'enrollment').sum())} enrollment, {int((df.phase == 'verification').sum())} "
               f"verification){' | smoke run' if args.max_subjects else ''}")
-        for note in caveats(mode, train_phases):
+        if mode == "x1":
+            print(f"  x1: {args.external_name} from {external_root}: {df.person.nunique()} persons, subjects are "
+                  f"classes (one eye each); {getattr(args, 'external_unusable', 0)} unusable images left out")
+        for note in caveats(mode, train_phases, args.external_name):
             print(f"  NOTE ({mode}): {note}")
 
     timing, t = {}, time.time()
     model = load_checkpoint(args.ckpt)
     timing["load_model_s"] = round(time.time() - t, 1)
     print(f"loaded: {args.ckpt} ({timing['load_model_s']} s)")
-    relpaths = sorted(set().union(*(set(df.relpath) for df in selected.values())))
-    print(f"embedding {len(relpaths)} images (batch {args.batch_size}) from {root}", flush=True)
-    t = time.time()
-    emb = embed_images(model, relpaths, root, args.batch_size, args.workers)
-    timing["embedding_s"] = round(time.time() - t, 1)
-    row_of = {r: i for i, r in enumerate(relpaths)}
-    for mode in selected:
-        selected[mode]["row"] = selected[mode].relpath.map(row_of).to_numpy()
+    relpaths = sorted(set().union(*(set(selected[m].relpath) for m in visob)))
+    emb = emb_x = None
+    if relpaths:
+        print(f"embedding {len(relpaths)} images (batch {args.batch_size}) from {root}", flush=True)
+        t = time.time()
+        emb = embed_images(model, relpaths, root, args.batch_size, args.workers)
+        timing["embedding_s"] = round(time.time() - t, 1)
+        row_of = {r: i for i, r in enumerate(relpaths)}
+        for mode in visob:
+            selected[mode]["row"] = selected[mode].relpath.map(row_of).to_numpy()
+    if "x1" in selected:                  # external images: their own root and embedding matrix
+        ext_relpaths = selected["x1"].relpath.tolist()           # unique and sorted (external_table)
+        print(f"embedding {len(ext_relpaths)} {args.external_name} images (batch {args.batch_size}) from "
+              f"{external_root}", flush=True)
+        t = time.time()
+        emb_x = embed_images(model, ext_relpaths, external_root, args.batch_size, args.workers)
+        timing["embedding_x1_s"] = round(time.time() - t, 1)
+        selected["x1"]["row"] = np.arange(len(ext_relpaths))
 
     all_rows, curves, samples, per_mode = [], {}, [], {}
     for mode in modes:
         t = time.time()
         if mode == "p1":
             rows, c, sample, extra = evaluate_pairs(selected[mode], emb, args)
+        elif mode == "x1":
+            rows, c, sample, extra = evaluate_templates(selected[mode], emb_x, args, mode, external=True)
         else:
             rows, c, sample, extra = evaluate_templates(selected[mode], emb, args, mode)
         timing[f"{mode}_s"] = round(time.time() - t, 1)
-        notes = caveats(mode, train_phases)
+        notes = caveats(mode, train_phases, args.external_name)
         overall = rows[0]
         for target in FARS:
             key = far_key(target)
@@ -554,9 +662,14 @@ def main():
     labels = {m: f"{m.upper()} {'(inflated) ' if m == 'p1' else ''}{PROTOCOLS[m].split(':')[0]}: "
                  f"EER {100 * per_mode[m]['eer']:.2f}%, TAR@FAR=0.1% {100 * per_mode[m]['tar_at_far_1e-3']:.1f}%, "
                  f"rank-1 {100 * per_mode[m]['rank1']:.1f}%" for m in modes}
+    if "x1" in labels:
+        labels["x1"] = labels["x1"].replace("X1 ", f"X1 ({args.external_name}) ", 1)
     plot_curves(curves, labels, paths["verification_roc_det"])
-    if args.save_embeddings:
+    if args.save_embeddings and emb is not None:
         np.savez_compressed(paths["embeddings"], embeddings=emb.astype(np.float16), relpaths=np.array(relpaths))
+    if args.save_embeddings and emb_x is not None:
+        np.savez_compressed(os.path.join(args.out_dir, f"embeddings_{args.external_name}_{args.tag}.npz"),
+                            embeddings=emb_x.astype(np.float16), relpaths=selected["x1"].relpath.to_numpy())
 
     timing["total_minutes"] = round((time.time() - t0) / 60, 1)
     summary = {"tag": args.tag, "ckpt": args.ckpt, "git_commit": git_commit(), "modes": modes,
@@ -564,9 +677,17 @@ def main():
                "training_subjects": seen_source, "training_images_by_phase": train_phases,
                "max_subjects": args.max_subjects, "n_boot": args.n_boot, "seed": args.seed,
                "batch_size": args.batch_size, "score_grid_step": 1.0 / BINS_PER_UNIT,
-               "n_images_embedded": len(relpaths), "embedding_dim": int(emb.shape[1]),
+               "n_images_embedded": len(relpaths), "embedding_dim": int((emb if emb is not None else emb_x).shape[1]),
                "comparisons": "same eye only; FAR = false match rate, FRR = false non-match rate",
                "per_mode": per_mode, "timing": timing}
+    if "x1" in modes:                     # only with x1, so that p1 / p2 / p3 summaries keep their keys
+        summary["external"] = {"name": args.external_name, "manifest": os.path.abspath(args.external_manifest),
+                               "root": external_root, "subsets": list(external_subset_cols(args)),
+                               "n_images_embedded": len(selected["x1"]),
+                               "n_unusable_images_left_out": int(getattr(args, "external_unusable", 0)),
+                               "genuine": "probe and template of the same class (one eye of one person)",
+                               "impostor": "template of another person, same eye label; a probe's comparisons with "
+                                           "other classes of its own person are left out"}
     with open(paths["verification_summary"], "w") as f:
         json.dump(summary, f, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
     for m in modes:
