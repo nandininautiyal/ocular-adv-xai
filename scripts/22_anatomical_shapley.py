@@ -49,12 +49,19 @@ on each part group, src/xai/shapley.part_masses):
                              4-D activation, block14_sepconv2_act for Xception)
   attention                  attention maps of an anatomy model (averaged over its
                              maps), when the model has an attention_pool layer
-  receipt                    the parts model's exact per-part score contributions
-                             (margin-free cosine of the target class; multiply by s
-                             for logits), matched to the groups by part name
+                             (03 --arch attn, attn_mask, parts)
+  receipt                    the parts model's exact per-part decomposition of the
+                             score of the full image, in the units of --score: for
+                             logit, s x the part's term of the target's margin-free
+                             cosine (src.models.anatomy_model.part_receipt); for
+                             margin, the target's terms minus those of the best other
+                             class. Matched to the groups by part name. The receipt
+                             sums to v_full (receipt_sum; 23 checks it), while phi
+                             sums to v_full - v_empty: the receipt splits the score
+                             itself, ASA the score's drop when the parts are hidden.
 Attention and receipt come from src.models.anatomy_model (attention_maps,
-part_receipt, model_arch, part_names); without that module the columns are left
-out with a note.
+part_receipt, model_arch, part_names); models without an attention_pool layer
+(baseline, gap) have no attention columns, models other than parts no receipt.
 
 Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target):
   row_id, image_id, relpath, link_path, true_idx, true_subject, eye, device, lighting, phase
@@ -75,7 +82,9 @@ Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target
   int_<g>__<h>         Shapley interaction index of the pair (g, h)
   value_<k>            the coalition values (k = bitmask of kept groups, bit p = group p)
   mass_<src>_<g>       part masses of src = layercam, eigencam, attention
-  receipt_<g>          the parts model's receipt
+  receipt_<g>          the parts model's receipt (units of --score; NaN for a group the
+                       model has no part for)
+  receipt_sum          sum of the receipt over all of the model's parts (= v_full)
   del_auc_<src>        normalised deletion AUC (src/xai/shapley.deletion_from_values: the score
                        rescaled from 1 with every part kept to 0 with every present part
                        hidden; lower = it gets there sooner) when the present groups are hidden
@@ -141,13 +150,7 @@ from src.xai.shapley import (DEFAULT_GROUPS, DEFAULT_WORKERS, METHODS, asa_order
                              normalise_groups, order_from_scores, parse_groups, part_masses, score_values,
                              shapley_interactions)
 
-try:        # WP-A: anatomy-guided attention models; until it lands, the attention and receipt columns are skipped
-    from src.models.anatomy_model import attention_maps, model_arch, part_names, part_receipt  # noqa: E402
-except ImportError as _err:
-    attention_maps = model_arch = part_names = part_receipt = None
-    ANATOMY_IMPORT_ERROR = str(_err)
-else:
-    ANATOMY_IMPORT_ERROR = None
+from src.models.anatomy_model import attention_maps, model_arch, part_names, part_receipt  # noqa: E402
 
 
 def _load_script(name):
@@ -230,15 +233,29 @@ class Rates:
 
 def anatomy_capabilities(model):
     """What the model offers beyond CAMs: its arch, attention maps, the parts receipt."""
-    if model_arch is None:
-        return {"arch": None, "attention": False, "receipt": False, "receipt_parts": None,
-                "note": f"src.models.anatomy_model is not available ({ANATOMY_IMPORT_ERROR}): "
-                        f"no attention or receipt columns"}
     arch = model_arch(model)
     attention = any(layer.name == "attention_pool" for layer in model.layers)
     receipt = arch == "parts"
     return {"arch": arch, "attention": attention, "receipt": receipt,
-            "receipt_parts": [str(p) for p in part_names(model)] if receipt else None, "note": None}
+            "receipt_parts": [str(p) for p in part_names(model)] if receipt else None,
+            "receipt_units": "score (--score): sums to v_full" if receipt else None}
+
+
+def receipt_terms(model, images, class_idx, logits, score):
+    """Parts receipt (N, P_model) in the units of the ASA score, summing to the score of each image.
+
+    logit: s x the per-part terms of the target's margin-free cosine (they sum to the target's
+    margin-free logit). margin: the target's terms minus those of the best other class of
+    *logits* (the margin is a difference of two logits, each additive over the parts with the
+    same ||e||, so the difference is additive too).
+    """
+    class_idx = np.asarray(class_idx, np.int64)
+    terms = np.asarray(part_receipt(model, images, class_idx, units="logit"), np.float64)
+    if score == "logit":
+        return terms
+    others = np.array(logits, np.float64, copy=True)
+    others[np.arange(len(others)), class_idx] = -np.inf
+    return terms - np.asarray(part_receipt(model, images, others.argmax(axis=1), units="logit"), np.float64)
 
 
 def cam_maps(model, xai, images, class_idx, target_layer):
@@ -254,13 +271,15 @@ def class_specific(xai):
     return "class_idx" in inspect.signature(XAI_REGISTRY[xai]).parameters
 
 
-def explanations(model, images, targets, cams, target_layer, capabilities, receipt_index):
+def explanations(model, images, targets, cams, target_layer, capabilities, receipt_index, logits=None,
+                 score="margin"):
     """Per target ("true", "pred"): source -> per-image maps (CAMs, attention) or part vectors
-    (receipt, already in group order).
+    (receipt, already in group order, plus "receipt_sum" over all of the model's parts).
 
     targets : dict target -> class indices (N,)
     receipt_index : for each group, its column in the model's receipt (None if the model has
         no such part)
+    logits, score : margin-free logits of *images* and the ASA score (units of the receipt)
     """
     out = {t: {} for t in targets}
     shared = {}
@@ -276,7 +295,10 @@ def explanations(model, images, targets, cams, target_layer, capabilities, recei
             if class_specific(xai):
                 out[target][xai] = cam_maps(model, xai, images, class_idx, target_layer)
         if capabilities["receipt"]:
-            receipt = np.asarray(part_receipt(model, images, class_idx), np.float64)     # (N, P_model)
+            if logits is None:
+                logits = predict_logits(model, images)
+            receipt = receipt_terms(model, images, class_idx, logits, score)                # (N, P_model)
+            out[target]["receipt_sum"] = receipt.sum(axis=1)
             out[target]["receipt"] = np.stack(
                 [receipt[:, j] if j is not None else np.full(len(images), np.nan) for j in receipt_index], axis=1)
     return out
@@ -319,7 +341,8 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
     targets = {"true": ctx.labels}
     if info["condition"] != "clean" and flipped.any():
         targets["pred"] = pred
-    expl = explanations(ctx.model, images, targets, ctx.cams, ctx.target_layer, ctx.capabilities, ctx.receipt_index)
+    expl = explanations(ctx.model, images, targets, ctx.cams, ctx.target_layer, ctx.capabilities, ctx.receipt_index,
+                        logits, ctx.score)
     timings["explanations"] = timings.get("explanations", 0.0) + time.perf_counter() - start
 
     diff = (images - ctx.clean).reshape(len(images), -1)
@@ -341,7 +364,9 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
                 continue
             masses, scores = {}, {}
             for src, values in expl[target].items():
-                if src == "receipt":
+                if src == "receipt_sum":
+                    masses["receipt_sum"] = float(values[i])
+                elif src == "receipt":
                     scores[src] = values[i]
                     masses.update({f"receipt_{g}": float(v) for g, v in zip(names, values[i])})
                 else:
@@ -598,8 +623,6 @@ def main(argv=None):
             raise SystemExit(f"--target-layer {args.target_layer!r} is not a layer of {args.ckpt}") from None
     target_layer = args.target_layer or (find_feature_layer(model) if cams else None)
     capabilities = anatomy_capabilities(model)
-    if capabilities["note"]:
-        print("note:", capabilities["note"])
     receipt_index = [None] * len(names)
     if capabilities["receipt"]:
         parts = capabilities["receipt_parts"]

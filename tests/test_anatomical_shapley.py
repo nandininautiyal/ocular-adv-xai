@@ -217,36 +217,74 @@ def test_groups_from_a_config_file(script, tmp_path):
     assert script.resolve_groups("iris=iris;skin=skin") == (("iris", ("iris",)), ("skin", ("skin",)))
 
 
-def test_attention_and_receipt_columns(script, model, images, labels, monkeypatch):
-    """With an anatomy model (faked here: WP-A's module is not needed), attention part masses and
-    the parts receipt become columns and deletion orders."""
-    attention = np.zeros((2, 8, 8, 2), np.float32)
-    attention[:, 0, :, 0] = 1.0                                    # map 0: the top row of cells (brow)
-    attention[:, 3, 3, 1] = 1.0
+@pytest.fixture(scope="module")
+def parts_model():
+    """A tiny parts model (src/models/anatomy_model.py) with a perturbed, non-trivial head; its parts
+    are the default groups in a different order than 22's groups."""
+    import tensorflow as tf
+    import yaml
+    from src.models import anatomy_model as am
+    with open(os.path.join(REPO, "configs", "anatomy.yml")) as f:
+        cfg = yaml.safe_load(f)
+    cfg["model"].update({"backbone": "tiny", "fine_tune_at": 0, "dense_units": 16, "n_classes": 5})
+    cfg["anatomy"]["hidden"] = 8
+    cfg["anatomy"]["part_groups"] = {g: cfg["anatomy"]["part_groups"][g] for g in ("skin", "iris", "sclera",
+                                                                                   "brow", "lid")}
+    tf.keras.utils.set_random_seed(4)
+    model = am.build_anatomy_model(cfg, "parts")
+    rng = np.random.default_rng(4)
+    model.set_weights([w + rng.normal(0, 0.3, w.shape).astype(np.float32) for w in model.get_weights()])
+    return model
+
+
+@pytest.mark.parametrize("score", ["margin", "logit"])
+def test_attention_and_receipt_columns(script, parts_model, images, labels, score):
+    """A parts model gets attention part masses and the receipt in the units of the score, summing to
+    v_full, as columns and deletion orders."""
+    caps = script.anatomy_capabilities(parts_model)
     model_parts = ["skin", "iris", "sclera", "brow", "lid"]
-    receipt = np.array([[0.1, 0.5, 0.2, 0.05, 0.0], [0.3, 0.1, 0.1, 0.2, 0.0]])
-    monkeypatch.setattr(script, "attention_maps", lambda m, x: attention[:len(x)])
-    monkeypatch.setattr(script, "part_receipt", lambda m, x, c: receipt[:len(x)])
-    monkeypatch.setattr(script, "model_arch", lambda m: "parts")
-    monkeypatch.setattr(script, "part_names", lambda m: model_parts)
-    caps = script.anatomy_capabilities(model)
-    assert caps["arch"] == "parts" and caps["receipt"] and caps["receipt_parts"] == model_parts
-    assert caps["attention"] is False                              # the tiny model has no attention_pool layer
-    caps["attention"] = True
+    assert caps["arch"] == "parts" and caps["receipt"] and caps["attention"]
+    assert caps["receipt_parts"] == model_parts
     groups = normalise_groups(DEFAULT_GROUPS)
     index = [model_parts.index(g) for g in GROUPS]
     base = [{"image_id": i, "true_idx": int(labels[i])} for i in range(2)]
-    ctx = script.Context(model, images[:2], labels[:2], base, eye_labels(2), CLASSES, groups, ["mean"], "margin",
+    ctx = script.Context(parts_model, images[:2], labels[:2], base, eye_labels(2), CLASSES, groups, ["mean"], score,
                          ["layercam"], None, caps, index, 64, 0)
     rows, pred = script.condition_rows(ctx, images[:2], {"condition": "clean"})
-    assert len(rows) == 2 and (pred == labels[:2]).all()
-    row = rows[0]
-    for g, j in zip(GROUPS, index):
-        assert row[f"receipt_{g}"] == pytest.approx(receipt[0, j])
-    assert row["mass_attention_brow"] > row["mass_attention_iris"]
-    assert np.isfinite(row["del_auc_attention"]) and np.isfinite(row["del_auc_receipt"])
+    logits = predict_logits(parts_model, images[:2])
+    for row, i in zip(rows, range(2)):
+        receipt = np.array([row[f"receipt_{g}"] for g in GROUPS])
+        np.testing.assert_allclose(receipt.sum(), row["receipt_sum"], atol=1e-4)
+        np.testing.assert_allclose(row["receipt_sum"], row["v_full"], atol=1e-3)
+        target = logits[i, row["target_idx"]]
+        expected = target if score == "logit" else target - np.delete(logits[i], row["target_idx"]).max()
+        np.testing.assert_allclose(row["v_full"], expected, atol=1e-3)
+        masses = np.array([row[f"mass_attention_{g}"] for g in GROUPS])
+        assert np.all(masses >= 0) and masses.sum() <= 1 + 1e-6
+        assert np.isfinite(row["del_auc_attention"]) and np.isfinite(row["del_auc_receipt"])
     # groups the model has no part for get NaN receipts (and no receipt order)
     ctx.receipt_index = [1, 2, None, 3, 0]
     rows, _ = script.condition_rows(ctx, images[:2], {"condition": "clean"})
-    assert np.isnan(rows[0]["receipt_lid"]) and rows[0]["receipt_iris"] == pytest.approx(receipt[0, 1])
+    assert np.isnan(rows[0]["receipt_lid"]) and np.isfinite(rows[0]["receipt_iris"])
     assert np.isnan(rows[0]["del_auc_receipt"])                    # image 0 has a lid with no receipt
+
+
+def test_parts_model_end_to_end(script, analyse, parts_model, inputs, tmp_path):
+    """22 on a saved parts checkpoint, then 23's checks, including the receipt summing to v_full."""
+    ckpt = tmp_path / "parts.keras"
+    parts_model.save(ckpt)
+    out = tmp_path / "out"
+    args = common(inputs, out)
+    args[1] = str(ckpt)
+    script.main(args + ["--max-images", "2", "--levels", "2", "--attacks", "fgsm", "--defences", "none",
+                        "--baselines", "mean", "--cams", "layercam", "--tag", "parts"])
+    rows = pd.read_csv(out / "rows_asa_parts.csv")
+    summary = json.loads((out / "summary_asa_parts.json").read_text())
+    assert summary["anatomy"]["arch"] == "parts" and summary["anatomy"]["attention"]
+    assert {f"receipt_{g}" for g in GROUPS} | {f"mass_attention_{g}" for g in GROUPS} | {"receipt_sum"}         <= set(rows.columns)
+    checks = analyse.check_rows(rows, summary)
+    assert any("receipt sums to v_full" in c for c in checks)
+    broken = rows.copy()
+    broken.loc[0, "receipt_sum"] += 1.0
+    with pytest.raises(ValueError, match="receipt"):
+        analyse.check_rows(broken, summary)

@@ -10,7 +10,8 @@ and any mismatch stops the analysis: no duplicate rows; one true-class row per
 image for every condition variant and baseline; adversarial-class rows exactly
 where the prediction is wrong; attack_success of defended rows equal to the
 outcome of the attacked image; efficiency (sum of phi = v_full - v_empty) in
-every row; and the counts and rates of the summary JSON.
+every row; for a parts model, the receipt summing to v_full (receipt_sum); and
+the counts and rates of the summary JSON.
 
 Statistics never treat images as independent: every CI is a subject-cluster
 bootstrap and every test a Wilcoxon signed-rank test on per-subject means
@@ -63,6 +64,7 @@ sys.path.insert(0, REPO)
 from src.analysis.stats import (cluster_bootstrap_median, finite_median, format_p, holm,  # noqa: E402
                                 paired_subject_ci, paired_subject_test, parse_bool)
 
+RECEIPT_TOLERANCE = 1e-3       # receipt_sum vs v_full: two float32 computations of the same score
 MIN_N = 10                     # fewer finite pairs: estimates only, no CI and no p-value
 VARIANT = ["condition", "attack", "adapted_to", "eps", "defence"]
 MEASURES = ("phi", "share")
@@ -196,6 +198,16 @@ def check_rows(rows, summary=None, tolerance=1e-6):
         raise ValueError(f"{absent.sum()} absent groups have a non-zero phi (null player)")
     passed.append(f"efficiency (sum of phi = v_full - v_empty, max gap {gap.max():.2g}) and phi = 0 for absent groups "
                   f"in every row")
+
+    if "receipt_sum" in r:          # parts models: the receipt splits the score of the full image exactly
+        receipt = r.receipt_sum.to_numpy(np.float64)
+        v_full = r.v_full.to_numpy(np.float64)
+        off = np.abs(receipt - v_full)
+        bad = ~(off <= RECEIPT_TOLERANCE * np.maximum(1.0, np.abs(v_full)))
+        if bad.any():
+            raise ValueError(f"the parts receipt does not sum to v_full in {int(bad.sum())} rows "
+                             f"(max gap {np.nanmax(off):.3g})")
+        passed.append(f"the parts receipt sums to v_full in every row (max gap {off.max():.2g}, float32 forward passes)")
 
     if summary is not None:
         if summary.get("n_rows") is not None and summary["n_rows"] != len(r):

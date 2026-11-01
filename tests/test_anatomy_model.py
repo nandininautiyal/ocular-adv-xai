@@ -179,6 +179,12 @@ def test_part_receipt_sums_to_the_margin_free_cosine(built, x):
     cosine = predict_logits(model, x)[np.arange(len(x)), class_ids] / 64.0
     np.testing.assert_allclose(receipt.sum(axis=1), cosine, atol=2e-6)
     assert np.abs(receipt).max() > 1e-3                          # the terms are not all zero
+    logit_terms = am.part_receipt(model, x, class_ids, batch_size=3, units="logit")
+    assert am.arcface_scale(model) == 64.0
+    np.testing.assert_allclose(logit_terms, receipt * 64.0, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(logit_terms.sum(axis=1), cosine * 64.0, atol=2e-4)
+    with pytest.raises(ValueError, match="units"):
+        am.part_receipt(model, x, class_ids, units="prob")
     with pytest.raises(ValueError):
         am.part_receipt(built["attn"], x, class_ids)
     with pytest.raises(ValueError, match="class ids"):

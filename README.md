@@ -51,13 +51,17 @@ ocular-adv-xai/
   - fgsm_sample_run.py
   - ORIGINAL_README.md         original repo's README, untouched
   - VENDORED_FROM.txt          provenance: commit hash, date, notes
-- src/models/    wrapper around the reference model (Xception+ArcFace) and margin-free logits
+- src/models/    wrapper around the reference model (Xception+ArcFace) and margin-free logits; anatomy-guided
+  heads on the same backbone (anatomy_model.py: attention pooling with an eye-mask loss, a parts head whose
+  score splits exactly over the eye parts, an AttNet-style gate) and their mask-supervised trainer
+- src/data/      training data with eye masks: 03's augmentation applied to the image and its mask (masked_generator.py)
 - src/attacks/   FGSM/BIM/PGD/MIM/CW, Patch Occlusion, Monocle Blending; the 8-bit budget
   helper (budget.py); adaptive attacks through the defences (adaptive.py); the ablation of
   the vendored attacks' flaws (ablation.py)
 - src/defences/  JPEG and bit-depth reduction (inference time, with parameters); Strip and Patch
   Augmentation (training time). EAT and the unified defense are training-time too.
-- src/xai/       LayerCAM + Eigen-CAM; heuristic eye masks (masks.py); learned eye masks (seg_masks.py)
+- src/xai/       LayerCAM + Eigen-CAM; heuristic eye masks (masks.py); learned eye masks (seg_masks.py);
+  Anatomical Shapley Attribution, exact Shapley values over eye-part groups (shapley.py)
 - src/compare/   heatmap divergence metrics; region mass, area, enrichment and entropy per eye region
 - src/detect/    consistency-based attack detection (kept for reference)
 - src/analysis/  statistics (subject-cluster bootstrap, Wilcoxon, Holm, permutation tests) and
@@ -65,9 +69,10 @@ ocular-adv-xai/
 - src/eval/      verification and identification metrics (EER, TAR at FAR, rank-1, CIs)
 - src/generated_masks.zip   legacy: 150 preliminary heuristic masks made before the PR #24 mask
   rewrite; no code uses it
-- scripts/       00-18, see below
+- scripts/       00-23, see below
 - notebooks/     next_run.ipynb (the next Kaggle session, end to end); baseline-run.ipynb
-  (training record); train_cross_session.ipynb (cross-session retraining, 2 seeds, and its evaluation)
+  (training record); train_cross_session.ipynb (cross-session retraining, 2 seeds, and its evaluation);
+  train_anatomy.ipynb (the anatomy-guided models under the same protocol, their evaluation and ASA)
 - docs/          mask_labelling.md (hand-labelling eye masks with local tools)
 - splits/        visob_test.csv, the pinned test list of the checkpoint
 - tests/         pytest suite (CPU, tiny ArcFace model)
@@ -99,6 +104,10 @@ ocular-adv-xai/
 | 16_check_dataset.py | checks of the Kaggle VISOB copy (counts, synthetic frames, test-train overlap) and per-image heuristic mask areas | Kaggle CPU |
 | 17_make_eye_masks.py | learned eye masks (periorbital DeepLabV3, zero-shot) in model-input geometry | Kaggle GPU |
 | 18_validate_masks.py | exports a labelling pack; scores eye masks against hand labels (IoU, Dice) | Kaggle or laptop |
+| 20_prepare_ubipr.py | manifest of the UBIPr images for zero-shot cross-dataset verification (15 x1) | Kaggle |
+| 21_make_train_masks.py | 64 x 64 training masks for every image (or converted from 17's file) and how often each eye part is in the crop | Kaggle GPU |
+| 22_anatomical_shapley.py | Anatomical Shapley Attribution of clean, noisy, attacked and defended images, next to CAM and attention part masses and the parts model's exact receipt | Kaggle GPU |
+| 23_analyse_asa.py | statistics, tables, figures and report_asa.md from the rows of 22 | laptop |
 
 Each script's docstring gives its smoke-run and full-run commands.
 
@@ -125,6 +134,9 @@ PyTorch and torchvision are needed only to make the eye masks (17); Kaggle has t
   and use Save Version > Save & Run All (about 4-5 h). It runs 01, 02, 04, 17, 15, 05, 14, 16 and 12
   on both GPUs and the CPU at the same time, guards Kaggle's 12-hour limit, and ends with a checklist.
   Download `results.zip` from the Output panel.
+- **Anatomy-guided models (Kaggle):** `notebooks/train_anatomy.ipynb`, run like the notebook above
+  (`RUN_FULL = False` first, then Save & Run All): eye masks (17, 21), `03 --arch ...` for every model,
+  04, 15 and then 22 + 23 on the best mask model and the cross-session baseline. Resumable across sessions.
 - **Single scripts:** the order is 01 -> 02 -> 04 (correct-image list) -> 05 / 14 / 15 / 16 / 17. Every
   TensorFlow script runs in its own process (`!python ...`); never import TensorFlow in a notebook cell.
   Start every long run with a 2-3 minute smoke run.

@@ -430,16 +430,20 @@ def attention_maps(model, images, batch_size=32):
     return np.concatenate(parts) if parts else np.zeros((0,) + feature_grid(model) + (k,), np.float32)
 
 
-def part_receipt(model, images, class_ids, batch_size=32):
+def part_receipt(model, images, class_ids, batch_size=32, units="cosine"):
     """Per-part terms of the margin-free cosine of class ``class_ids[n]`` for image n: (N, P) float32.
 
     For the parts head e = sum_p e_p, and the margin-free cosine of class c is
     e . normalize(W_c) / ||e|| = sum_p e_p . normalize(W_c) / ||e||, so the terms sum
-    exactly (to float32 rounding) to the cosine; multiply by s for logits. The sum is
-    computed in float64 from the layer outputs, with ArcFace's l2_normalize floor.
+    exactly (to float32 rounding) to the cosine. ``units="logit"`` multiplies them by
+    ArcFace's s, so they sum to the margin-free logit of predict_logits (the units of the
+    ASA scores in src/xai/shapley.py). The sum is computed in float64 from the layer
+    outputs, with ArcFace's l2_normalize floor.
     """
     if model_arch(model) != "parts":
         raise ValueError(f"part_receipt needs a parts model, got {model_arch(model)}")
+    if units not in ("cosine", "logit"):
+        raise ValueError(f"units must be 'cosine' or 'logit', got {units!r}")
     sub = _sub_model(model, "parts", lambda: tf.keras.Model(model.inputs[0], model.get_layer("part_embedding").output))
     arcface = _find_arcface(model)
     weights = np.asarray(arcface.W, np.float64)
@@ -455,7 +459,15 @@ def part_receipt(model, images, class_ids, batch_size=32):
         norm = np.sqrt(np.maximum((e ** 2).sum(axis=1), 1e-12))
         w = weights[:, class_ids[i:i + batch_size]].T                                     # (n, D)
         out.append(np.einsum("npd,nd->np", e_parts, w) / norm[:, None])
-    return (np.concatenate(out) if out else np.zeros((0, attention_n_maps(model)))).astype(np.float32)
+    receipt = np.concatenate(out) if out else np.zeros((0, attention_n_maps(model)))
+    if units == "logit":
+        receipt = receipt * float(arcface.s)
+    return receipt.astype(np.float32)
+
+
+def arcface_scale(model):
+    """ArcFace's scale s of a model (margin-free logit = s x cosine)."""
+    return float(_find_arcface(model).s)
 
 
 def embed_regions(model, images, regions, batch_size=64):
