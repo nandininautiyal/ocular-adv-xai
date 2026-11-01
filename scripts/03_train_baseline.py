@@ -53,6 +53,32 @@ Training recipe (all optional; without them a run trains exactly as before):
                  without the optimizer state (smaller; load them with model.load_weights into
                  a model built from the same cfg)
 
+Architecture (--arch, src/models/anatomy_model.py; default baseline = the vendored create_model,
+whose behaviour and outputs are unchanged):
+  gap / attn     other pooling heads on the same backbone (no masks)
+  attn_mask      attention head trained with CE + lambda x KL(eye-region target || attention map);
+                 masks are used only in training
+  parts          one attention map per part group, per-part linear embeddings summed (the
+                 margin-free cosine is exactly the sum of per-part terms), per-part mask loss
+  attnet_gate    AttNet's fixed gate (x5 inside the eye region, x1/5 outside) before the gap head;
+                 its model has a third input (the eye-region fraction per 8 x 8 cell) and needs
+                 masks at test time as well (04 / 15 --region-masks)
+  --masks        masks64_<tag>.npz (21_make_train_masks.py) or a 256 masks_<tag>.npz (17) holding
+                 masks for the train, validation and test images; needed by attn_mask, parts and
+                 attnet_gate. Images are matched to masks like 17 / 18 match them (condition, phase,
+                 file name); a missing mask stops the run with a count unless --allow-missing-masks
+                 (mask-loss weight 0 for that image, attnet_gate region 0). The masks go through
+                 the same augmentation as the image (src/data/masked_generator.py).
+  --mask-loss-weight  lambda (default anatomy.mask_loss_weight of --cfg; configs/anatomy.yml is
+                 configs/cross_session.yml plus the anatomy section)
+  The training loop, callbacks, --resume, --reshuffle and --save-weights work as for the baseline.
+  The checkpoint is always the plain inference model (dual input; triple for attnet_gate) under the
+  same name Xception_ArcFace_<tag>.keras (every arch is Xception + ArcFace): put the arch in --tag.
+  For attn_mask and parts, val_loss (which the callbacks monitor) is CE + lambda x mask loss, and
+  the logs add ce, mask_loss, val_ce and val_mask_loss. run_<tag>.json adds arch, anatomy (the
+  effective settings, also under cfg), masks, masks_sha256, mask_classes and mask_coverage per
+  split; a baseline record has exactly the fields it had before.
+
 Writes to --out-dir:
   Xception_ArcFace_<tag>.keras       best checkpoint (lowest val_loss)
   class_index_<tag>.json             subject -> class index
@@ -79,6 +105,10 @@ Cross-session model with the real schedule, resumable over Kaggle sessions (run 
 command again in the next session):
   python scripts/03_train_baseline.py --split-dir /tmp/ocular_cross_session --n-classes 300 \
       --cfg configs/cross_session.yml --reshuffle --resume --save-weights --tag cs
+Mask-supervised attention model (masks from 21_make_train_masks.py), same recipe:
+  python scripts/03_train_baseline.py --split-dir /tmp/ocular_cross_session --n-classes 300 \
+      --cfg configs/anatomy.yml --arch attn_mask --masks /kaggle/working/masks/masks64_cs.npz \
+      --reshuffle --resume --save-weights --tag cs_attn_mask_s1
 """
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; must be set before importing tensorflow
@@ -102,17 +132,25 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
-from src.models.recognition_model import ArcFace, CustomDataGen, build_model, load_cfg  # noqa: E402
+from src.data.masked_generator import MODES, MaskedDataGen, MaskTable, MissingMasksError  # noqa: E402
+from src.models.anatomy_model import (ARCHS, CUSTOM_OBJECTS, MASK_ARCHS, MASK_LOSS_ARCHS,  # noqa: E402
+                                      anatomy_settings, build_anatomy_model, feature_grid, make_trainer)
+from src.models.recognition_model import ArcFace, CustomDataGen, build_model, load_cfg  # noqa: E402,F401
+
+MASK_GRID = 8                     # feature cells per side that the mask targets are computed on
+ANATOMY_ARGS = ("arch", "masks", "mask_loss_weight", "allow_missing_masks")
 
 
 def accuracies(model, gen, n_classes):
-    """Return (margin-free accuracy, with-labels accuracy) over a CustomDataGen."""
+    """Return (margin-free accuracy, with-labels accuracy) over a CustomDataGen (or a MaskedDataGen:
+    the targets it adds are ignored, the region input of attnet_gate is fed to the model)."""
     ok_free = ok_lab = total = 0
     for i in range(len(gen)):
-        (x, y), _ = gen[i]
+        (x, y, *rest), _ = gen[i]
+        extra = list(rest[:len(model.inputs) - 2])
         y_true = y.argmax(1)
-        p_free = model.predict_on_batch([x, np.zeros((len(x), n_classes), dtype="float32")])
-        p_lab = model.predict_on_batch([x, y])
+        p_free = model.predict_on_batch([x, np.zeros((len(x), n_classes), dtype="float32")] + extra)
+        p_lab = model.predict_on_batch([x, y] + extra)
         ok_free += int((np.asarray(p_free).argmax(1) == y_true).sum())
         ok_lab += int((np.asarray(p_lab).argmax(1) == y_true).sum())
         total += len(x)
@@ -291,7 +329,7 @@ class ResumeState(Callback):
             # loaded on the CPU so that the GPU does not hold a second copy of the model
             try:
                 with tf.device("/cpu:0"):
-                    best = tf.keras.models.load_model(self.ckpt_path, custom_objects={"ArcFace": ArcFace},
+                    best = tf.keras.models.load_model(self.ckpt_path, custom_objects=CUSTOM_OBJECTS,
                                                       compile=False)
                 self.early_stop.best_weights = best.get_weights()
                 del best
@@ -388,7 +426,7 @@ def save_best_weights(ckpt, path, fallback_model):
     """
     try:
         with tf.device("/cpu:0"):       # no second copy of the model on the GPU
-            best = tf.keras.models.load_model(ckpt, custom_objects={"ArcFace": ArcFace}, compile=False)
+            best = tf.keras.models.load_model(ckpt, custom_objects=CUSTOM_OBJECTS, compile=False)
         source = "best_checkpoint"
     except Exception as e:
         print("could not reload checkpoint, saving the in-memory weights:", repr(e)[:200])
@@ -410,12 +448,13 @@ def finish_run(args, record, run_path, ckpt, model, test_gen, epochs_run, minute
     results_<tag>.json. Also run by a --resume re-run whose earlier session stopped after the run record
     but before these files (model is then None and the checkpoint must load)."""
     try:
-        model = tf.keras.models.load_model(ckpt, custom_objects={"ArcFace": ArcFace})
+        model = tf.keras.models.load_model(ckpt, custom_objects=CUSTOM_OBJECTS)
         print("evaluating the best checkpoint")
     except Exception as e:
         if model is None:
             raise
         print("could not reload checkpoint, evaluating last-epoch weights:", repr(e)[:200])
+        model = getattr(model, "net", model)          # a MaskTrainer: its inference model
 
     if args.save_weights:
         weights_path = os.path.join(args.out_dir, f"Xception_ArcFace_{args.tag}.weights.h5")
@@ -436,6 +475,44 @@ def finish_run(args, record, run_path, ckpt, model, test_gen, epochs_run, minute
     print(json.dumps(res, indent=2))
 
 
+def run_args(args):
+    """The arguments a run record keeps (and a --resume re-run compares). A baseline run keeps exactly the
+    arguments of the records written before --arch existed, so that a run started with the older script
+    is recognised as finished (or resumed) by this one."""
+    recorded = dict(vars(args))
+    if args.arch == "baseline" and not args.masks and args.mask_loss_weight is None and not args.allow_missing_masks:
+        for key in ANATOMY_ARGS:
+            recorded.pop(key, None)
+    return recorded
+
+
+def check_anatomy_args(ap, args):
+    """Stop on --arch / --masks / --mask-loss-weight combinations that would silently do nothing."""
+    if args.arch in MASK_ARCHS and not args.masks:
+        ap.error(f"--arch {args.arch} needs --masks masks64_<tag>.npz (scripts/21_make_train_masks.py)")
+    if args.masks and args.arch not in MASK_ARCHS:
+        ap.error(f"--masks is used only by --arch {', '.join(MASK_ARCHS)}, not {args.arch}")
+    if args.mask_loss_weight is not None and args.arch not in MASK_LOSS_ARCHS:
+        ap.error(f"--mask-loss-weight is used only by --arch {', '.join(MASK_LOSS_ARCHS)}")
+    if args.allow_missing_masks and not args.masks:
+        ap.error("--allow-missing-masks needs --masks")
+
+
+def masked_generators(args, table, settings, classes, aug, plain, bs, size):
+    """Train / validation / test MaskedDataGen of --arch, like 03's ClassListDataGen with masks added."""
+    gens = []
+    for split, datagen, reshuffle in (("train", aug, args.reshuffle), ("validation", plain, False),
+                                      ("test", plain, False)):
+        try:
+            gens.append(MaskedDataGen(os.path.join(args.split_dir, split), datagen, classes, table, MODES[args.arch],
+                                      settings["part_groups"], settings["eps"], settings["min_part_area"],
+                                      batch_size=bs, target_size=size, reshuffle=reshuffle,
+                                      allow_missing=args.allow_missing_masks, grid=MASK_GRID))
+        except MissingMasksError as e:
+            raise SystemExit(str(e))
+    return gens
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split-dir", required=True)
@@ -454,7 +531,20 @@ def main():
                     help="new training batches every epoch (the vendored generator keeps those of the first)")
     ap.add_argument("--save-weights", action="store_true",
                     help="also write Xception_ArcFace_<tag>.weights.h5 (best weights, no optimizer state)")
+    ap.add_argument("--arch", choices=ARCHS, default="baseline",
+                    help="baseline (the vendored model, default), gap, attn, attn_mask, parts or attnet_gate "
+                         "(src/models/anatomy_model.py); the checkpoint keeps the name Xception_ArcFace_<tag>.keras "
+                         "and run_<tag>.json records the arch, so put the arch in --tag")
+    ap.add_argument("--masks", default=None,
+                    help="masks64_<tag>.npz from 21_make_train_masks.py (or a 256 masks_<tag>.npz from 17) covering "
+                         "the train, validation and test images; needed by attn_mask, parts and attnet_gate")
+    ap.add_argument("--mask-loss-weight", type=float, default=None,
+                    help="lambda of the mask loss (attn_mask, parts); default anatomy.mask_loss_weight of --cfg")
+    ap.add_argument("--allow-missing-masks", action="store_true",
+                    help="train on images without a mask with mask-loss weight 0 (attnet_gate: region 0) "
+                         "instead of stopping")
     args = ap.parse_args()
+    check_anatomy_args(ap, args)
 
     gpus = tf.config.list_physical_devices("GPU")
     # FIX: legacy tf.keras has no __version__, so report which Keras is really in use
@@ -490,12 +580,26 @@ def main():
         if not os.path.isdir(os.path.join(args.split_dir, split)):
             raise SystemExit(f"{os.path.join(args.split_dir, split)} not found; build it with 02_make_splits.py")
     classes = class_list(args.split_dir)          # one index per subject, the same in every split
-    train_gen = ClassListDataGen(os.path.join(args.split_dir, "train"), aug, classes, batch_size=bs,
-                                 target_size=size, reshuffle=args.reshuffle)
-    val_gen = ClassListDataGen(os.path.join(args.split_dir, "validation"), plain, classes, batch_size=bs,
-                               target_size=size)
-    test_gen = ClassListDataGen(os.path.join(args.split_dir, "test"), plain, classes, batch_size=bs,
-                                target_size=size)
+    settings = table = None
+    if args.arch != "baseline":                   # the effective anatomy settings go into the run record's cfg
+        cfg["anatomy"] = anatomy_settings(cfg)
+        if args.mask_loss_weight is not None:
+            cfg["anatomy"]["mask_loss_weight"] = args.mask_loss_weight
+        settings = cfg["anatomy"]
+    if args.arch in MODES:
+        table = MaskTable(args.masks)
+        print(f"masks: {len(table)} maps from {args.masks} | classes {table.class_names} | part groups "
+              f"{settings['part_groups']}")
+        train_gen, val_gen, test_gen = masked_generators(args, table, settings, classes, aug, plain, bs, size)
+        print("mask coverage:", {s: g.coverage() for s, g in
+                                 (("train", train_gen), ("validation", val_gen), ("test", test_gen))})
+    else:
+        train_gen = ClassListDataGen(os.path.join(args.split_dir, "train"), aug, classes, batch_size=bs,
+                                     target_size=size, reshuffle=args.reshuffle)
+        val_gen = ClassListDataGen(os.path.join(args.split_dir, "validation"), plain, classes, batch_size=bs,
+                                   target_size=size)
+        test_gen = ClassListDataGen(os.path.join(args.split_dir, "test"), plain, classes, batch_size=bs,
+                                    target_size=size)
 
     found = len(classes)
     print(f"classes found: {found} | train/val/test images: "
@@ -518,7 +622,7 @@ def main():
                 previous = json.load(f)
         except ValueError:
             previous = {}
-        if previous.get("finished") and previous.get("args") == vars(args):
+        if previous.get("finished") and previous.get("args") == run_args(args):
             # the same command has trained to the end; a backup still there was left by a session that
             # stopped between the run record and the removal of the backup
             shutil.rmtree(backup_dir, ignore_errors=True)
@@ -548,7 +652,16 @@ def main():
         print("resume:", f"continuing from the backup in {backup_dir}" if resumed else
               f"no backup yet, starting from scratch; backups go to {backup_dir}")
 
-    model = build_model(cfg)
+    if args.arch == "baseline":
+        model = build_model(cfg)
+    else:
+        model = build_anatomy_model(cfg, args.arch)
+        if args.arch in MODES and feature_grid(model) != (MASK_GRID, MASK_GRID):
+            raise SystemExit(f"the mask targets are {MASK_GRID} x {MASK_GRID} cells, but the feature map is "
+                             f"{feature_grid(model)}: use a 256 x 256 input")
+        if args.arch in MASK_LOSS_ARCHS:          # trains with CE + mask loss, saves the inference model
+            model = make_trainer(model, cfg)
+        print(f"arch: {args.arch} | anatomy settings: {settings}")
     print("model parameters:", f"{model.count_params():,}")
 
     class_index = os.path.join(args.out_dir, f"class_index_{args.tag}.json")
@@ -589,7 +702,7 @@ def main():
     best, best_val_loss = best_epoch(log)
     record = {
         "tag": args.tag, "finished": True, "git_commit": commit, "git_dirty": dirty,
-        "argv": sys.argv, "args": vars(args), "seed": args.seed, "cfg": cfg, "versions": package_versions(),
+        "argv": sys.argv, "args": run_args(args), "seed": args.seed, "cfg": cfg, "versions": package_versions(),
         "split_dir": args.split_dir,
         "images_per_split": {s: int(g.generator.samples) for s, g in gens.items()},
         "images_by_phase": phases,
@@ -604,6 +717,12 @@ def main():
         "weights": None, "weights_source": None, "weights_sha256": None,
         "class_index": class_index, "log": log_path,
     }
+    if args.arch != "baseline":            # a baseline record keeps exactly the fields it had before --arch
+        record.update({"arch": args.arch, "anatomy": settings,
+                       "masks": os.path.abspath(args.masks) if args.masks else None,
+                       "masks_sha256": file_sha256(args.masks) if args.masks else None,
+                       "mask_classes": table.class_names if table else None,
+                       "mask_coverage": {s: g.coverage() for s, g in gens.items()} if table else None})
 
     write_json(run_path, record)
     print("run record written to:", run_path)

@@ -1,0 +1,54 @@
+# Anatomy-guided models (03_train_baseline.py --arch gap | attn | attn_mask | parts | attnet_gate):
+# configs/cross_session.yml unchanged plus the anatomy section at the end, so a difference from the
+# cross-session baseline comes from the head (and its mask loss) only: same backbone, fine_tune_at,
+# ArcFace s and m, learning rate, batch size, schedule and augmentation.
+model:
+  input_shape: [256, 256, 3]
+  n_classes: 300          # VISOB IDs 1141-3279 plus 7000 (confirmed: 300 class folders)
+  fine_tune_at: 100
+  dense_units: 1024
+
+arcface:
+  scale: 64.0
+  margin: 0.50
+
+training:
+  batch_size: 32
+  epochs: 30              # a cap, not a target: early stopping normally ends the run before it
+  learning_rate: 0.0001   # unchanged from baseline.yml
+  early_stop_patience: 5  # stop after 5 epochs without a lower val_loss...
+  early_stop_restore_best: true   # ...and go back to the weights of the best epoch (03 also reloads the
+                                  # best checkpoint before testing; this keeps the in-memory model right too)
+  reduce_lr_patience: 2   # lower the rate after 2 epochs without improvement, so it drops at least
+                          # twice before early stopping (patience 5) ends the run
+  reduce_lr_factor: 0.2   # 1e-4 -> 2e-5 -> 4e-6 -> 1e-6
+  min_lr: 1.0e-6          # below learning_rate, so the reduction really happens (baseline: equal, a no-op)
+
+data:
+  train_dir: "ocular_recognition/train"
+  val_dir: "ocular_recognition/validation"
+  test_dir: "ocular_recognition/test"
+  target_size: [256, 256]
+  class_mode: "categorical"
+
+paths:
+  model_save_dir: "trained_models"
+  model_name: "Xception_best_model_ArcFace_Base.h5"
+  adversarial_dir: "Adversarial_Images"
+
+anatomy:
+  # Part groups over the mask classes (skin, iris, sclera, lid, caruncle, brow; 255 = unknown, in no
+  # group). The ORDER is the order of the parts model's maps and embeddings. The eye region (target of
+  # attn_mask, AttNet gate of attnet_gate) is every group except skin.
+  part_groups:
+    iris: [iris]
+    sclera: [sclera, caruncle]
+    lid: [lid]
+    brow: [brow]
+    skin: [skin]
+  hidden: 256             # width of the attention MLP (two 1 x 1 convolutions over the 8 x 8 cells)
+  mask_loss_weight: 1.0   # lambda: loss = CE + lambda x mean KL(target || attention map); 03 --mask-loss-weight
+  eps: 1.0e-3             # added to every cell of a target before normalising (no zero targets)
+  min_part_area: 0.005    # a part's map counts in the loss only if the part covers >= 0.5 % of the image
+  gate_inside: 5.0        # attnet_gate: AttNet's fixed gains (Zhao & Kumar, TIFS 2018): x5 inside the eye
+  gate_outside: 0.2       # region, x1/5 outside; a cell's gain is outside + (inside - outside) x eye fraction

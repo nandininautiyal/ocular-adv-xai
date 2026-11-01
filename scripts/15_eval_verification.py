@@ -51,6 +51,9 @@ Usage (Kaggle, checkpoint dataset and VISOB attached, 01 already run):
 Cross-dataset (VISOB not needed; 20_prepare_ubipr.py already run):
   python scripts/15_eval_verification.py --ckpt <checkpoint>.keras --modes x1 \
       --external-manifest /kaggle/working/ubipr/ubipr_manifest.csv --tag ubipr
+Any arch of 03 --arch loads. The attnet_gate model needs the eye masks at test time: add
+--region-masks masks64_<tag>.npz (21) or masks_<tag>.npz (17) covering every embedded image
+(matched by condition, phase and file name; a missing mask stops the run). Other archs ignore it.
 """
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; set before importing tensorflow
@@ -73,6 +76,7 @@ from src.eval.verification import (BINS_PER_UNIT, FARS, bootstrap_metrics, build
                                    metrics_from_counts, pair_counts, rank1_ci, ranks, roc_from_counts,
                                    template_counts, template_scores)
 from src.models.arcface_inference import load_checkpoint  # noqa: E402
+from src.models.anatomy_model import embed_regions, feature_grid, model_arch, region_classes  # noqa: E402
 
 DEFAULT_TEST_LIST = os.path.join(REPO, "splits", "visob_test.csv")
 RELPATH_RE = re.compile(r"^(?P<condition>[^/]+)/(?P<phase>enrollment|verification)_(?P<eye>left|right)_eye/"
@@ -268,13 +272,20 @@ def external_subset_cols(args):
     return tuple(c.strip() for c in (getattr(args, "external_subsets", None) or "").split(",") if c.strip())
 
 
-def embed_images(model, relpaths, root, batch_size, workers):
-    """Embeddings (N, D) of root/<relpath>, in order, with progress and a time estimate."""
+def embed_images(model, relpaths, root, batch_size, workers, region_of=None):
+    """Embeddings (N, D) of root/<relpath>, in order, with progress and a time estimate.
+
+    region_of: for a model with a region input (attnet_gate), a function relpaths -> (n, 8, 8, 1) regions.
+    """
     emb, t0 = None, time.time()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for start in range(0, len(relpaths), batch_size):
-            paths = [os.path.join(root, r) for r in relpaths[start:start + batch_size]]
-            e = embed(model, np.stack(list(pool.map(load_image, paths))), batch_size=batch_size)
+            batch = relpaths[start:start + batch_size]
+            images = np.stack(list(pool.map(load_image, [os.path.join(root, r) for r in batch])))
+            if region_of is None:
+                e = embed(model, images, batch_size=batch_size)
+            else:
+                e = embed_regions(model, images, region_of(batch), batch_size=batch_size)
             if emb is None:
                 emb = np.zeros((len(relpaths), e.shape[1]), np.float32)
             emb[start:start + len(e)] = e
@@ -284,6 +295,26 @@ def embed_images(model, relpaths, root, batch_size, workers):
                 print(f"  embedded {done}/{len(relpaths)} images | {(time.time() - t0) / 60:.1f} min | "
                       f"about {(len(relpaths) - done) / rate / 60:.1f} min left", flush=True)
     return emb
+
+
+def region_lookup(model, region_masks, relpaths):
+    """None for a dual-input model; for attnet_gate a function relpaths -> region inputs (n, 8, 8, 1)
+    from --region-masks, after checking that every image to embed has a mask."""
+    if len(model.inputs) == 2:
+        if region_masks:
+            print(f"NOTE: --region-masks is ignored: this {model_arch(model)} model has no region input")
+        return None
+    if not region_masks:
+        raise SystemExit(f"this {model_arch(model)} model has a region input: pass --region-masks")
+    from src.data.masked_generator import MaskTable, regions_for_rows
+    table = MaskTable(region_masks)
+    missing = [r for r, row in zip(relpaths, table.rows_for_relpaths(relpaths)) if row < 0]
+    if missing:
+        raise SystemExit(f"{len(missing)} of {len(relpaths)} images have no mask in {region_masks}, "
+                         f"e.g. {missing[:3]}")
+    eye, grid = region_classes(model), feature_grid(model)[0]
+    print(f"region input: eye-region fraction of {eye} per cell, from {region_masks}")
+    return lambda batch: regions_for_rows(table, table.rows_for_relpaths(batch), eye, grid)
 
 
 def subsets(images, cols=("device", "lighting")):
@@ -550,6 +581,8 @@ def main():
                     help="also report FAR and FRR at this score threshold (e.g. one set on another protocol)")
     ap.add_argument("--sample-scores", type=int, default=20000, help="genuine and impostor scores saved per mode")
     ap.add_argument("--save-embeddings", action="store_true", help="also write embeddings_<tag>.npz (float16)")
+    ap.add_argument("--region-masks", default=None,
+                    help="attnet_gate only: masks64_<tag>.npz (21) or masks_<tag>.npz (17) for the region input")
     ap.add_argument("--out-dir", default="/kaggle/working/verification")
     ap.add_argument("--tag", default="full")
     args = ap.parse_args()
@@ -598,13 +631,15 @@ def main():
     timing, t = {}, time.time()
     model = load_checkpoint(args.ckpt)
     timing["load_model_s"] = round(time.time() - t, 1)
-    print(f"loaded: {args.ckpt} ({timing['load_model_s']} s)")
+    print(f"loaded: {args.ckpt} ({timing['load_model_s']} s) | arch: {model_arch(model)}")
     relpaths = sorted(set().union(*(set(selected[m].relpath) for m in visob)))
+    region_of = region_lookup(model, args.region_masks,
+                              relpaths + (selected["x1"].relpath.tolist() if "x1" in selected else []))
     emb = emb_x = None
     if relpaths:
         print(f"embedding {len(relpaths)} images (batch {args.batch_size}) from {root}", flush=True)
         t = time.time()
-        emb = embed_images(model, relpaths, root, args.batch_size, args.workers)
+        emb = embed_images(model, relpaths, root, args.batch_size, args.workers, region_of)
         timing["embedding_s"] = round(time.time() - t, 1)
         row_of = {r: i for i, r in enumerate(relpaths)}
         for mode in visob:
@@ -614,7 +649,7 @@ def main():
         print(f"embedding {len(ext_relpaths)} {args.external_name} images (batch {args.batch_size}) from "
               f"{external_root}", flush=True)
         t = time.time()
-        emb_x = embed_images(model, ext_relpaths, external_root, args.batch_size, args.workers)
+        emb_x = embed_images(model, ext_relpaths, external_root, args.batch_size, args.workers, region_of)
         timing["embedding_x1_s"] = round(time.time() - t, 1)
         selected["x1"]["row"] = np.arange(len(ext_relpaths))
 
