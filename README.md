@@ -67,7 +67,7 @@ ocular-adv-xai/
   rewrite; no code uses it
 - scripts/       00-18, see below
 - notebooks/     next_run.ipynb (the next Kaggle session, end to end); baseline-run.ipynb
-  (training record)
+  (training record); train_cross_session.ipynb (cross-session retraining, 2 seeds, and its evaluation)
 - docs/          mask_labelling.md (hand-labelling eye masks with local tools)
 - splits/        visob_test.csv, the pinned test list of the checkpoint
 - tests/         pytest suite (CPU, tiny ArcFace model)
