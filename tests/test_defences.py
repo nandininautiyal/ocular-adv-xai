@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from src.defences.inference import DEFENCE_REGISTRY, bit_depth_reduction, jpeg_compress
+from src.defences.inference import (DEFENCE_REGISTRY, bit_depth_reduction, jpeg_compress, make_defence,
+                                    parse_defence)
 from src.defences.training import make_preprocessing_function, patch_augmentation, strip_augmentation
 
 
@@ -36,6 +37,52 @@ def test_bit_depth_levels(images):
     assert len(np.unique(out)) <= 4
     with pytest.raises(ValueError):
         bit_depth_reduction(images[0], bits=0)
+
+
+def test_make_defence_fixes_parameters(images):
+    jpeg50 = make_defence("jpeg", quality=50)
+    np.testing.assert_array_equal(jpeg50(images), jpeg_compress(images, quality=50))
+    assert not np.array_equal(jpeg50(images), jpeg_compress(images))
+    assert jpeg50(images[0]).shape == (256, 256, 3) and jpeg50.label == "jpeg:quality=50"
+    bits3 = make_defence("bit_depth", bits=np.int64(3))
+    np.testing.assert_array_equal(bits3(images), bit_depth_reduction(images, bits=3))
+    assert bits3.label == "bit_depth:bits=3"
+
+
+def test_make_defence_defaults_match_the_registry(images):
+    for name, fn in DEFENCE_REGISTRY.items():
+        defence = make_defence(name)
+        assert defence.label == name
+        np.testing.assert_array_equal(defence(images), fn(images))
+    # spelling out a default keeps the registry name, so rows stay comparable with older runs
+    assert make_defence("jpeg", quality=75).label == "jpeg"
+    assert make_defence("bit_depth", bits=4).label == "bit_depth"
+
+
+def test_make_defence_rejects_bad_parameters():
+    with pytest.raises(KeyError):
+        make_defence("blur")
+    with pytest.raises(TypeError):
+        make_defence("jpeg", bits=3)
+    for bad in (0, 101, 50.5, True, "50", float("nan")):
+        with pytest.raises(ValueError):
+            make_defence("jpeg", quality=bad)
+    with pytest.raises(ValueError):
+        make_defence("bit_depth", bits=9)
+
+
+def test_parse_defence(images):
+    for spec, label in [("jpeg", "jpeg"), ("jpeg:quality=50", "jpeg:quality=50"),
+                        (" bit_depth : bits = 3 ", "bit_depth:bits=3"), ("bit_depth:bits=4", "bit_depth")]:
+        defence = parse_defence(spec)
+        assert defence.label == label and parse_defence(defence.label).label == label
+    np.testing.assert_array_equal(parse_defence("jpeg:quality=50")(images[0]),
+                                  jpeg_compress(images[0], quality=50))
+    for bad in ("jpeg:quality", "jpeg:quality=high", "jpeg:=50", "jpeg:quality=0"):
+        with pytest.raises(ValueError):
+            parse_defence(bad)
+    with pytest.raises(KeyError):
+        parse_defence("blur:sigma=1")
 
 
 def test_strip_augmentation_matches_notebook_protocol(images):

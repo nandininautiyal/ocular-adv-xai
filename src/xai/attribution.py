@@ -32,6 +32,10 @@ Choices that matter for the heatmap-divergence study
 - Resolution: the Xception feature map is only 8 x 8 for a 256 x 256 input.
   Pass ``size=None`` to get the native map; compare metrics on native maps and
   upsample only for display.
+- Magnitude: every map is min-max scaled on its own, which discards how strong
+  the evidence was; a weak map looks as spread out as a strong one.
+  ``return_raw=True`` also returns the sum and maximum of each native map before
+  scaling, so "evidence removed" can be told apart from "evidence spread out".
 """
 
 import os
@@ -56,20 +60,31 @@ def _min_max(maps):
     return np.where(span > 0, (maps - lo) / np.where(span > 0, span, 1.0), 0.0).astype(np.float32)
 
 
-def _finish(maps, size, single):
-    """Normalise, optionally resize (bilinear), and drop the batch axis for single images."""
+def _finish(maps, size, single, return_raw=False):
+    """Normalise, optionally resize (bilinear), and drop the batch axis for single images.
+
+    With *return_raw*, also return the sum and maximum of each native map before
+    normalisation (floats for a single image, (N,) float64 arrays for a batch).
+    """
+    raw = np.asarray(maps, dtype=np.float64)
     maps = _min_max(maps)
     if size is not None:
         maps = tf.image.resize(maps[..., np.newaxis], size)[..., 0].numpy()
         maps = np.clip(maps, 0.0, 1.0).astype(np.float32)
-    return maps[0] if single else maps
+    maps = maps[0] if single else maps
+    if not return_raw:
+        return maps
+    raw_sum, raw_max = raw.sum(axis=(1, 2)), raw.max(axis=(1, 2))
+    if single:
+        return maps, float(raw_sum[0]), float(raw_max[0])
+    return maps, raw_sum, raw_max
 
 
 # ---------------------------------------------------------------------------
 # LayerCAM  (Jiang et al., 2021)
 # ---------------------------------------------------------------------------
 
-def layercam(model, image, class_idx=None, target_layer=None, size=DEFAULT_SIZE):
+def layercam(model, image, class_idx=None, target_layer=None, size=DEFAULT_SIZE, return_raw=False):
     """Generate a LayerCAM heatmap for *image*.
 
     Parameters
@@ -85,10 +100,14 @@ def layercam(model, image, class_idx=None, target_layer=None, size=DEFAULT_SIZE)
         Layer to explain. Defaults to the last 4-D activation (block14_sepconv2_act).
     size : (int, int) or None
         Output resolution. *None* returns the native feature-map resolution.
+    return_raw : bool
+        Also return the sum and maximum of the native map before min-max scaling
+        (in units of logit gradient x activation), whatever *size* is.
 
     Returns
     -------
     heatmap : np.ndarray, (H, W) or (N, H, W), float32, range [0, 1]
+    raw_sum, raw_max : float, or np.ndarray (N,) float64 for a batch — only with *return_raw*
     """
     x, single = as_batch(image)
     target_layer = target_layer or find_feature_layer(model)
@@ -107,7 +126,7 @@ def layercam(model, image, class_idx=None, target_layer=None, size=DEFAULT_SIZE)
 
     # LayerCAM: ReLU(gradients) weight each activation location, sum over channels.
     cams = tf.nn.relu(tf.reduce_sum(tf.nn.relu(grads) * features, axis=-1))
-    return _finish(cams.numpy(), size, single)
+    return _finish(cams.numpy(), size, single, return_raw)
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +149,7 @@ def _eigen_projection(activations):
     return projection.reshape(h, w)
 
 
-def eigencam(model, image, target_layer=None, size=DEFAULT_SIZE):
+def eigencam(model, image, target_layer=None, size=DEFAULT_SIZE, return_raw=False):
     """Generate an Eigen-CAM heatmap for *image*.
 
     Eigen-CAM is gradient-free and class-agnostic: it projects the activations
@@ -145,16 +164,20 @@ def eigencam(model, image, target_layer=None, size=DEFAULT_SIZE):
         Layer to explain. Defaults to the last 4-D activation (block14_sepconv2_act).
     size : (int, int) or None
         Output resolution. *None* returns the native feature-map resolution.
+    return_raw : bool
+        Also return the sum and maximum of the native projection before min-max
+        scaling (in activation units), whatever *size* is.
 
     Returns
     -------
     heatmap : np.ndarray, (H, W) or (N, H, W), float32, range [0, 1]
+    raw_sum, raw_max : float, or np.ndarray (N,) float64 for a batch — only with *return_raw*
     """
     x, single = as_batch(image)
     target_layer = target_layer or find_feature_layer(model)
     features, _ = get_margin_free(model, target_layer)(x)
     maps = np.stack([_eigen_projection(a) for a in features.numpy()])
-    return _finish(maps, size, single)
+    return _finish(maps, size, single, return_raw)
 
 
 # ---------------------------------------------------------------------------

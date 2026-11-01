@@ -28,7 +28,16 @@ Not in this module, on purpose:
 Both defences quantise to 8 bits. Any L-inf perturbation smaller than half a
 grey level (0.5 / 255 ~= 0.002, e.g. the paper's epsilon = 0.001) is removed by
 that quantisation alone, before the defence itself does anything.
+
+Parameters: the registry functions keep their defaults (JPEG quality 75,
+4 bits), which the base paper does not report. ``make_defence("jpeg",
+quality=50)`` and ``parse_defence("jpeg:quality=50")`` fix other values for a
+parameter sweep and label them for result tables ("jpeg" for the defaults).
 """
+
+import functools
+import inspect
+import numbers
 
 import numpy as np
 import tensorflow as tf
@@ -93,3 +102,76 @@ DEFENCE_REGISTRY = {
     "jpeg": jpeg_compress,
     "bit_depth": bit_depth_reduction,
 }
+
+# Parameters each defence accepts, with their valid (inclusive) ranges.
+PARAMETER_RANGES = {
+    "jpeg": {"quality": (1, 100)},
+    "bit_depth": {"bits": (1, 8)},
+}
+
+
+def make_defence(name, **params):
+    """A registry defence with its parameters fixed, e.g. ``make_defence("jpeg", quality=50)``.
+
+    Parameters
+    ----------
+    name : str — key of :data:`DEFENCE_REGISTRY`
+    **params : whole numbers within :data:`PARAMETER_RANGES` (``quality`` for
+        "jpeg", ``bits`` for "bit_depth"); omitted ones keep their defaults
+
+    Returns
+    -------
+    defence : callable image -> defended image (same contract as the registry
+        functions), with a ``label`` attribute for result tables: *name* when every
+        parameter has its default ("jpeg"), else ``name:key=value`` ("jpeg:quality=50")
+
+    Raises
+    ------
+    KeyError for an unknown *name*, TypeError for an unknown parameter, ValueError
+    for a value that is not a whole number in range.
+    """
+    if name not in DEFENCE_REGISTRY:
+        raise KeyError(f"unknown defence {name!r}; choose from {sorted(DEFENCE_REGISTRY)}")
+    ranges = PARAMETER_RANGES[name]
+    fixed = {}
+    for key, value in params.items():
+        if key not in ranges:
+            raise TypeError(f"defence {name!r} has no parameter {key!r}; it takes {sorted(ranges)}")
+        lo, hi = ranges[key]
+        if (isinstance(value, bool) or not isinstance(value, numbers.Real)
+                or not float(value).is_integer() or not lo <= value <= hi):
+            raise ValueError(f"{name} {key} must be a whole number in [{lo}, {hi}], got {value!r}")
+        fixed[key] = int(value)
+
+    fn = DEFENCE_REGISTRY[name]
+    defaults = {key: param.default for key, param in inspect.signature(fn).parameters.items()}
+    defence = functools.partial(fn, **fixed)
+    defence.label = name + "".join(f":{key}={value}" for key, value in sorted(fixed.items())
+                                   if value != defaults[key])
+    return defence
+
+
+def parse_defence(spec):
+    """:func:`make_defence` from a command-line spec.
+
+    Parameters
+    ----------
+    spec : str — "jpeg", "jpeg:quality=50", "bit_depth:bits=3"; the ``label`` of a
+        defence parses back to the same defence
+
+    Returns
+    -------
+    defence : callable with a ``label`` attribute, see :func:`make_defence`
+    """
+    name, *pairs = (part.strip() for part in str(spec).split(":"))
+    params = {}
+    for pair in pairs:
+        key, sep, value = (part.strip() for part in pair.partition("="))
+        if not sep or not key:
+            raise ValueError(f"expected name:key=value in defence spec {spec!r}, got {pair!r}")
+        try:
+            params[key] = int(value)
+        except ValueError:
+            raise ValueError(f"{key} must be a whole number in defence spec {spec!r}, "
+                             f"got {value!r}") from None
+    return make_defence(name, **params)
