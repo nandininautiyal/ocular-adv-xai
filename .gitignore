@@ -6,6 +6,7 @@ env/
 *.egg-info/
 .ipynb_checkpoints/
 data/
+!src/data/
 outputs/*.pt
 outputs/*.h5
 *.ckpt

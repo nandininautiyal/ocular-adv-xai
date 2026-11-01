@@ -34,8 +34,10 @@ from src.models.recognition_model import ArcFace
 
 
 def load_checkpoint(path):
-    """Load a trained ``.keras`` / ``.h5`` checkpoint with the vendored ArcFace layer."""
-    return tf.keras.models.load_model(path, custom_objects={"ArcFace": ArcFace})
+    """Load a trained ``.keras`` / ``.h5`` checkpoint: the vendored ArcFace layer plus the layers of
+    the anatomy-guided heads (src/models/anatomy_model.CUSTOM_OBJECTS), so every arch loads."""
+    from src.models.anatomy_model import CUSTOM_OBJECTS
+    return tf.keras.models.load_model(path, custom_objects=CUSTOM_OBJECTS)
 
 
 def get_n_classes(model):
