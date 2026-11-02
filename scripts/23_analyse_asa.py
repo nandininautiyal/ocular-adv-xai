@@ -12,8 +12,11 @@ where the prediction is wrong; attack_success of defended rows equal to the
 attack's own outcome (fgsm / pgd: the attacked image fooled the model; BPDA-PGD:
 the defended image did, as 22 defines it), and attack_success_undefended equal
 to the outcome of the attacked image; efficiency (sum of phi = v_full - v_empty) in
-every row; for a parts model, the receipt summing to v_full (receipt_sum); and
-the counts and rates of the summary JSON.
+every row; for a parts model, the receipt summing to v_full (receipt_sum); with
+verification pairs, one genuine and one impostor row per image, variant and baseline
+(score verif, cosine scores, the right template classes); KernelSHAP part values
+summing to v_full - v_empty; and the counts and rates of the summary JSON (rows per
+target kind included).
 
 Statistics never treat images as independent: every CI is a subject-cluster
 bootstrap and every test a Wilcoxon signed-rank test on per-subject means
@@ -59,6 +62,21 @@ Tables (CSV in --out-dir):
                           among successful attacks, by whether the label was restored (for
                           BPDA-PGD a success means the defended label is wrong, so it has no
                           restored split)
+  sampling_error.csv      KernelSHAP and LIME (part players, and patches aggregated to the parts)
+                          against exact ASA on the same game, per condition (and pooled: 'all') x
+                          hiding baseline x target: MAE (units of the score), relative MAE (MAE / mean
+                          |phi| of the row), Spearman rank agreement and sign agreement over the present
+                          parts. With 5 parts every coalition can be evaluated: this is what sampling
+                          would cost
+  verification_scores.csv  with --verif-pairs rows of 22: the cosine with the genuine / impostor
+                          template per variant, its shift from the clean probe and, for attacks, that
+                          shift minus the noise control's (Wilcoxon on per-subject means, Holm)
+  verification_shift.csv  phi_shift.csv for the genuine and the impostor games (column target)
+  runtime.csv             wall time per explanation (one image and condition): median, IQR and forward
+                          passes per method (and hiding baseline for ASA and the sampling baselines),
+                          measured on the run's hardware (summary runtime.hardware)
+  agreement.csv           pairwise Jensen-Shannon divergence (base 2) of the 256 x 256 attribution maps:
+                          median with CI per pair, condition, hiding baseline and target
 Figures: fig_phi_shift.png, fig_deletion.png. Report: report_asa.md.
 
 Usage:
@@ -79,7 +97,7 @@ sys.path.insert(0, REPO)
 from src.analysis.stats import (cluster_bootstrap_median, finite_median, format_p, holm,  # noqa: E402
                                 paired_subject_ci, paired_subject_test, parse_bool)
 
-RECEIPT_TOLERANCE = 1e-3       # receipt_sum vs v_full: two float32 computations of the same score
+RECEIPT_TOLERANCE = 1e-3       # receipt_sum (and KernelSHAP's sum) vs v_full: two float32 computations of a score
 MIN_N = 10                     # fewer finite pairs: estimates only, no CI and no p-value
 VARIANT = ["condition", "attack", "adapted_to", "eps", "defence"]
 MEASURES = ("phi", "share")
@@ -90,6 +108,12 @@ RATE_SECTIONS = {"clean": "clean_flip_rate", "noise": "noise_control_flip_rate",
                  "attack": "attack_success_rate"}
 DEFENDED_SECTIONS = ("attack_success_after_defence_rate", "restoration_rate_among_successful_attacks")
 SAME_EMPTY_ATOL = 1e-5         # v_empty of two games on the same image: one fill, two forward passes
+TARGET_KINDS = {"true": "true_class", "pred": "adv_class", "genuine": "genuine", "impostor": "impostor"}
+CLASS_TARGETS = ("true", "pred")
+VERIF_TARGETS = ("genuine", "impostor")
+ESTIMATES = ("kernelshap_parts", "lime_parts", "kernelshap_pixels", "lime_pixels")
+GAME_METHODS = ("asa",) + ESTIMATES          # run time depends on the hiding baseline
+COSINE_TOLERANCE = 1e-4        # |v_full| of a verification row: a cosine of float32 embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +164,8 @@ def prepare(rows):
         for i, k in zip(idx, r.iloc[idx][keys].itertuples(index=False, name=None)):
             outcome[i] = beat.get(k, outcome[i])
     r["outcome"] = outcome
+    if "target_kind" not in r:
+        r["target_kind"] = r.target.map(TARGET_KINDS)
     return r
 
 
@@ -247,6 +273,40 @@ def check_rows(rows, summary=None, tolerance=1e-6):
                              f"(max gap {np.nanmax(off):.3g})")
         passed.append(f"the parts receipt sums to v_full in every row (max gap {off.max():.2g}, float32 forward passes)")
 
+    verif = r[r.target.isin(VERIF_TARGETS)]
+    if len(verif):
+        if (verif.score != "verif").any():
+            raise ValueError("verification rows (genuine / impostor) must have score 'verif'")
+        per = verif.groupby(VARIANT + ["baseline", "target"]).image_id.agg(["size", "nunique"])
+        bad = per[(per["size"] != n_images) | (per["nunique"] != n_images)]
+        if len(bad):
+            raise ValueError(f"{len(bad)} verification variant x baseline x target groups do not have exactly one row "
+                             f"per image ({n_images} images): {bad.head(3).to_dict('index')}")
+        variants = set(map(tuple, true[VARIANT].drop_duplicates().to_numpy()))
+        if not set(map(tuple, verif[VARIANT].drop_duplicates().to_numpy())) <= variants:
+            raise ValueError("verification rows have condition variants without true-class rows")
+        genuine, impostor = verif[verif.target == "genuine"], verif[verif.target == "impostor"]
+        if (genuine.target_idx != genuine.true_idx).any() or (impostor.target_idx == impostor.true_idx).any():
+            raise ValueError("verification templates: genuine rows must use the true class, impostor rows another one")
+        if (verif.v_full.abs() > 1 + COSINE_TOLERANCE).any():
+            raise ValueError("verification rows have |v_full| > 1, but the verif score is a cosine")
+        passed.append(f"verification rows: one genuine and one impostor row per image for each of the "
+                      f"{len(per) // 2} variant x baseline groups, with cosine scores and the right template classes")
+
+    columns = [f"kernelshap_parts_{g}" for g in groups]
+    if all(c in r for c in columns):
+        ks = r[columns].to_numpy(np.float64)
+        done = np.isfinite(ks).all(axis=1)
+        span_done = (r.v_full - r.v_empty).to_numpy(np.float64)[done]
+        off = np.abs(ks[done].sum(axis=1) - span_done)
+        # KernelSHAP enforces efficiency with its own forward passes of the full and the empty coalition
+        bad = off > RECEIPT_TOLERANCE * np.maximum(1.0, np.abs(span_done))
+        if bad.any():
+            raise ValueError(f"KernelSHAP part values do not sum to v_full - v_empty in {int(bad.sum())} rows "
+                             "(its efficiency constraint)")
+        passed.append(f"KernelSHAP part values sum to v_full - v_empty in all {int(done.sum()):,} rows that have them "
+                      f"(max gap {off.max() if off.size else 0.0:.2g}, float32 forward passes)")
+
     if summary is not None:
         if summary.get("n_rows") is not None and summary["n_rows"] != len(r):
             raise ValueError(f"the summary JSON counts {summary['n_rows']} rows, the file has {len(r)}")
@@ -256,6 +316,9 @@ def check_rows(rows, summary=None, tolerance=1e-6):
         theirs = summary.get("rows_per_condition") or {}
         if theirs and {k: int(v) for k, v in theirs.items()} != {k: int(v) for k, v in counts.items()}:
             raise ValueError(f"rows per condition differ: summary {theirs}, rows {counts}")
+        kinds, theirs = r.target_kind.value_counts().to_dict(), summary.get("rows_per_target_kind") or {}
+        if theirs and {k: int(v) for k, v in theirs.items()} != {k: int(v) for k, v in kinds.items()}:
+            raise ValueError(f"rows per target kind differ: summary {theirs}, rows {kinds}")
         mine, checked = summary_rates(r), 0
         for section, values in mine.items():
             stated = summary.get(section)
@@ -315,10 +378,11 @@ def _add_holm(table, columns):
     return table
 
 
-def _attach_controls(r, groups):
-    """True-class condition rows (attack, attack+defence) joined with the clean row and the
-    same-budget control row of the same image and baseline (columns get _clean / _ctrl)."""
-    true = r[r.target == "true"]
+def _attach_controls(r, groups, target="true"):
+    """Condition rows (attack, attack+defence) of one target (default the true class; genuine or
+    impostor for verification rows) joined with the clean row and the same-budget control row of the
+    same image and baseline (columns get _clean / _ctrl)."""
+    true = r[r.target == target]
     cols = [f"{m}_{g}" for m in MEASURES for g in groups]
     clean = true[true.condition == "clean"][["image_id", "baseline"] + cols]
     out = []
@@ -338,10 +402,10 @@ def _attach_controls(r, groups):
 # Tables
 # ---------------------------------------------------------------------------
 
-def phi_shift(r, n_boot, by_outcome=False):
-    """Shift of phi (and share) from the clean image, against the same-budget control."""
+def phi_shift(r, n_boot, by_outcome=False, target="true"):
+    """Shift of phi (and share) from the clean image, against the same-budget control, for one target."""
     groups = groups_in(r.columns)
-    m = _attach_controls(r, groups)
+    m = _attach_controls(r, groups, target)
     if not len(m):
         return pd.DataFrame()
     keys = VARIANT + ["baseline"] + (["outcome"] if by_outcome else [])
@@ -421,7 +485,7 @@ def faithfulness(r, n_boot):
     sources = [s for s in CAM_SOURCES
                if all((f"mass_{s}_{g}" if s != "receipt" else f"receipt_{g}") in r for g in groups)]
     auc_sources = [s for s in ("asa", *CAM_SOURCES, "random") if f"del_auc_{s}" in r]
-    sub = r[r.condition.isin(["clean", "attack"])]
+    sub = r[r.condition.isin(["clean", "attack"]) & r.target.isin(CLASS_TARGETS)]
     out = []
     for key, g in sub.groupby(VARIANT + ["baseline", "target"], sort=True):
         info = dict(zip(VARIANT + ["baseline", "target"], key))
@@ -506,6 +570,154 @@ def attribution_restoration(r, n_boot):
                             "control_distance": c_est, "control_ci_low": c_lo, "control_ci_high": c_hi,
                             "diff_vs_control": d_est, "diff_ci_low": d_lo, "diff_ci_high": d_hi, "p": p})
     return _add_holm(pd.DataFrame(out), ["p"])
+
+
+def _scopes(frame, keys):
+    """(info, rows) per condition group, then pooled over the conditions (condition = 'all')."""
+    for key, g in frame.groupby(["condition"] + keys, sort=True):
+        yield dict(zip(["condition"] + keys, key)), g
+    for key, g in frame.groupby(keys, sort=True):
+        yield {"condition": "all", **dict(zip(keys, key if isinstance(key, tuple) else (key,)))}, g
+
+
+def sampling_error(r, n_boot):
+    """KernelSHAP and LIME (on the parts, and on patches aggregated to the parts) against exact ASA on the
+    same game: per row the mean absolute error over the present groups (in units of the score), the same
+    relative to the row's mean |phi|, Spearman rank agreement and the share of present groups with the same
+    sign; summarised per condition, hiding baseline and target (and pooled over conditions)."""
+    from src.xai.shapley import rank_agreement
+    groups = groups_in(r.columns)
+    sources = [s for s in ESTIMATES if all(f"{s}_{g}" in r for g in groups)]
+    sub = r[r.target.isin(CLASS_TARGETS)]
+    if not sources or not len(sub):
+        return pd.DataFrame()
+    phi = sub[[f"phi_{g}" for g in groups]].to_numpy(np.float64)
+    present = sub[[f"present_{g}" for g in groups]].to_numpy(bool)
+    n_present = present.sum(axis=1)
+    scale = np.where(present, np.abs(phi), 0.0).sum(axis=1) / np.maximum(n_present, 1)
+    out = []
+    for source in sources:
+        est = sub[[f"{source}_{g}" for g in groups]].to_numpy(np.float64)
+        done = np.isfinite(np.where(present, est, 0.0)).all(axis=1) & (n_present > 0)
+        if not done.any():
+            continue
+        err = np.where(present, np.abs(est - phi), 0.0).sum(axis=1) / np.maximum(n_present, 1)
+        same = np.where(present, np.sign(est) == np.sign(phi), False).sum(axis=1) / np.maximum(n_present, 1)
+        frame = sub.loc[done, ["condition", "baseline", "target", "true_idx"]].assign(
+            mae=err[done], rel_mae=np.where(scale > 0, err / np.where(scale > 0, scale, 1.0), np.nan)[done],
+            sign_agreement=same[done],
+            rank_agreement=[rank_agreement(a, b, p) for a, b, p in zip(phi[done], est[done], present[done])])
+        for info, g in _scopes(frame, ["baseline", "target"]):
+            subjects = g.true_idx.to_numpy()
+            row = {"estimator": source, **info, "n": int(len(g)), "n_subjects": int(g.true_idx.nunique())}
+            for metric in ("mae", "rel_mae", "sign_agreement"):
+                est_, lo, hi = _mean_ci(g[metric], subjects, n_boot)
+                row.update({metric: est_, f"{metric}_ci_low": lo, f"{metric}_ci_high": hi})
+            est_, lo, hi = _median_ci(g.rank_agreement, subjects, n_boot)
+            row.update({"rank_agreement_median": est_, "rank_ci_low": lo, "rank_ci_high": hi})
+            out.append(row)
+    return pd.DataFrame(out)
+
+
+def verification_scores(r, n_boot):
+    """Verification rows (genuine / impostor template): the score v_full (cosine of the probe with the
+    template) per variant, its shift from the clean probe and, for attacks, that shift minus the shift of
+    the same-budget noise control (Wilcoxon p on per-subject means, Holm)."""
+    v = r[r.target.isin(VERIF_TARGETS)]
+    if not len(v):
+        return pd.DataFrame()
+    clean = v[v.condition == "clean"][["image_id", "baseline", "target", "v_full"]]
+    m = v.merge(clean, on=["image_id", "baseline", "target"], suffixes=("", "_clean"), how="left",
+                validate="many_to_one")
+    ctrl = v[v.condition == "noise"][["image_id", "baseline", "target", "eps", "v_full"]]
+    m = m.merge(ctrl.rename(columns={"v_full": "v_full_ctrl"}), on=["image_id", "baseline", "target", "eps"],
+                how="left", validate="many_to_one")
+    out = []
+    for key, g in m.groupby(["target"] + VARIANT + ["baseline"], sort=True):
+        info = dict(zip(["target"] + VARIANT + ["baseline"], key))
+        subjects = g.true_idx.to_numpy()
+        score, lo, hi = _mean_ci(g.v_full, subjects, n_boot)
+        shift = (g.v_full - g.v_full_clean).to_numpy(np.float64)
+        s_est, s_lo, s_hi = _mean_ci(shift, subjects, n_boot)
+        row = {**info, "n": int(len(g)), "n_subjects": int(g.true_idx.nunique()), "score": score,
+               "score_ci_low": lo, "score_ci_high": hi, "shift": s_est, "shift_ci_low": s_lo, "shift_ci_high": s_hi,
+               "diff_vs_control": np.nan, "diff_ci_low": np.nan, "diff_ci_high": np.nan, "p": np.nan}
+        if info["condition"] == "attack":
+            control = (g.v_full_ctrl - g.v_full_clean).to_numpy(np.float64)
+            d, d_lo, d_hi, p = _paired(shift, control, subjects, n_boot)
+            row.update({"diff_vs_control": d, "diff_ci_low": d_lo, "diff_ci_high": d_hi, "p": p})
+        out.append(row)
+    return _add_holm(pd.DataFrame(out), ["p"])
+
+
+def verification_shift(r, n_boot):
+    """phi_shift for the genuine and the impostor template (column target)."""
+    tables = [phi_shift(r, n_boot, target=t).assign(target=t) for t in VERIF_TARGETS if (r.target == t).any()]
+    tables = [t for t in tables if len(t)]
+    return pd.concat(tables, ignore_index=True) if tables else pd.DataFrame()
+
+
+def runtime(r):
+    """Wall time per explanation (one image and condition) and forward passes, per method: median and IQR
+    over the true-class rows (one per image, variant and hiding baseline); methods whose cost depends on
+    the hiding baseline (ASA, the sampling baselines) per baseline, the others once per image and variant.
+    ASA with the verification score (embeddings) from the genuine rows. Measured on the run's hardware."""
+    methods = [c[len("time_"):] for c in r.columns if c.startswith("time_")]
+    if not methods:
+        return pd.DataFrame()
+    true = r[r.target_kind == "true_class"]
+    first = true[true.baseline == true.baseline.iloc[0]] if len(true) else true
+    genuine = r[r.target_kind == "genuine"]
+    out = []
+
+    def add(method, baseline, frame, column):
+        seconds = frame[f"time_{column}"].to_numpy(np.float64)
+        forwards = frame[f"nfwd_{column}"].to_numpy(np.float64) if f"nfwd_{column}" in frame else np.full(len(frame),
+                                                                                                         np.nan)
+        keep = np.isfinite(seconds)
+        if not keep.any():
+            return
+        q25, q50, q75 = np.quantile(seconds[keep], [0.25, 0.5, 0.75])
+        out.append({"method": method, "baseline": baseline, "n": int(keep.sum()), "median_s": q50, "q25_s": q25,
+                    "q75_s": q75, "iqr_s": q75 - q25, "mean_s": float(seconds[keep].mean()),
+                    "forwards_median": float(np.nanmedian(forwards[keep])) if np.isfinite(forwards[keep]).any()
+                    else np.nan,
+                    "forwards_mean": float(np.nanmean(forwards[keep])) if np.isfinite(forwards[keep]).any()
+                    else np.nan})
+
+    for method in methods:
+        if method in GAME_METHODS:
+            for baseline, g in true.groupby("baseline", sort=True):
+                add(method, baseline, g, method)
+        else:
+            add(method, "", first, method)
+    if len(genuine) and "time_asa" in genuine:
+        for baseline, g in genuine.groupby("baseline", sort=True):
+            add("asa_verif", baseline, g, "asa")
+    return pd.DataFrame(out)
+
+
+def agreement(r, n_boot):
+    """Pairwise Jensen-Shannon divergence (base 2) of the 256 x 256 attribution maps: median with its
+    subject-cluster CI per pair, condition, hiding baseline and target (classification rows), and pooled
+    over the conditions."""
+    columns = [c for c in r.columns if c.startswith("js_")]
+    sub = r[r.target.isin(CLASS_TARGETS)]
+    if not columns or not len(sub):
+        return pd.DataFrame()
+    out = []
+    for info, g in _scopes(sub, ["baseline", "target"]):
+        subjects = g.true_idx.to_numpy()
+        for column in columns:
+            values = g[column].to_numpy(np.float64)
+            if not np.isfinite(values).any():
+                continue
+            a, b = column[len("js_"):].split("__")
+            est, lo, hi = _median_ci(values, subjects, n_boot)
+            out.append({**info, "source_a": a, "source_b": b, "n": int(np.isfinite(values).sum()),
+                        "js_median": est, "js_ci_low": lo, "js_ci_high": hi,
+                        "js_mean": float(np.nanmean(values))})
+    return pd.DataFrame(out)
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +893,89 @@ def report(tables, checks, summary, args):
                              _ci(r.control_distance, r.control_ci_low, r.control_ci_high, ".3f"),
                              _ci(r.diff_vs_control, r.diff_ci_low, r.diff_ci_high) +
                              f" (p_Holm {format_p(r.p_holm)})"] for r in t.itertuples()]) + [""]
+    lines += _report_fu(tables, summary, args)
     return "\n".join(lines)
+
+
+def _report_baseline(table, args):
+    """The hiding baseline shown in a report table: --baseline, else blur, else the first."""
+    baselines = [b for b in dict.fromkeys(table.baseline) if b != ""]
+    wanted = getattr(args, "baseline", None)
+    return wanted if wanted in baselines else ("blur" if "blur" in baselines else (baselines[0] if baselines else ""))
+
+
+def _report_fu(tables, summary, args):
+    """Report sections for the sampling baselines, verification pairs, run times and agreement."""
+    lines = []
+    summary = summary or {}
+    err = tables.get("sampling_error", pd.DataFrame())
+    if len(err):
+        t = err[(err.target == "true") & err.condition.isin(["clean", "attack", "all"])]
+        part, pixel = summary.get("part_baselines", {}), summary.get("pixel_baselines", {})
+        lines += ["## Sampling baselines against exact ASA (true class)", "",
+                  f"KernelSHAP and LIME on the same part players, hiding baselines and score "
+                  f"({part.get('samples', '?')} coalitions per explanation instead of all 2^P of the exact game), "
+                  f"and on {pixel.get('patch_size', '?')} px patches ({pixel.get('samples', '?')} coalitions) "
+                  "aggregated to the parts by pixel share. Error against exact ASA on the same game: MAE (units of "
+                  "the score), relative MAE (MAE / mean |phi| of the row), rank agreement (Spearman over present "
+                  "parts, median) and sign agreement (share of present parts with the sign of phi).", ""]
+        lines += _markdown(["estimator", "baseline", "condition", "n", "MAE", "relative MAE", "rank agreement",
+                            "same sign"],
+                           [[r.estimator, r.baseline, r.condition, r.n, _ci(r.mae, r.mae_ci_low, r.mae_ci_high, ".3f"),
+                             _ci(r.rel_mae, r.rel_mae_ci_low, r.rel_mae_ci_high, ".2f"),
+                             _ci(r.rank_agreement_median, r.rank_ci_low, r.rank_ci_high, ".2f"),
+                             _ci(r.sign_agreement, r.sign_agreement_ci_low, r.sign_agreement_ci_high, ".2f")]
+                            for r in t.itertuples()]) + [""]
+    ver = tables.get("verification_scores", pd.DataFrame())
+    if len(ver):
+        baseline = _report_baseline(ver, args)
+        t = ver[ver.baseline == baseline]
+        lines += ["## Verification pairs (probe = condition image, template clean)", "",
+                  "Score = cosine of the probe's embedding with the template's (v_full; the same for every hiding "
+                  "baseline). Shift = change from the clean probe; for attacks also minus the shift of the "
+                  "same-budget noise control (Wilcoxon on per-subject means, Holm). The part attributions of these "
+                  "games are in verification_shift.csv.", ""]
+        lines += _markdown(["template", "condition", "n", "score", "shift", "shift - noise control"],
+                           [[r.target, variant_name(r.condition, r.attack, r.adapted_to, r.eps, r.defence), r.n,
+                             _ci(r.score, r.score_ci_low, r.score_ci_high, ".3f"),
+                             _ci(r.shift, r.shift_ci_low, r.shift_ci_high),
+                             (_ci(r.diff_vs_control, r.diff_ci_low, r.diff_ci_high) +
+                              f" (p_Holm {format_p(r.p_holm)})") if r.condition == "attack" else ""]
+                            for r in t.itertuples()]) + [""]
+    rt = tables.get("runtime", pd.DataFrame())
+    if len(rt):
+        hw = (summary.get("runtime") or {}).get("hardware") or {}
+        where = []
+        if hw:
+            where = [hw.get("platform"), f"{hw.get('cpu_threads')} CPU threads",
+                     ("GPU " + "; ".join(map(str, hw["gpus"]))) if hw.get("gpus") else "no GPU"]
+        where = ", ".join(str(x) for x in where if x)
+        lines += ["## Run time per explanation", "",
+                  "Wall time per image and condition and forward passes, measured on our hardware"
+                  f"{' (' + where + ')' if where else ''}: the ratios between methods are the point, not the "
+                  "absolute times. Batched methods (CAMs, attention, receipt) get their batch's time divided by its "
+                  "images; LayerCAM also needs one backward pass. The sampling baselines run stand-alone (their own "
+                  "coalition images and forward passes).", ""]
+        lines += _markdown(["method", "baseline", "n", "median (s)", "IQR (s)", "forward passes (median)"],
+                           [[r.method, r.baseline, r.n, f"{r.median_s:.4f}", f"{r.q25_s:.4f}-{r.q75_s:.4f}",
+                             _num(r.forwards_median, ".0f")] for r in rt.itertuples()]) + [""]
+    ag = tables.get("agreement", pd.DataFrame())
+    if len(ag):
+        baseline = _report_baseline(ag, args)
+        t = ag[(ag.target == "true") & (ag.baseline == baseline)]
+        conditions = [c for c in ("clean", "attack", "all") if (t.condition == c).any()]
+        lines += [f"## Agreement between attributions (true class, baseline {baseline})", "",
+                  "Jensen-Shannon divergence (base 2) of the 256 x 256 maps as distributions (0 = the same, 1 = "
+                  "disjoint; median and subject-cluster CI). ASA, the part baselines and the receipt spread their "
+                  "positive part values over the part's pixels, the pixel baselines their positive patch values; "
+                  "CAMs and attention are upsampled. Deletion curves stay the main faithfulness test.", ""]
+        body = []
+        for (a, b), g in t.groupby(["source_a", "source_b"], sort=False):
+            v = g.set_index("condition")
+            body.append([f"{a} ~ {b}"] + [_ci(v.js_median[c], v.js_ci_low[c], v.js_ci_high[c], ".3f")
+                                          if c in v.index else "n/a" for c in conditions])
+        lines += _markdown(["pair"] + conditions, body) + [""]
+    return lines
 
 
 def _sibling(rows_path, prefix, ext):
@@ -724,7 +1018,12 @@ def main(argv=None):
               "phi_shift_by_outcome": phi_shift(r, args.n_boot, by_outcome=True),
               "baseline_sensitivity": baseline_sensitivity(r, args.n_boot),
               "faithfulness": faithfulness(r, args.n_boot),
-              "attribution_restoration": attribution_restoration(r, args.n_boot)}
+              "attribution_restoration": attribution_restoration(r, args.n_boot),
+              "sampling_error": sampling_error(r, args.n_boot),
+              "verification_scores": verification_scores(r, args.n_boot),
+              "verification_shift": verification_shift(r, args.n_boot),
+              "runtime": runtime(r),
+              "agreement": agreement(r, args.n_boot)}
     os.makedirs(args.out_dir, exist_ok=True)
     for name, table in tables.items():
         table.to_csv(os.path.join(args.out_dir, f"{name}.csv"), index=False)

@@ -260,3 +260,120 @@ def test_main_writes_tables_figures_and_report(analyse, tmp_path):
     with pytest.raises(SystemExit, match="row accounting failed"):
         analyse.main(["--rows", str(path), "--out-dir", str(tmp_path / "again")])
     assert not (tmp_path / "again").exists()
+
+
+# ---------------------------------------------------------------------------
+# Sampling baselines, verification pairs, run times and agreement
+# ---------------------------------------------------------------------------
+
+def make_fu_rows():
+    """make_rows plus the columns of 22's sampling baselines, run times and agreement, and verification rows
+    (genuine: the true class; impostor: the next class) on clean, noise and attack with phi / 20 (cosines)."""
+    rows = make_rows()
+    phi = rows[[f"phi_{g}" for g in GROUPS]].to_numpy()
+    present = rows[[f"present_{g}" for g in GROUPS]].to_numpy(bool)
+    for k, g in enumerate(GROUPS):
+        rows[f"kernelshap_parts_{g}"] = phi[:, k]                             # exact
+        rows[f"lime_parts_{g}"] = np.where(present[:, k], phi[:, k] + 0.5, 0.0)   # off by 0.5 on every present part
+    rows["time_asa"] = 0.1 + 0.01 * rows.image_id
+    rows["nfwd_asa"] = 32
+    rows["time_layercam"], rows["nfwd_layercam"] = 0.02, 1
+    rows["js_asa__layercam"] = np.where(rows.condition == "clean", 0.2, 0.4)
+    verif = []
+    for kind, offset in (("genuine", 0), ("impostor", 1)):
+        part = rows[(rows.target == "true") & rows.condition.isin(["clean", "noise", "attack"])].copy()
+        for g in GROUPS:
+            part[f"phi_{g}"] = part[f"phi_{g}"] / 20
+        part["v_full"] = part[[f"phi_{g}" for g in GROUPS]].sum(axis=1) - 0.1 * offset
+        part["v_empty"] = -0.1 * offset
+        part["target"], part["score"] = kind, "verif"
+        part["target_idx"] = (part.image_id + offset) % N
+        part[[f"kernelshap_parts_{g}" for g in GROUPS] + [f"lime_parts_{g}" for g in GROUPS]] = np.nan
+        verif.append(part)
+    return pd.concat([rows] + verif, ignore_index=True)
+
+
+def test_fu_rows_pass_the_accounting(analyse):
+    rows = make_fu_rows()
+    checks = analyse.check_rows(rows, {**summary_of(analyse, rows), "rows_per_target_kind": {
+        "true_class": int((rows.target == "true").sum()), "adv_class": int((rows.target == "pred").sum()),
+        "genuine": int((rows.target == "genuine").sum()), "impostor": int((rows.target == "impostor").sum())}})
+    assert len(checks) == 9
+    assert any("one genuine and one impostor row per image for each of the 6" in c for c in checks)
+    assert any("KernelSHAP part values sum to v_full - v_empty in all" in c for c in checks)
+    broken = rows.assign(kernelshap_parts_iris=rows.kernelshap_parts_iris + (rows.index == 3))
+    with pytest.raises(ValueError, match="KernelSHAP"):
+        analyse.check_rows(broken)
+    with pytest.raises(ValueError, match="cosine"):
+        analyse.check_rows(rows.assign(v_full=np.where(rows.target == "genuine", rows.v_full + 5, rows.v_full),
+                                       phi_skin=np.where(rows.target == "genuine", rows.phi_skin + 5, rows.phi_skin)))
+    with pytest.raises(ValueError, match="score 'verif'"):
+        analyse.check_rows(rows.assign(score="margin"))
+
+
+def test_sampling_error(analyse):
+    table = analyse.sampling_error(analyse.prepare(make_fu_rows()), n_boot=100)
+    assert set(table.estimator) == {"kernelshap_parts", "lime_parts"} and set(table.target) == {"true", "pred"}
+    exact = table[(table.estimator == "kernelshap_parts") & (table.condition == "clean") & (table.baseline == "blur")
+                  & (table.target == "true")].iloc[0]
+    assert exact.n == N and exact.mae == pytest.approx(0.0) and exact.rank_agreement_median == pytest.approx(1.0)
+    assert exact.sign_agreement == pytest.approx(1.0)
+    lime = table[(table.estimator == "lime_parts") & (table.condition == "all") & (table.baseline == "mean")
+                 & (table.target == "true")].iloc[0]
+    assert lime.mae == pytest.approx(0.5) and lime.mae_ci_low == pytest.approx(0.5)
+    assert lime.rank_agreement_median == pytest.approx(1.0)               # a constant offset keeps the order
+    clean_lime = table[(table.estimator == "lime_parts") & (table.condition == "clean") & (table.baseline == "blur")
+                       & (table.target == "true")].iloc[0]
+    scale = np.array([np.mean(np.array([3.0, 2.0, 1.0])[[True, i != 0, True]] * (1 + 0.05 * i)) for i in range(N)])
+    assert clean_lime.rel_mae == pytest.approx(np.mean(0.5 / scale))
+    assert {"clean", "noise", "attack", "all"} <= set(table.condition)
+
+
+def test_verification_scores_and_shift(analyse):
+    r = analyse.prepare(make_fu_rows())
+    table = analyse.verification_scores(r, n_boot=100)
+    assert set(table.target) == {"genuine", "impostor"} and set(table.condition) == {"clean", "noise", "attack"}
+    gen = table[(table.target == "genuine") & (table.baseline == "blur")].set_index("condition")
+    clean_score = np.array([6.0 - (i == 0) * 2.0 for i in range(N)]) * (1 + 0.05 * np.arange(N)) / 20
+    assert gen.loc["clean", "score"] == pytest.approx(clean_score.mean())
+    assert gen.loc["clean", "shift"] == pytest.approx(0.0, abs=1e-12)
+    shift = np.array([SHIFT(i).sum() for i in range(N)]) / 20
+    control = np.array([0.01 * (-1) ** i * (3 - (i == 0)) for i in range(N)]) / 20
+    assert gen.loc["attack", "shift"] == pytest.approx(shift.mean())
+    assert gen.loc["attack", "diff_vs_control"] == pytest.approx((shift - control).mean())
+    assert gen.loc["attack", "p"] < 0.01 and np.isnan(gen.loc["clean", "p"])
+    imp = table[(table.target == "impostor") & (table.baseline == "blur")].set_index("condition")
+    assert imp.loc["clean", "score"] == pytest.approx(clean_score.mean() - 0.1)
+    by_part = analyse.verification_shift(r, n_boot=100)
+    iris = by_part[(by_part.target == "genuine") & (by_part.baseline == "blur") & (by_part.measure == "phi")
+                   & (by_part.group == "iris")].iloc[0]
+    assert iris.mean_shift == pytest.approx(np.mean([SHIFT(i)[0] for i in range(N)]) / 20)
+
+
+def test_runtime_and_agreement_tables(analyse):
+    r = analyse.prepare(make_fu_rows())
+    rt = analyse.runtime(r).set_index(["method", "baseline"])
+    times = 0.1 + 0.01 * np.arange(N)
+    row = rt.loc[("asa", "blur")]
+    true_rows = int(((r.target == "true") & (r.baseline == "blur")).sum())
+    assert row.n == true_rows and row.forwards_median == 32
+    per_row = r[(r.target == "true") & (r.baseline == "blur")].time_asa
+    assert row.median_s == pytest.approx(np.median(per_row)) and row.q25_s <= row.median_s <= row.q75_s
+    assert row.iqr_s == pytest.approx(np.quantile(per_row, 0.75) - np.quantile(per_row, 0.25))
+    assert rt.loc[("layercam", "")].n == true_rows and rt.loc[("layercam", "")].median_s == pytest.approx(0.02)
+    assert rt.loc[("asa_verif", "blur")].median_s == pytest.approx(np.median(times))
+    ag = analyse.agreement(r, n_boot=50)
+    clean = ag[(ag.condition == "clean") & (ag.baseline == "blur") & (ag.target == "true")].iloc[0]
+    assert (clean.source_a, clean.source_b) == ("asa", "layercam") and clean.js_median == pytest.approx(0.2)
+    attack = ag[(ag.condition == "attack") & (ag.baseline == "blur") & (ag.target == "true")].iloc[0]
+    assert attack.js_median == pytest.approx(0.4)
+    assert set(ag.target) == {"true", "pred"} and "all" in set(ag.condition)
+    import argparse
+    tables = {"sampling_error": analyse.sampling_error(r, 20),
+              "verification_scores": analyse.verification_scores(r, 20),
+              "runtime": analyse.runtime(r), "agreement": ag}
+    text = analyse.report(tables, [], {"runtime": {"hardware": {"platform": "test", "cpu_threads": 4, "gpus": []}}},
+                          argparse.Namespace(n_boot=20, baseline=None))
+    assert "measured on our hardware (test, 4 CPU threads, no GPU)" in text
+    assert "Sampling baselines against exact ASA" in text and "Verification pairs" in text
+    assert "| asa ~ layercam | 0.200" in text

@@ -172,6 +172,14 @@ def test_adaptive_attack_success_is_judged_after_the_defence(run):
     assert not any("bpda" in k for k in summary["restoration_rate_among_successful_attacks"])
 
 
+def without_wall_times(rows):
+    """The rows without the time_<method> columns: wall times are measurements and differ between two runs
+    (every other column, including the forward-pass counts nfwd_<method>, must be equal)."""
+    times = [c for c in rows.columns if c.startswith("time_")]
+    assert times and (rows[times].fillna(0.0) >= 0).all().all()
+    return rows.drop(columns=times)
+
+
 def test_resume_continues_a_stopped_run(script, inputs, tmp_path, monkeypatch, capsys):
     """Rows are written after every batch: a run stopped after its first batch continues with --resume and
     gives the rows and rates of an uninterrupted run."""
@@ -203,7 +211,7 @@ def test_resume_continues_a_stopped_run(script, inputs, tmp_path, monkeypatch, c
     capsys.readouterr()
     script.main(common(inputs, out) + opts + ["--resume", "--workers", "1"])   # --workers does not change rows
     assert "resuming after 2 of 4 images" in capsys.readouterr().out
-    pd.testing.assert_frame_equal(pd.read_csv(out / "rows_asa_r.csv"), want)
+    pd.testing.assert_frame_equal(without_wall_times(pd.read_csv(out / "rows_asa_r.csv")), without_wall_times(want))
     summary = json.loads((out / "summary_asa_r.json").read_text())
     assert summary["resumed"] and summary["resumed_after_images"] == 2 and not (out / "parts_asa_r").exists()
     for section in ("attack_success_rate", "attack_success_after_defence_rate", "noise_control_flip_rate",
@@ -223,7 +231,7 @@ def test_resume_continues_a_stopped_run(script, inputs, tmp_path, monkeypatch, c
         script.main(common(inputs, out) + opts + ["--resume", "--tag", "r2", "--seed", "6"])
     script.main(common(inputs, out) + opts + ["--tag", "r2"])
     assert not json.loads((out / "summary_asa_r2.json").read_text())["resumed"]
-    pd.testing.assert_frame_equal(pd.read_csv(out / "rows_asa_r2.csv"), want)
+    pd.testing.assert_frame_equal(without_wall_times(pd.read_csv(out / "rows_asa_r2.csv")), without_wall_times(want))
 
 
 def test_noise_follows_the_05_convention(run, model, inputs):
@@ -365,3 +373,226 @@ def test_parts_model_end_to_end(script, analyse, parts_model, inputs, tmp_path):
     broken.loc[0, "receipt_sum"] += 1.0
     with pytest.raises(ValueError, match="receipt"):
         analyse.check_rows(broken, summary)
+
+
+# ---------------------------------------------------------------------------
+# Sampling baselines, verification pairs, run times and agreement
+# ---------------------------------------------------------------------------
+
+FU_OPTS = ["--max-images", "4", "--levels", "2", "--attacks", "fgsm,pgd", "--defences", "jpeg", "--steps", "2",
+           "--baselines", "blur,mean", "--verif-pairs", "--pixel-conditions", "clean,attack", "--pixel-samples", "24",
+           "--batch-size", "2", "--seed", "3"]
+
+
+@pytest.fixture(scope="module")
+def pair_inputs(tmp_path_factory, model, images, labels):
+    """Two correct images per subject, one per phase (the second with faint noise), so every image has a
+    genuine template from the other phase; eye masks for all of them."""
+    root = tmp_path_factory.mktemp("asa_pairs")
+    ckpt = root / "tiny.keras"
+    model.save(ckpt)
+    rows, masks = [], eye_labels(len(images))
+    for phase, offset in (("enrollment", 0), ("verification", 1)):
+        for i, (img, label) in enumerate(zip(images, labels)):
+            noisy = np.clip(img + offset * np.random.default_rng(i).normal(0, 0.01, img.shape), 0, 1)
+            path = root / f"{label}_{i}_{phase}.png"
+            Image.fromarray((noisy * 255).round().astype(np.uint8)).save(path)
+            rows.append({"link_path": str(path), "relpath": f"test_office/{phase}_left_eye/{1000 + label}/{path.name}",
+                         "true_idx": int(label), "true_subject": 1000 + int(label), "eye": "left", "device": "test",
+                         "lighting": "office", "phase": phase})
+    frame = pd.DataFrame(rows)
+    frame.to_csv(root / "correct_pairs.csv", index=False)
+    save_mask_file(root / "masks_pairs.npz", frame.relpath, np.concatenate([masks, masks]), meta={"model": "synthetic"})
+    return {"root": root, "ckpt": ckpt, "csv": root / "correct_pairs.csv", "masks": root / "masks_pairs.npz",
+            "frame": frame}
+
+
+@pytest.fixture(scope="module")
+def fu_run(script, pair_inputs):
+    out_dir = pair_inputs["root"] / "out"
+    script.main(common(pair_inputs, out_dir) + FU_OPTS + ["--tag", "fu"])
+    return {"dir": out_dir, "rows": pd.read_csv(out_dir / "rows_asa_fu.csv"),
+            "summary": json.loads((out_dir / "summary_asa_fu.json").read_text())}
+
+
+def test_templates_prefer_the_other_phase(script, pair_inputs):
+    pool = pair_inputs["frame"]
+    sampled = pool.iloc[[0, 6]].reset_index().rename(columns={"index": "image_id"})
+    templates = script.choose_templates(sampled, pool, seed=1)
+    genuine, impostor = templates["genuine"], templates["impostor"]
+    assert genuine.template_image_id.tolist() == [5, 1]             # the same subject, other phase
+    assert genuine.other_phase.all() and (genuine.class_idx == sampled.true_idx).all()
+    assert (impostor.class_idx != sampled.true_idx).all() and impostor.other_phase.all()
+    assert script.choose_templates(sampled, pool, seed=1)["impostor"].equals(impostor)       # seeded
+    with pytest.raises(ValueError, match="no other correct image"):
+        script.choose_templates(sampled, pool.drop(index=5), seed=1)
+
+
+def test_verification_rows(fu_run, model, pair_inputs):
+    """--verif-pairs: genuine and impostor rows on clean, noise and attack, with the cosine of the probe's
+    embedding and the clean template's as v_full (efficiency holds as for every game)."""
+    from src.eval.verification import embed
+    rows, summary = fu_run["rows"], fu_run["summary"]
+    assert set(rows.target_kind) >= {"true_class", "genuine", "impostor"}
+    assert (rows.target_kind == rows.target.map({"true": "true_class", "pred": "adv_class", "genuine": "genuine",
+                                                 "impostor": "impostor"})).all()
+    verif = rows[rows.target.isin(["genuine", "impostor"])]
+    assert set(verif.condition) == {"clean", "noise", "attack"} and (verif.score == "verif").all()
+    # one row per image, variant, baseline and template
+    per = verif.groupby(["target", "condition", "attack", "baseline"], dropna=False).image_id.nunique()
+    assert (per == 4).all() and len(per) == 2 * 4 * 2
+    genuine, impostor = verif[verif.target == "genuine"], verif[verif.target == "impostor"]
+    assert (genuine.target_idx == genuine.true_idx).all() and (impostor.target_idx != impostor.true_idx).all()
+    frame = pair_inputs["frame"]
+    template_phase = genuine.template_relpath.str.split("/").str[1].str.split("_").str[0]
+    assert (template_phase != genuine.phase).all()                       # the other phase (session)
+    assert (frame.loc[genuine.template_image_id, "true_idx"].to_numpy() == genuine.true_idx.to_numpy()).all()
+    phi = verif[[f"phi_{g}" for g in GROUPS]].to_numpy()
+    np.testing.assert_allclose(phi.sum(axis=1), verif.v_full - verif.v_empty, atol=1e-9)
+    # v_full of the clean rows: the cosine of the clean probe with the template
+    clean = verif[(verif.condition == "clean") & (verif.baseline == "blur")]
+    load = lambda paths: np.stack([np.asarray(Image.open(p), np.float32) / 255 for p in paths])  # noqa: E731
+    probes = embed(model, load(clean.link_path))
+    templates = embed(model, load(frame.loc[clean.template_image_id, "link_path"]))
+    np.testing.assert_allclose(clean.v_full, (probes * templates).sum(axis=1), atol=1e-4)
+    assert (genuine.v_full.groupby(genuine.condition).mean()["clean"]
+            > impostor.v_full.groupby(impostor.condition).mean()["clean"])
+    assert verif[[c for c in verif.columns if c.startswith("mass_")]].isna().all().all()
+    assert summary["verification"]["enabled"] and summary["verification"]["other_phase"] == {"genuine": 4,
+                                                                                            "impostor": 4}
+    assert summary["rows_per_target_kind"] == {k: int(v) for k, v in rows.target_kind.value_counts().items()}
+    assert summary["forward_passes_by_method"]["templates"] == 8
+    assert summary["forward_passes_by_method"]["asa_verif"] == verif[verif.target == "genuine"].groupby(
+        ["image_id", "condition", "attack"], dropna=False).n_forward.first().sum()
+
+
+def test_sampling_baseline_columns(fu_run):
+    """The part baselines play the same game as ASA: their values equal the estimators run on the row's own
+    coalition values (looked up), with the same seeded coalitions; the pixel baselines are on clean and attack
+    rows with the blur baseline only."""
+    from src.xai.part_baselines import from_game
+    rows = fu_run["rows"]
+    cls = rows[rows.target.isin(["true", "pred"])]
+    values = cls[[f"value_{k}" for k in range(32)]].to_numpy()
+    present = cls[[f"present_{g}" for g in GROUPS]].to_numpy(bool)
+    for estimator, code in (("kernelshap", 1), ("lime", 2)):
+        got = cls[[f"{estimator}_parts_{g}" for g in GROUPS]].to_numpy()
+        want = np.stack([from_game(estimator, v, 16, seed=[3, int(i), code], present=p)
+                         for v, i, p in zip(values, cls.image_id, present)])
+        np.testing.assert_allclose(got, want, atol=2e-3)
+    ks = cls[[f"kernelshap_parts_{g}" for g in GROUPS]].to_numpy()
+    # efficiency, with the estimator's own (float32) evaluation of the full and the empty coalition
+    np.testing.assert_allclose(ks.sum(axis=1), cls.v_full - cls.v_empty, rtol=1e-5, atol=1e-5)
+    pixel = cls[[f"kernelshap_pixels_{g}" for g in GROUPS] + [f"lime_pixels_{g}" for g in GROUPS]]
+    has = pixel.notna().all(axis=1)
+    assert has.any() and (pixel.isna().all(axis=1) | has).all()
+    assert set(cls.condition[has]) == {"clean", "attack"} and set(cls.baseline[has]) == {"blur"}
+    assert has[(cls.baseline == "blur") & cls.condition.isin(["clean", "attack"])].all()
+    summary = fu_run["summary"]
+    assert summary["part_baselines"]["samples"] == 16 and summary["pixel_baselines"]["n_patches"] == 64
+    assert summary["pixel_baselines"]["hiding"] == ["blur"]
+
+
+def test_runtime_and_js_columns(fu_run):
+    from src.xai.part_baselines import pairwise_js, player_map_from_masks, player_value_map
+    from src.xai.shapley import group_masks
+    rows = fu_run["rows"]
+    true = rows[rows.target == "true"]
+    lid = true.present_lid.astype(bool)
+    assert (true.nfwd_asa[lid] == 32).all() and (true.nfwd_asa[~lid] == 16).all()
+    assert (true.nfwd_kernelshap_parts == 16).all() and (true.nfwd_lime_parts <= 16).all()
+    pix = true.time_kernelshap_pixels.notna()
+    assert (true.nfwd_kernelshap_pixels[pix] == 24).all() and (true.nfwd_lime_pixels[pix] <= 24).all()
+    assert (true.nfwd_layercam == 1).all() and (true.nfwd_eigencam == 1).all()
+    for method in ("asa", "kernelshap_parts", "lime_parts", "layercam", "eigencam"):
+        assert (true[f"time_{method}"] > 0).all(), method
+    assert (true.time_kernelshap_pixels[pix] > 0).all()
+    js = [c for c in rows.columns if c.startswith("js_")]
+    sources = ["asa", "kernelshap_parts", "lime_parts", "kernelshap_pixels", "lime_pixels", "layercam", "eigencam"]
+    assert js == [f"js_{a}__{b}" for k, a in enumerate(sources) for b in sources[k + 1:]]
+    finite = rows[js].stack().dropna()
+    assert ((finite >= 0) & (finite <= 1)).all()
+    assert true.js_asa__layercam.notna().mean() > 0.5
+    assert rows[rows.target.isin(["genuine", "impostor"])][js].isna().all().all()
+    # recompute one divergence from the row's own part values
+    row = true[(true.condition == "clean") & (true.baseline == "mean")].iloc[0]
+    masks = group_masks(eye_labels(5)[int(row.image_id) % 5], CLASSES, normalise_groups(DEFAULT_GROUPS))
+    player_map = player_map_from_masks(masks)
+    maps = {s: player_value_map(row[[f"{p}_{g}" for g in GROUPS]].to_numpy(float), player_map)
+            for s, p in (("a", "phi"), ("b", "lime_parts"))}
+    if np.isfinite(row.js_asa__lime_parts):
+        assert row.js_asa__lime_parts == pytest.approx(pairwise_js(maps)[("a", "b")], abs=1e-9)
+    hardware = fu_run["summary"]["runtime"]["hardware"]
+    assert hardware["cpu_threads"] and "gpus" in hardware
+
+
+def test_fu_analysis_end_to_end(fu_run, analyse):
+    out = fu_run["dir"] / "analysis"
+    checks = analyse.check_rows(fu_run["rows"], fu_run["summary"])
+    assert any("verification rows" in c for c in checks) and any("KernelSHAP part values" in c for c in checks)
+    analyse.main(["--rows", str(fu_run["dir"] / "rows_asa_fu.csv"), "--n-boot", "20", "--out-dir", str(out)])
+    for name in ("sampling_error", "verification_scores", "verification_shift", "runtime", "agreement"):
+        assert len(pd.read_csv(out / f"{name}.csv")), name
+    error = pd.read_csv(out / "sampling_error.csv")
+    assert set(error.estimator) == {"kernelshap_parts", "lime_parts", "kernelshap_pixels", "lime_pixels"}
+    assert {"clean", "attack", "all"} <= set(error.condition)
+    runtime = pd.read_csv(out / "runtime.csv")
+    assert {"asa", "kernelshap_parts", "lime_parts", "kernelshap_pixels", "lime_pixels", "layercam", "eigencam",
+            "asa_verif"} == set(runtime.method)
+    assert (runtime.q25_s <= runtime.median_s).all() and (runtime.median_s <= runtime.q75_s).all()
+    asa_blur = runtime[(runtime.method == "asa") & (runtime.baseline == "blur")].iloc[0]
+    assert asa_blur.n == len(fu_run["rows"].query("target == 'true' and baseline == 'blur'"))
+    scores = pd.read_csv(out / "verification_scores.csv")
+    assert set(scores.target) == {"genuine", "impostor"}
+    assert scores.loc[scores.condition == "attack", "shift"].notna().all()
+    shift = pd.read_csv(out / "verification_shift.csv")
+    assert set(shift.target) == {"genuine", "impostor"} and set(shift.condition) == {"attack"}
+    text = (out / "report_asa.md").read_text(encoding="utf-8")
+    for section in ("Sampling baselines against exact ASA", "Verification pairs", "measured on our hardware",
+                    "Agreement between attributions"):
+        assert section in text, section
+    # verification rows that break the accounting stop the analysis
+    rows = fu_run["rows"]
+    wrong = rows.copy()
+    wrong.loc[wrong.target == "impostor", "target_idx"] = wrong.loc[wrong.target == "impostor", "true_idx"]
+    with pytest.raises(ValueError, match="impostor rows another one"):
+        analyse.check_rows(wrong)
+    with pytest.raises(ValueError, match="verification variant"):
+        analyse.check_rows(rows.drop(index=rows.index[rows.target == "genuine"][0]))
+    with pytest.raises(ValueError, match="target kind"):
+        analyse.check_rows(rows, {**fu_run["summary"], "rows_per_target_kind": {"true_class": 1}})
+
+
+def test_resume_keeps_the_new_rows_and_columns(script, pair_inputs, tmp_path, monkeypatch):
+    """A run with verification pairs and sampling baselines stopped after its first batch continues with --resume
+    to the rows of an uninterrupted run (wall times aside) and the same forward-pass counts."""
+    opts = ["--max-images", "4", "--levels", "2", "--attacks", "fgsm", "--defences", "jpeg", "--baselines", "mean",
+            "--cams", "layercam", "--verif-pairs", "--pixel-samples", "8", "--batch-size", "2", "--seed", "4",
+            "--tag", "fr"]
+    script.main(common(pair_inputs, tmp_path / "whole") + opts)
+    want = pd.read_csv(tmp_path / "whole" / "rows_asa_fr.csv")
+    whole = json.loads((tmp_path / "whole" / "summary_asa_fr.json").read_text())
+
+    class Stopped(RuntimeError):
+        pass
+
+    real, calls = script.run_batch, []
+
+    def stop_at_second_batch(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise Stopped()
+        return real(*args, **kwargs)
+
+    out = tmp_path / "resumed"
+    monkeypatch.setattr(script, "run_batch", stop_at_second_batch)
+    with pytest.raises(Stopped):
+        script.main(common(pair_inputs, out) + opts + ["--resume"])
+    monkeypatch.setattr(script, "run_batch", real)
+    script.main(common(pair_inputs, out) + opts + ["--resume"])
+    got = pd.read_csv(out / "rows_asa_fr.csv")
+    assert {"genuine", "impostor"} <= set(got.target) and "js_asa__kernelshap_parts" in got
+    pd.testing.assert_frame_equal(without_wall_times(got), without_wall_times(want))
+    summary = json.loads((out / "summary_asa_fr.json").read_text())
+    assert summary["resumed"] and summary["forward_passes_by_method"] == whole["forward_passes_by_method"]
+    assert summary["rows_per_target_kind"] == whole["rows_per_target_kind"]

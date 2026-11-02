@@ -75,6 +75,47 @@ Attention and receipt come from src.models.anatomy_model (attention_maps,
 part_receipt, model_arch, part_names); models without an attention_pool layer
 (baseline, gap) have no attention columns, models other than parts no receipt.
 
+Sampling baselines (src/xai/part_baselines.py; numpy only, no shap or lime package):
+  --part-baselines kernelshap,lime   KernelSHAP (Shapley kernel, shap's enumeration of complete
+                             sizes, the rest sampled without replacement, efficiency enforced as in
+                             shap) and LIME (uniform samples, kernel sqrt(exp(-d^2 / 0.25^2)) of the
+                             cosine distance to the full coalition, ridge alpha 1) on the SAME part
+                             players, hiding baselines (--baseline-hiding, default all of --baselines)
+                             and score as ASA, with --baseline-samples coalitions (default 16 = half of
+                             the 32; KernelSHAP's budget includes the empty and the full coalition).
+                             They run stand-alone (their own coalition images and forward passes), so
+                             their run time is measured, and their error against exact ASA on the same
+                             game is a result (23: sampling_error.csv).
+  --pixel-baselines kernelshap,lime  the same estimators on square patches (--patch-size 32 = 64
+                             players, --pixel-samples 500), hidden with --pixel-hiding (default blur),
+                             on the conditions of --pixel-conditions (default clean; each condition costs
+                             2 x --pixel-samples forward passes per image), aggregated to the parts:
+                             part p = sum over patches j of w_j x (share of patch j's pixels in part p).
+  The coalitions are seeded per image (default_rng([--seed, image_id, 1..4])): every condition,
+  target and hiding baseline of an image uses the same ones.
+
+Verification pairs (--verif-pairs): the conditions of --verif-conditions (default clean, noise,
+attack; noise is the same-budget control of the shifts) are also explained with score "verif",
+the cosine of the probe's embedding (the condition image) with a clean template embedding: a
+GENUINE template (another correct image of the same class from --correct-csv, preferring the other
+phase, i.e. the other session) and an IMPOSTOR template (an image of a class drawn with
+default_rng([--seed, image_id, 6]), also preferring the other phase). The coalition images are the
+same as for the classification score (built once, embedded separately). An image without another
+correct image of its class stops the run before the model loads.
+
+Run times: per image, condition and method, the wall time in seconds (time_<method>) and the forward
+passes (nfwd_<method>) of exact ASA (per hiding baseline: building the coalition images and their
+forward passes), the part and pixel baselines (stand-alone, the regression included), LayerCAM,
+Eigen-CAM, attention and the receipt (computed per batch: the batch's time divided by its images;
+LayerCAM also needs one backward pass). 23 summarises them; they are measured on the run's hardware
+(summary: runtime.hardware).
+
+Agreement: every attribution of a row becomes one 256 x 256 non-negative map (ASA, the part
+baselines and the receipt: positive part values spread uniformly over the part's pixels; pixel
+baselines: positive patch values over the patch's pixels; CAMs and attention: the native map upsampled
+bilinearly, clipped at 0), normalised to a distribution, and js_<a>__<b> is the Jensen-Shannon
+divergence (base 2) of every pair. Deletion curves stay the main faithfulness test.
+
 Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target):
   row_id, image_id, relpath, link_path, true_idx, true_subject, eye, device, lighting, phase
   condition, attack, adapted_to, epsilon, budget_levels, defence, defence_param
@@ -82,7 +123,11 @@ Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target
                        defence a BPDA-PGD image was computed through
   baseline, score      hiding method and score function of the game
   target, target_idx   "true" (true class) or "pred" (the predicted class, rows only
-                       where the prediction is wrong), and its class index
+                       where the prediction is wrong), and its class index; with --verif-pairs
+                       also "genuine" / "impostor" (score verif; target_idx = the template's class)
+  target_kind          true_class, adv_class, genuine or impostor (the target, spelled out)
+  template_image_id, template_relpath   the template of genuine / impostor rows (image_id = its
+                       row in --correct-csv); only with --verif-pairs
   pred_idx, correct    prediction for the condition image and whether it is the true class
   margin_true          true-class margin of the condition image (negative = fooled)
   attack_success       attack+defence rows: the attack reached its own goal. fgsm / pgd: it
@@ -110,7 +155,17 @@ Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target
                        it), layercam, eigencam, attention, receipt (highest first), or random
                        (one seeded permutation per image, the same in every condition)
   n_forward            coalition images of this image and condition that went through the
-                       model (all baselines)
+                       model for ASA (all baselines)
+  <est>_parts_<g>      part baseline est = kernelshap, lime on the row's game (NaN for the hiding
+                       baselines outside --baseline-hiding and on genuine / impostor rows)
+  <est>_pixels_<g>     pixel baseline aggregated to group g (NaN outside --pixel-conditions and
+                       --pixel-hiding)
+  time_<m>, nfwd_<m>   wall time (s) and forward passes of method m for this image and condition:
+                       asa (this row's baseline; genuine / impostor rows: the embedding passes),
+                       kernelshap_parts, lime_parts, kernelshap_pixels, lime_pixels, layercam,
+                       eigencam, attention, receipt
+  js_<a>__<b>          Jensen-Shannon divergence (base 2) of the 256 x 256 maps of a and b (NaN where a
+                       map is missing or has no positive mass)
 
 Writes to --out-dir:
   rows_asa_<tag>.csv      the rows above
@@ -123,7 +178,10 @@ Writes to --out-dir:
                           restoration_rate_among_successful_attacks (fgsm / pgd only: among the
                           attacks that fooled the undefended model, the share the defence
                           classifies correctly; for BPDA-PGD it is 1 - success after defence)
-                          and the flip rates of the controls
+                          and the flip rates of the controls; rows per target kind; the settings of
+                          the part and pixel baselines, the verification templates (how many from the
+                          other phase), the agreement maps; forward passes per method and the hardware
+                          the run times were measured on
   parts_asa_<tag>/        while the run is unfinished: the rows of every finished batch and
                           the state to continue from (--resume); removed at the end
 
@@ -137,9 +195,13 @@ Without --resume a left-over parts_asa_<tag>/ is removed and the run starts from
 
 Cost: with the defaults (levels 1,2,4, fgsm and pgd, jpeg and bit_depth) every image has
 30 condition images, so ASA needs up to 30 x 3 baselines x 32 = 2,880 forward passes per
-image (printed at start-up with the inpainting estimate). Inpainting runs on the CPU, about
-60 ms per coalition image and thread (30 x 31 per image; --workers threads); on the laptop
-CPU with the tiny test model it was most of the run time. --baselines blur,mean skips it.
+image (printed at start-up with the inpainting estimate, and with the forward passes of the
+sampling baselines and the verification pairs). The part baselines add up to 2 x 16 per condition
+image and hiding baseline (about as much as ASA, inpainting included: --baseline-hiding blur,mean
+leaves the inpaint game out); the pixel baselines 2 x 500 per condition image of --pixel-conditions.
+Inpainting runs on the CPU, about 60 ms per coalition image and thread (30 x 31 per image for ASA;
+--workers threads); on the laptop CPU with the tiny test model it was most of the run time.
+--baselines blur,mean skips it.
 
 Usage (Kaggle, with the checkpoint dataset attached and 01, 02, 04, 17 already run):
   smoke (a few minutes):
@@ -152,6 +214,8 @@ Usage (Kaggle, with the checkpoint dataset attached and 01, 02, 04, 17 already r
         --correct-csv /kaggle/working/eval_clean/correct_test_full.csv \
         --masks /kaggle/working/eye_masks/masks_full.npz --per-class 1 --seed 2 \
         --exclude-from /kaggle/working/asa/images_asa_smoke.csv --resume --tag full
+  with verification pairs and the pixel baselines on the attacked images as well, add:
+        --verif-pairs --pixel-conditions clean,attack
 """
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; set before importing tensorflow
@@ -180,10 +244,14 @@ from src.defences.inference import DEFENCE_REGISTRY, make_defence  # noqa: E402
 from src.models.arcface_inference import find_feature_layer, load_checkpoint, predict_logits  # noqa: E402
 from src.xai.attribution import XAI_REGISTRY  # noqa: E402
 from src.xai.seg_masks import load_mask_file  # noqa: E402
-from src.xai.shapley import (DEFAULT_GROUPS, DEFAULT_WORKERS, METHODS, asa_order, coalition_outputs,  # noqa: E402
-                             deletion_from_values, exact_shapley, format_groups, group_masks, groups_from_config,
-                             normalise_groups, order_from_scores, parse_groups, part_masses, score_values,
-                             shapley_interactions)
+from src.xai.part_baselines import (DEFAULT_PART_SAMPLES, DEFAULT_PATCH, DEFAULT_PIXEL_SAMPLES,  # noqa: E402
+                                    ESTIMATORS, LIME_ALPHA, LIME_KERNEL_WIDTH, aggregate_to_parts, design,
+                                    evaluated, fit, pairwise_js, patch_map, patch_part_shares,
+                                    player_map_from_masks, player_value_map, sampled_outputs, upsample_map)
+from src.xai.shapley import (DEFAULT_GROUPS, DEFAULT_WORKERS, METHODS, asa_order, canonical_indices,  # noqa: E402
+                             coalition_images, deletion_from_values, exact_shapley, format_groups, group_masks,
+                             groups_from_config, model_outputs, normalise_groups, order_from_scores,
+                             parse_groups, part_masses, score_values, shapley_interactions)
 
 from src.models.anatomy_model import attention_maps, model_arch, part_names, part_receipt  # noqa: E402
 
@@ -202,6 +270,14 @@ _ADAPTIVE = _load_script("14_adaptive_attacks")      # sampling, margins, JSON h
 ATTACKS = ("fgsm", "pgd", "bpda_pgd")
 SCORES = ("margin", "logit")
 SOURCES = ("asa", "layercam", "eigencam", "attention", "receipt", "random")
+CONDITIONS = ("clean", "noise", "attack", "defence_on_clean", "noise+defence", "attack+defence")
+TARGET_KINDS = {"true": "true_class", "pred": "adv_class", "genuine": "genuine", "impostor": "impostor"}
+VERIF_TARGETS = ("genuine", "impostor")
+PLAN_SEEDS = {("kernelshap", "parts"): 1, ("lime", "parts"): 2, ("kernelshap", "pixels"): 3, ("lime", "pixels"): 4}
+TEMPLATE_SEEDS = {"genuine": 5, "impostor": 6}
+AGREEMENT = ("asa", "kernelshap_parts", "lime_parts", "kernelshap_pixels", "lime_pixels", "receipt", "layercam",
+             "eigencam", "attention")
+CAM_FORWARDS = {"layercam": 1, "eigencam": 1, "attention": 1}     # receipt: 1 (logit) or 2 (margin) forward passes
 BASE_COLS = ["image_id", "relpath", "link_path", "true_idx", "true_subject", "eye", "device", "lighting", "phase"]
 
 
@@ -320,7 +396,7 @@ def class_specific(xai):
 
 
 def explanations(model, images, targets, cams, target_layer, capabilities, receipt_index, logits=None,
-                 score="margin"):
+                 score="margin", times=None):
     """Per target ("true", "pred"): source -> per-image maps (CAMs, attention) or part vectors
     (receipt, already in group order, plus "receipt_sum" over all of the model's parts).
 
@@ -328,24 +404,37 @@ def explanations(model, images, targets, cams, target_layer, capabilities, recei
     receipt_index : for each group, its column in the model's receipt (None if the model has
         no such part)
     logits, score : margin-free logits of *images* and the ASA score (units of the receipt)
+    times : dict, filled with target -> source -> wall time per image in seconds (the batch's
+        time divided by its images; class-agnostic maps are computed once for all targets)
     """
     out = {t: {} for t in targets}
-    shared = {}
+    times = {} if times is None else times
+    shared, shared_time = {}, {}
+    per_image = 1.0 / max(len(images), 1)
     for xai in cams:
         if not class_specific(xai):
+            start = time.perf_counter()
             shared[xai] = cam_maps(model, xai, images, None, target_layer)
+            shared_time[xai] = (time.perf_counter() - start) * per_image
     if capabilities["attention"]:
+        start = time.perf_counter()
         maps = np.asarray(attention_maps(model, images), np.float32)       # (N, 8, 8, K)
         shared["attention"] = maps.mean(axis=-1)
+        shared_time["attention"] = (time.perf_counter() - start) * per_image
     for target, class_idx in targets.items():
         out[target].update(shared)
+        times[target] = dict(shared_time)
         for xai in cams:
             if class_specific(xai):
+                start = time.perf_counter()
                 out[target][xai] = cam_maps(model, xai, images, class_idx, target_layer)
+                times[target][xai] = (time.perf_counter() - start) * per_image
         if capabilities["receipt"]:
             if logits is None:
                 logits = predict_logits(model, images)
+            start = time.perf_counter()
             receipt = receipt_terms(model, images, class_idx, logits, score)                # (N, P_model)
+            times[target]["receipt"] = (time.perf_counter() - start) * per_image
             out[target]["receipt_sum"] = receipt.sum(axis=1)
             out[target]["receipt"] = np.stack(
                 [receipt[:, j] if j is not None else np.full(len(images), np.nan) for j in receipt_index], axis=1)
@@ -356,11 +445,33 @@ def explanations(model, images, targets, cams, target_layer, capabilities, recei
 # Rows of one condition
 # ---------------------------------------------------------------------------
 
+def agreement_sources(part_estimators, pixel_estimators, cams, capabilities):
+    """The attributions of a run that get a 256 x 256 map and pairwise Jensen-Shannon columns, in column order."""
+    maps = (["asa"] + [f"{e}_parts" for e in part_estimators] + [f"{e}_pixels" for e in pixel_estimators]
+            + (["receipt"] if capabilities["receipt"] else []) + list(cams)
+            + (["attention"] if capabilities["attention"] else []))
+    return [s for s in AGREEMENT if s in maps] + [s for s in maps if s not in AGREEMENT]
+
+
 class Context:
-    """Everything about a batch of images that stays the same across conditions."""
+    """Everything about a batch of images that stays the same across conditions.
+
+    part_estimators : sampling baselines on the part players ("kernelshap", "lime"), each with
+        *part_samples* coalitions per image, condition and hiding baseline in *part_methods* (default: all)
+    pixel_estimators : the same estimators on square patches of *patch* pixels with *pixel_samples*
+        coalitions, on the conditions in *pixel_conditions* and the hiding baselines in *pixel_methods*
+    templates : for --verif-pairs, dict kind ("genuine", "impostor") -> {"images" (N, 256, 256, 3),
+        "image_id", "relpath", "class_idx"}, one template per image of the batch; the conditions in
+        *verif_conditions* are also explained with the verification score against them
+    The sampled coalitions are seeded per image ([seed, image_id, estimator and player kind]), so every
+    condition, target and hiding baseline of an image uses the same coalitions.
+    """
 
     def __init__(self, model, clean, labels, base_rows, mask_labels, class_names, groups, baselines, score,
-                 cams, target_layer, capabilities, receipt_index, asa_batch_size, seed, workers=1):
+                 cams, target_layer, capabilities, receipt_index, asa_batch_size, seed, workers=1,
+                 part_estimators=(), part_samples=DEFAULT_PART_SAMPLES, part_methods=None, pixel_estimators=(),
+                 pixel_samples=DEFAULT_PIXEL_SAMPLES, patch=DEFAULT_PATCH, pixel_conditions=(), pixel_methods=(),
+                 templates=None, verif_conditions=()):
         self.model, self.clean, self.labels, self.base_rows = model, clean, labels, base_rows
         self.groups, self.names = groups, [name for name, _ in groups]
         self.baselines, self.score, self.cams, self.target_layer = baselines, score, cams, target_layer
@@ -375,6 +486,98 @@ class Context:
             rng = np.random.default_rng([seed, int(row["image_id"])])
             self.random_order.append([int(p) for p in rng.permutation(np.flatnonzero(present))])
         self.n_forward = 0
+        self.n_forward_by = defaultdict(int)                      # method -> forward passes of this batch
+
+        # sampling baselines on the part players (only the present groups play, as in ASA)
+        self.part_estimators = list(part_estimators)
+        self.part_methods = set(baselines if part_methods is None else part_methods)
+        self.player_maps = [player_map_from_masks(m) for m in self.masks]
+        self.part_plans = []
+        for row, present in zip(base_rows, self.present):
+            players, plans = np.flatnonzero(present), {}
+            for est in self.part_estimators:
+                if not len(players):
+                    continue
+                plan = design(est, len(players), part_samples, [seed, int(row["image_id"]), PLAN_SEEDS[(est, "parts")]])
+                rows = evaluated(est, plan)
+                full = np.zeros((len(rows), len(present)), bool)
+                full[:, players] = rows
+                plans[est] = (plan, players, full)
+            self.part_plans.append(plans)
+        # and on square patches, aggregated to the parts by pixel share
+        self.pixel_conditions, self.pixel_methods = set(pixel_conditions), set(pixel_methods)
+        self.pixel_estimators = list(pixel_estimators) if self.pixel_conditions and self.pixel_methods else []
+        self.patches, self.patch_shares, self.pixel_plans = None, [], []
+        if self.pixel_estimators:
+            self.patches = patch_map(clean.shape[1:3], patch)
+            n_patches = int(self.patches.max()) + 1
+            for row, masks in zip(base_rows, self.masks):
+                self.patch_shares.append(patch_part_shares(self.patches, masks))
+                plans = {}
+                for est in self.pixel_estimators:
+                    plan = design(est, n_patches, pixel_samples,
+                                  [seed, int(row["image_id"]), PLAN_SEEDS[(est, "pixels")]])
+                    plans[est] = (plan, evaluated(est, plan))
+                self.pixel_plans.append(plans)
+        # verification templates: clean images, embedded once
+        self.templates = {}
+        for kind, t in (templates or {}).items():
+            self.templates[kind] = {**{k: v for k, v in t.items() if k != "images"},
+                                    "embedding": model_outputs(model, t["images"], "embedding", asa_batch_size)}
+            self.n_forward_by["templates"] += len(t["images"])
+        self.verif_conditions = set(verif_conditions) if self.templates else set()
+
+        # attributions compared by Jensen-Shannon divergence, methods with a run time, optional columns
+        self.sources = agreement_sources(self.part_estimators, self.pixel_estimators, cams, capabilities)
+        maps = set(self.sources)
+        self.methods = (["asa"] + [f"{e}_parts" for e in self.part_estimators]
+                        + [f"{e}_pixels" for e in self.pixel_estimators] + list(cams)
+                        + (["attention"] if capabilities["attention"] else [])
+                        + (["receipt"] if capabilities["receipt"] else []))
+        n = self.names
+        optional = [f"mass_{s}_{g}" for s in list(cams) + (["attention"] if capabilities["attention"] else [])
+                    for g in n]
+        if capabilities["receipt"]:
+            optional += [f"receipt_{g}" for g in n] + ["receipt_sum"]
+        optional += [f"del_auc_{s}" for s in SOURCES if s in ("asa", "random") or s in maps]
+        optional += [f"{e}_{kind}_{g}" for kind, ests in (("parts", self.part_estimators),
+                                                          ("pixels", self.pixel_estimators))
+                     for e in ests for g in n]
+        optional += [f"{c}_{m}" for m in self.methods for c in ("time", "nfwd")]
+        optional += [f"js_{a}__{b}" for a, b in itertools.combinations(self.sources, 2)]
+        if self.templates:
+            optional += ["template_image_id", "template_relpath"]
+        self.optional = optional
+
+
+def game_outputs(ctx, image, masks, method, cache, kinds):
+    """Model outputs of the 2^P coalition images of one hiding method, built once, for each output kind
+    ("logits", "embedding"). Absent groups are exact null players (src/xai/shapley.coalition_outputs).
+
+    Returns (outputs: kind -> (2^P, C or D), present (P,), coalition images that went through the model
+    per kind, seconds: kind -> building the images plus that kind's forward passes).
+    """
+    present = masks.reshape(len(masks), -1).any(axis=1)
+    canonical = canonical_indices(len(masks), present)
+    needed = np.unique(canonical)
+    start = time.perf_counter()
+    images = coalition_images(image, masks, method, cache, needed, ctx.workers)
+    build = time.perf_counter() - start
+    position = {k: i for i, k in enumerate(needed)}
+    rows = np.array([position[k] for k in canonical])
+    outputs, seconds = {}, {}
+    for kind in kinds:
+        start = time.perf_counter()
+        outputs[kind] = model_outputs(ctx.model, images, kind, ctx.asa_batch_size)[rows]
+        seconds[kind] = build + time.perf_counter() - start
+    return outputs, present, int(len(needed)), seconds
+
+
+def js_columns(ctx, maps):
+    """js_<a>__<b> for every pair of the run's agreement sources (NaN where a map is missing or has no
+    positive mass), from 256 x 256 maps (src/xai/part_baselines.pairwise_js)."""
+    js = pairwise_js({s: maps.get(s) for s in ctx.sources})
+    return {f"js_{a}__{b}": v for (a, b), v in js.items()}
 
 
 def condition_rows(ctx, images, info, extra=None, timings=None):
@@ -392,19 +595,47 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
     targets = {"true": ctx.labels}
     if info["condition"] != "clean" and flipped.any():
         targets["pred"] = pred
+    expl_times = {}
     expl = explanations(ctx.model, images, targets, ctx.cams, ctx.target_layer, ctx.capabilities, ctx.receipt_index,
-                        logits, ctx.score)
+                        logits, ctx.score, expl_times)
     timings["explanations"] = timings.get("explanations", 0.0) + time.perf_counter() - start
 
     diff = (images - ctx.clean).reshape(len(images), -1)
     linf, l2 = np.abs(diff).max(axis=1), np.sqrt((diff ** 2).sum(axis=1))
+    verif_here = info["condition"] in ctx.verif_conditions
+    pixels_here = info["condition"] in ctx.pixel_conditions
+    kinds = ["logits"] + (["embedding"] if verif_here else [])
     names, rows = ctx.names, []
     for i in range(len(images)):
         start = time.perf_counter()
-        outputs, present, n_forward = coalition_outputs(ctx.model, images[i], ctx.masks[i], ctx.baselines,
-                                                        "logits", ctx.asa_batch_size, workers=ctx.workers)
+        cache = {}                       # blur / mean fills of this image, shared by ASA and the sampling baselines
+        games = {b: game_outputs(ctx, images[i], ctx.masks[i], b, cache, kinds) for b in ctx.baselines}
+        present = games[ctx.baselines[0]][1]
+        n_forward = sum(g[2] for g in games.values())
         timings["asa"] = timings.get("asa", 0.0) + time.perf_counter() - start
         ctx.n_forward += n_forward
+        ctx.n_forward_by["asa"] += n_forward
+        if verif_here:
+            ctx.n_forward_by["asa_verif"] += n_forward
+
+        start = time.perf_counter()
+        sampled = {}                     # (baseline, "parts" | "pixels", estimator) -> (outputs, n_forward, seconds)
+        for b in ctx.baselines:
+            for est, (_, _, coalitions) in (ctx.part_plans[i].items() if b in ctx.part_methods else ()):
+                t = time.perf_counter()
+                out, nf = sampled_outputs(ctx.model, images[i], ctx.player_maps[i], coalitions, b, "logits",
+                                          ctx.asa_batch_size, cache, ctx.workers)
+                sampled[(b, "parts", est)] = (out, nf, time.perf_counter() - t)
+                ctx.n_forward_by[f"{est}_parts"] += nf
+            if pixels_here and b in ctx.pixel_methods:
+                for est, (_, coalitions) in ctx.pixel_plans[i].items():
+                    t = time.perf_counter()
+                    out, nf = sampled_outputs(ctx.model, images[i], ctx.patches, coalitions, b, "logits",
+                                              ctx.asa_batch_size, cache, ctx.workers)
+                    sampled[(b, "pixels", est)] = (out, nf, time.perf_counter() - t)
+                    ctx.n_forward_by[f"{est}_pixels"] += nf
+        timings["sampling_baselines"] = timings.get("sampling_baselines", 0.0) + time.perf_counter() - start
+
         common = {**ctx.base_rows[i], **info, "pred_idx": int(pred[i]), "correct": bool(not flipped[i]),
                   "margin_true": float(margin_true[i]), "pert_linf": float(linf[i]), "pert_l2": float(l2[i])}
         common.update({k: v[i] for k, v in extra.items()})
@@ -413,7 +644,7 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
         for target, class_idx in targets.items():
             if target == "pred" and not flipped[i]:
                 continue
-            masses, scores = {}, {}
+            masses, scores, native = {}, {}, {}
             for src, values in expl[target].items():
                 if src == "receipt_sum":
                     masses["receipt_sum"] = float(values[i])
@@ -424,11 +655,18 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
                     m = part_masses(values[i], None, ctx.class_names, ctx.groups, masks=ctx.masks[i])
                     scores[src] = m
                     masses.update({f"mass_{src}_{g}": float(v) for g, v in zip(names, m)})
+                    native[src] = upsample_map(values[i], images.shape[1:3])
+            run_times = {}
+            for src, seconds in expl_times.get(target, {}).items():
+                run_times[f"time_{src}"] = seconds
+                run_times[f"nfwd_{src}"] = CAM_FORWARDS.get(src, 1 if ctx.score == "logit" else 2)
             for baseline in ctx.baselines:
-                values = score_values(outputs[baseline], ctx.score, target=int(class_idx[i]))
+                outputs, _, n_game, seconds = games[baseline]
+                values = score_values(outputs["logits"], ctx.score, target=int(class_idx[i]))
                 phi, inter = exact_shapley(values), shapley_interactions(values)
                 row = {**common, "baseline": baseline, "score": ctx.score, "target": target,
-                       "target_idx": int(class_idx[i]), "v_full": float(values[-1]), "v_empty": float(values[0])}
+                       "target_kind": TARGET_KINDS[target], "target_idx": int(class_idx[i]),
+                       "v_full": float(values[-1]), "v_empty": float(values[0])}
                 row.update({f"phi_{g}": float(v) for g, v in zip(names, phi)})
                 row.update({f"int_{names[p]}__{names[q]}": float(inter[p, q])
                             for p, q in itertools.combinations(range(len(names)), 2)})
@@ -440,9 +678,59 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
                         order = orders[src]
                         row[f"del_auc_{src}"] = (float("nan") if order is None
                                                  else deletion_from_values(values, order)["auc"])
+                maps = {"asa": player_value_map(phi, ctx.player_maps[i]), **native}
+                if "receipt" in scores:
+                    maps["receipt"] = player_value_map(scores["receipt"], ctx.player_maps[i])
+                row.update({"time_asa": seconds["logits"], "nfwd_asa": n_game})
+                for (b, kind, est), (out, nf, sec) in sampled.items():
+                    if b != baseline:
+                        continue
+                    t = time.perf_counter()
+                    est_values = score_values(out, ctx.score, target=int(class_idx[i]))
+                    if kind == "parts":
+                        plan, players, _ = ctx.part_plans[i][est]
+                        weights = np.zeros(len(names))
+                        weights[players] = fit(est, plan, est_values)
+                        parts, player_map = weights, ctx.player_maps[i]
+                    else:
+                        weights = fit(est, ctx.pixel_plans[i][est][0], est_values)
+                        parts, player_map = aggregate_to_parts(weights, ctx.patch_shares[i]), ctx.patches
+                    row.update({f"{est}_{kind}_{g}": float(v) for g, v in zip(names, parts)})
+                    row.update({f"time_{est}_{kind}": sec + time.perf_counter() - t, f"nfwd_{est}_{kind}": nf})
+                    maps[f"{est}_{kind}"] = player_value_map(weights, player_map)
                 row.update({f"value_{k}": float(v) for k, v in enumerate(values)})
                 row["n_forward"] = n_forward
+                row.update(run_times)
+                row.update(js_columns(ctx, maps))
+                for column in ctx.optional:
+                    row.setdefault(column, np.nan)
                 rows.append(row)
+        if verif_here:              # the probe (this condition image) against clean genuine / impostor templates
+            for kind in VERIF_TARGETS:
+                template = ctx.templates[kind]
+                for baseline in ctx.baselines:
+                    outputs, _, n_game, seconds = games[baseline]
+                    values = score_values(outputs["embedding"], "verif", template=template["embedding"][i])
+                    phi, inter = exact_shapley(values), shapley_interactions(values)
+                    row = {**common, "baseline": baseline, "score": "verif", "target": kind, "target_kind": kind,
+                           "target_idx": int(template["class_idx"][i]),
+                           "v_full": float(values[-1]), "v_empty": float(values[0])}
+                    row.update({f"phi_{g}": float(v) for g, v in zip(names, phi)})
+                    row.update({f"int_{names[p]}__{names[q]}": float(inter[p, q])
+                                for p, q in itertools.combinations(range(len(names)), 2)})
+                    for src, order in (("asa", asa_order(phi, values[-1], values[0], present)),
+                                       ("random", ctx.random_order[i])):
+                        row[f"del_auc_{src}"] = (float("nan") if order is None
+                                                 else deletion_from_values(values, order)["auc"])
+                    row.update({f"value_{k}": float(v) for k, v in enumerate(values)})
+                    row["n_forward"] = n_forward
+                    row.update({"time_asa": seconds["embedding"], "nfwd_asa": n_game,
+                                "template_image_id": int(template["image_id"][i]),
+                                "template_relpath": template["relpath"][i]})
+                    row.update(js_columns(ctx, {"asa": player_value_map(phi, ctx.player_maps[i])}))
+                    for column in ctx.optional:
+                        row.setdefault(column, np.nan)
+                    rows.append(row)
     return rows, pred
 
 
@@ -528,14 +816,14 @@ def run_batch(ctx, epsilons, defences, attacks, steps, seed, rng, rates, timings
     return rows
 
 
-def conditions_per_image(n_eps, n_def, attacks):
-    """Condition images per clean image (each explained with every baseline)."""
-    n = 1 + n_def + n_eps * (1 + n_def)                       # clean, defence_on_clean, noise, noise+defence
+def conditions_per_image(n_eps, n_def, attacks, conditions=None):
+    """Condition images per clean image (each explained with every baseline); with *conditions*, only
+    those of the listed conditions (e.g. the conditions of --pixel-conditions)."""
     plain = sum(a in attacks for a in ("fgsm", "pgd"))
-    n += n_eps * plain * (1 + n_def)                          # attack, attack+defence
-    if "bpda_pgd" in attacks:
-        n += n_eps * n_def * 2
-    return n
+    adaptive = n_def if "bpda_pgd" in attacks else 0          # one BPDA-PGD image per defence, with that defence
+    counts = {"clean": 1, "defence_on_clean": n_def, "noise": n_eps, "noise+defence": n_eps * n_def,
+              "attack": n_eps * (plain + adaptive), "attack+defence": n_eps * (plain * n_def + adaptive)}
+    return sum(n for c, n in counts.items() if conditions is None or c in conditions)
 
 
 # ---------------------------------------------------------------------------
@@ -551,6 +839,79 @@ def write_state(path, state):
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(state, f)
     os.replace(path + ".tmp", path)
+
+
+def choose_templates(sampled, pool, seed):
+    """Verification templates of every sampled image, from the correct-image list *pool* (its index is
+    the image_id): a GENUINE template (another image of the same class) and an IMPOSTOR template (an
+    image of another class, the class drawn with numpy default_rng([seed, image_id, 6])). Both prefer
+    an image of the other phase (enrollment / verification, i.e. the other session) when the class has
+    one; the image is drawn with default_rng([seed, image_id, 5 or 6]).
+
+    Returns
+    -------
+    dict kind -> DataFrame aligned with *sampled*: template_image_id, relpath, link_path, class_idx,
+    other_phase (True where the template is from the other phase)
+    Raises ValueError if an image's class has no other correct image.
+    """
+    has_phase = "phase" in pool.columns
+    by_class = {c: g for c, g in pool.groupby("true_idx", sort=True)}
+    classes = np.array(sorted(by_class))
+    out = {kind: [] for kind in VERIF_TARGETS}
+    missing = []
+    for row in sampled.itertuples():
+        image_id, label = int(row.image_id), int(row.true_idx)
+        phase = getattr(row, "phase", None) if has_phase else None
+        for kind in VERIF_TARGETS:
+            rng = np.random.default_rng([seed, image_id, TEMPLATE_SEEDS[kind]])
+            if kind == "genuine":
+                candidates = by_class[label][by_class[label].index != image_id]
+            else:
+                others = classes[classes != label]
+                if not len(others):
+                    raise ValueError("an impostor template needs a second class in --correct-csv")
+                candidates = by_class[int(others[rng.integers(len(others))])]
+            if not len(candidates):
+                missing.append(str(row.link_path))
+                continue
+            other = candidates[candidates.phase != phase] if has_phase and isinstance(phase, str) else candidates[:0]
+            pick = other if len(other) else candidates
+            chosen = pick.iloc[int(rng.integers(len(pick)))]
+            out[kind].append({"template_image_id": int(chosen.name), "relpath": chosen.get("relpath"),
+                              "link_path": chosen.link_path, "class_idx": int(chosen.true_idx),
+                              "other_phase": bool(len(other))})
+    if missing:
+        raise ValueError(f"{len(missing)} sampled images have no other correct image of their class for a genuine "
+                         f"template:\n  " + "\n  ".join(missing[:20]))
+    return {kind: pd.DataFrame(rows) for kind, rows in out.items()}
+
+
+def batch_templates(templates, start, n, data_root):
+    """The templates of images start .. start + n - 1 for Context: kind -> images (clean, loaded like the
+    probes), image_id, relpath, class_idx; None without --verif-pairs."""
+    if templates is None:
+        return None
+    out = {}
+    for kind, frame in templates.items():
+        part = frame.iloc[start:start + n]
+        out[kind] = {"images": np.stack([_RUNNER.load_image(_RUNNER.resolve_path(r, data_root))
+                                         for r in part.itertuples()]),
+                     "image_id": part.template_image_id.to_numpy(), "relpath": part.relpath.tolist(),
+                     "class_idx": part.class_idx.to_numpy()}
+    return out
+
+
+def hardware():
+    """Where the run times were measured: platform, CPU threads and GPU names."""
+    import platform
+    gpus = []
+    for device in tf.config.list_physical_devices("GPU"):
+        try:
+            gpus.append(tf.config.experimental.get_device_details(device).get("device_name", device.name))
+        except Exception:                                    # details are not available on every platform
+            gpus.append(device.name)
+    return {"platform": platform.platform(), "processor": platform.processor(), "cpu_threads": os.cpu_count(),
+            "gpus": gpus}
 
 
 def main(argv=None):
@@ -584,6 +945,34 @@ def main(argv=None):
     ap.add_argument("--cams", default="layercam,eigencam", help="CAMs for part masses ('none' skips them)")
     ap.add_argument("--target-layer", default=None,
                     help="layer the CAMs explain (default: the last 4-D activation, block14_sepconv2_act)")
+    ap.add_argument("--part-baselines", default="kernelshap,lime",
+                    help="sampling baselines on the same part players, hiding methods and score as ASA "
+                         "(src/xai/part_baselines.py; 'none' skips them)")
+    ap.add_argument("--baseline-hiding", default=None,
+                    help="hiding baselines (of --baselines) used by the part baselines (default: all of them; "
+                         "each runs stand-alone, so with inpaint it adds the inpainting of its coalitions)")
+    ap.add_argument("--baseline-samples", type=int, default=DEFAULT_PART_SAMPLES,
+                    help="coalitions per part baseline, image, condition and hiding baseline (KernelSHAP: the "
+                         "empty and the full one included; 16 = half of the 2^5 coalitions)")
+    ap.add_argument("--pixel-baselines", default="kernelshap,lime",
+                    help="the same estimators on square patches, aggregated to the parts by pixel share "
+                         "('none' skips them)")
+    ap.add_argument("--pixel-samples", type=int, default=DEFAULT_PIXEL_SAMPLES,
+                    help="coalitions per pixel baseline, image, condition and hiding baseline")
+    ap.add_argument("--patch-size", type=int, default=DEFAULT_PATCH,
+                    help="patch side in pixels for the pixel baselines (32 = 8 x 8 = 64 players)")
+    ap.add_argument("--pixel-conditions", default="clean",
+                    help=f"conditions that get the pixel baselines (of {', '.join(CONDITIONS)}): each costs "
+                         "2 x --pixel-samples forward passes per image and hiding method; e.g. clean,attack")
+    ap.add_argument("--pixel-hiding", default=None,
+                    help="hiding baselines (of --baselines) used by the pixel baselines (default: blur, else the "
+                         "first of --baselines)")
+    ap.add_argument("--verif-pairs", action="store_true",
+                    help="also explain the verification score (cosine with a template embedding) against a "
+                         "genuine template (another correct image of the subject, preferably of the other phase) "
+                         "and a seeded impostor template; the probe is the condition image, templates stay clean")
+    ap.add_argument("--verif-conditions", default="clean,noise,attack",
+                    help="conditions explained with --verif-pairs (noise: the same-budget control of the shifts)")
     ap.add_argument("--batch-size", type=int, default=16, help="images attacked together")
     ap.add_argument("--asa-batch-size", type=int, default=96, help="coalition images per forward pass")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
@@ -614,6 +1003,36 @@ def main(argv=None):
         ap.error("bpda_pgd attacks through a defence: give --defences")
     if min(args.steps, args.batch_size, args.asa_batch_size, args.per_class, args.workers) < 1:
         ap.error("--steps, --batch-size, --asa-batch-size, --per-class and --workers must be at least 1")
+    part_estimators, pixel_estimators = split_list(args.part_baselines), split_list(args.pixel_baselines)
+    for name in part_estimators + pixel_estimators:
+        if name not in ESTIMATORS:
+            ap.error(f"unknown sampling baseline {name!r}; choose from {list(ESTIMATORS)}")
+    if min(args.baseline_samples, args.pixel_samples) < 2:
+        ap.error("--baseline-samples and --pixel-samples must be at least 2")
+    if not 1 <= args.patch_size <= 256:
+        ap.error("--patch-size must be between 1 and 256 pixels")
+    pixel_conditions, verif_conditions = split_list(args.pixel_conditions), split_list(args.verif_conditions)
+    for flag, values in (("--pixel-conditions", pixel_conditions), ("--verif-conditions", verif_conditions)):
+        for name in values:
+            if name not in CONDITIONS:
+                ap.error(f"{flag}: unknown condition {name!r}; choose from {list(CONDITIONS)}")
+    part_hiding = baselines if args.baseline_hiding is None else split_list(args.baseline_hiding)
+    for name in part_hiding:
+        if name not in baselines:
+            ap.error(f"--baseline-hiding {name!r} is not one of --baselines {baselines}")
+    if not part_hiding:
+        part_estimators = []
+    if args.pixel_hiding is None:
+        pixel_hiding = ["blur" if "blur" in baselines else baselines[0]] if baselines else []
+    else:
+        pixel_hiding = split_list(args.pixel_hiding)
+    for name in pixel_hiding:
+        if name not in baselines:
+            ap.error(f"--pixel-hiding {name!r} is not one of --baselines {baselines}")
+    if not (pixel_estimators and pixel_conditions and pixel_hiding):
+        pixel_estimators, pixel_conditions, pixel_hiding = [], [], []
+    if args.verif_pairs and not verif_conditions:
+        ap.error("--verif-pairs needs at least one --verif-conditions")
     parameters = {"jpeg": {"quality": args.jpeg_quality}, "bit_depth": {"bits": args.bits}}
     defences = {}
     for name in defence_names:
@@ -635,6 +1054,7 @@ def main(argv=None):
 
     # --- images and masks ------------------------------------------------------------
     df = pd.read_csv(args.correct_csv)
+    pool = df.copy()                       # every correct image (index = image_id): verification templates
     if args.exclude_from:
         seen = set(pd.read_csv(args.exclude_from, usecols=["link_path"]).link_path)
         before = len(df)
@@ -661,6 +1081,14 @@ def main(argv=None):
     except ValueError as err:
         raise SystemExit(f"--groups do not fit the mask file: {err}")
     mask_labels = mask_file["labels"][[mask_file["index"][r] for r in df.relpath]]
+    templates = None
+    if args.verif_pairs:
+        try:
+            templates = choose_templates(df, pool, args.seed)
+        except ValueError as err:
+            raise SystemExit(f"--verif-pairs: {err}")
+        print("verification templates: " + ", ".join(
+            f"{kind} {int(t.other_phase.sum())} of {len(t)} from the other phase" for kind, t in templates.items()))
 
     # --- resume: the same settings and images as the stopped run, checked before the model loads ---------
     identity = {"args": {k: v for k, v in vars(args).items() if k not in RESUME_FREE},
@@ -704,6 +1132,20 @@ def main(argv=None):
         seconds = n_conditions * (2 ** len(names) - 1) * 0.06 / args.workers
         print(f"inpainting: about {seconds:.0f} s of CPU per image with {args.workers} threads "
               f"(--baselines blur,mean skips it)")
+    if part_estimators:
+        n_part = n_conditions * len(part_hiding) * len(part_estimators)
+        print(f"part baselines {part_estimators} with {part_hiding}: at most {n_part} x {args.baseline_samples} = "
+              f"{n_part * args.baseline_samples} forward passes per image (run stand-alone, inpainting included)")
+    if pixel_estimators:
+        n_pixel = conditions_per_image(len(epsilons), len(defences), attacks, pixel_conditions)
+        print(f"pixel baselines {pixel_estimators} ({args.patch_size} px patches) on {pixel_conditions} with "
+              f"{pixel_hiding}: {n_pixel} condition images x {len(pixel_hiding) * len(pixel_estimators)} x "
+              f"{args.pixel_samples} = {n_pixel * len(pixel_hiding) * len(pixel_estimators) * args.pixel_samples} "
+              "forward passes per image")
+    if args.verif_pairs:
+        n_verif = conditions_per_image(len(epsilons), len(defences), attacks, verif_conditions)
+        print(f"verification pairs on {verif_conditions}: {n_verif} condition images x {len(baselines)} x "
+              f"2^{len(names)} more forward passes per image (embeddings)")
 
     for g in tf.config.list_physical_devices("GPU"):
         try:
@@ -736,11 +1178,13 @@ def main(argv=None):
     base_cols = [c for c in BASE_COLS if c in df.columns]
     rng = np.random.default_rng(args.seed)
     rates, timings, n_forward, minutes_before = Rates(), {}, 0, 0.0
+    forwards_by = Counter()                 # method -> forward passes (ASA, the sampling baselines, templates)
     os.makedirs(parts_dir, exist_ok=True)
     if state:                       # continue after the last finished batch, with its noise stream and counts
         rng.bit_generator.state = state["rng"]
         rates = Rates.from_list(state["rates"])
         timings, n_forward, minutes_before = dict(state["seconds"]), int(state["n_forward"]), float(state["minutes"])
+        forwards_by = Counter(state.get("forwards_by", {}))
         for name in os.listdir(parts_dir):          # a batch written after the last state was saved runs again
             if name.startswith("rows_") and name.endswith(".csv") and int(name[5:-4]) >= start_at:
                 os.remove(os.path.join(parts_dir, name))
@@ -753,9 +1197,15 @@ def main(argv=None):
         ctx = Context(model, clean, labels, batch[base_cols].to_dict("records"),
                       mask_labels[start:start + len(batch)], class_names, groups, baselines, args.score, cams,
                       args.target_layer, capabilities, receipt_index, args.asa_batch_size, args.seed,
-                      args.workers)
+                      args.workers, part_estimators=part_estimators, part_samples=args.baseline_samples,
+                      part_methods=part_hiding,
+                      pixel_estimators=pixel_estimators, pixel_samples=args.pixel_samples, patch=args.patch_size,
+                      pixel_conditions=pixel_conditions, pixel_methods=pixel_hiding,
+                      templates=batch_templates(templates, start, len(batch), args.data_root),
+                      verif_conditions=verif_conditions)
         rows = run_batch(ctx, epsilons, defences, attacks, args.steps, args.seed + start, rng, rates, timings)
         n_forward += ctx.n_forward
+        forwards_by.update(ctx.n_forward_by)
         done = start + len(batch)
         minutes = (time.time() - t0) / 60
         # the batch's rows, then the state that points past them (both replaced atomically): a stop in
@@ -766,6 +1216,7 @@ def main(argv=None):
         write_state(state_path, {"resume_key": resume_key, "n_done": done, "n_images": int(len(df)),
                                  "rng": rng.bit_generator.state, "rates": rates.to_list(),
                                  "seconds": timings, "n_forward": int(n_forward),
+                                 "forwards_by": {k: int(v) for k, v in forwards_by.items()},
                                  "minutes": minutes_before + minutes})
         print(f"  {done}/{len(df)} images | {minutes:.1f} min | ETA "
               f"{minutes / (done - start_at) * (len(df) - done):.1f} min | "
@@ -775,7 +1226,7 @@ def main(argv=None):
     # the rows of every batch, read back from the parts (the same path for a resumed and an uninterrupted run)
     parts = sorted(name for name in os.listdir(parts_dir) if name.startswith("rows_") and name.endswith(".csv"))
     rows = pd.concat([pd.read_csv(os.path.join(parts_dir, name)) for name in parts], ignore_index=True, sort=False)
-    rows.insert(0, "row_id", np.arange(len(rows)))
+    rows = pd.concat([pd.DataFrame({"row_id": np.arange(len(rows))}), rows], axis=1)
     first = ["row_id"] + base_cols
     rows = rows[first + [c for c in rows.columns if c not in first]]
     rows.to_csv(os.path.join(args.out_dir, f"rows_asa_{args.tag}.csv"), index=False)
@@ -799,7 +1250,43 @@ def main(argv=None):
                "noise": "epsilon * sign(uniform(-1, 1)) from numpy default_rng(seed), rounded to 8 bits (as in 05)",
                "defences": {d: {"quality": p} if d == "jpeg" else {"bits": p} for d, (_, p) in defences.items()},
                "baselines": baselines, "score": args.score, "cams": cams, "cam_layer": target_layer,
-               "anatomy": capabilities, "targets": "true class; predicted class where it differs (not clean)",
+               "anatomy": capabilities, "targets": "true class; predicted class where it differs (not clean)" + (
+                   "; genuine and impostor templates (score verif) on " + ", ".join(verif_conditions)
+                   if args.verif_pairs else ""),
+               "rows_per_target_kind": {k: int(v) for k, v in Counter(rows.target_kind).items()},
+               "part_baselines": {
+                   "estimators": part_estimators, "samples": args.baseline_samples, "hiding": part_hiding,
+                   "kernelshap": "Shapley kernel; sizes enumerated as in shap's KernelExplainer while the budget "
+                                 "covers them, the rest sampled by kernel mass with complements, without "
+                                 "replacement; efficiency enforced by eliminating one player (as shap); the "
+                                 "budget counts the empty and the full coalition",
+                   "lime": {"sampling": "uniform (each part kept with probability 1/2), first sample the full image",
+                            "kernel": "sqrt(exp(-d^2 / w^2)), d = cosine distance to the full coalition",
+                            "kernel_width": LIME_KERNEL_WIDTH, "ridge_alpha": LIME_ALPHA},
+                   "seed": "default_rng([seed, image_id, 1 (kernelshap) | 2 (lime)]): the same coalitions in every "
+                           "condition, target and hiding baseline of an image"},
+               "pixel_baselines": {
+                   "estimators": pixel_estimators, "samples": args.pixel_samples, "patch_size": args.patch_size,
+                   "n_patches": int(patch_map((256, 256), args.patch_size).max()) + 1,
+                   "conditions": pixel_conditions, "hiding": pixel_hiding,
+                   "aggregation": "part p = sum over patches j of w_j x (share of patch j's pixels in part p)",
+                   "seed": "default_rng([seed, image_id, 3 (kernelshap) | 4 (lime)])"},
+               "verification": {
+                   "enabled": bool(args.verif_pairs), "conditions": verif_conditions if args.verif_pairs else [],
+                   "templates": "genuine: another correct image of the class; impostor: an image of a class drawn "
+                                "with default_rng([seed, image_id, 6]); both prefer the other phase; the probe "
+                                "is the condition image, the template stays clean",
+                   "other_phase": ({k: int(t.other_phase.sum()) for k, t in templates.items()}
+                                   if templates else None)},
+               "agreement": {"sources": agreement_sources(part_estimators, pixel_estimators, cams, capabilities),
+                             "maps": "256 x 256, non-negative: positive part (or patch) values spread uniformly "
+                                     "over its pixels; CAMs and attention upsampled bilinearly and clipped at 0",
+                             "divergence": "Jensen-Shannon, base 2, of the maps normalised to distributions"},
+               "forward_passes_by_method": {k: int(v) for k, v in sorted(forwards_by.items())},
+               "runtime": {"hardware": hardware(),
+                           "note": "time_<method> / nfwd_<method> columns: wall time in seconds and forward passes "
+                                   "per image and condition, measured on this hardware; batched methods (CAMs, "
+                                   "attention, receipt) get their batch's time divided by its images"},
                "conditions_per_image": n_conditions,
                "asa_forward_passes": {"total": int(n_forward), "per_image": n_forward / max(len(df), 1),
                                       "upper_bound_per_image": upper},
