@@ -15,10 +15,12 @@ from PIL import Image
 from scipy.stats import norm
 
 from conftest import REPO, make_images
-from src.eval.verification import (N_BINS, THRESHOLDS, bootstrap_metrics, bootstrap_picks, build_templates,
-                                   cmc, embed, eer, error_rates, error_rates_from_counts, exclude_same_person,
-                                   far_key, metrics_from_counts, pair_counts, rank1, rank1_ci, ranks, roc,
-                                   score_bins, tar_at_far, template_counts, template_scores)
+from src.eval.verification import (ALONSO2025_PAPER, N_BINS, THRESHOLDS, alonso2025_nominal_counts,
+                                   alonso2025_pairs, alonso2025_select, bootstrap_metrics, bootstrap_picks,
+                                   build_templates, cmc, embed, eer, error_rates, error_rates_from_counts,
+                                   exclude_same_person, far_key, metrics_from_counts, pair_counts, pair_list_counts,
+                                   rank1, rank1_ci, ranks, roc, score_bins, tar_at_far, template_counts,
+                                   template_scores)
 from src.models.arcface_inference import find_arcface_layer, predict_logits
 
 
@@ -209,6 +211,109 @@ def test_exclude_same_person_leaves_out_other_classes_of_the_probe_person():
     same, n_same = exclude_same_person(scores, own, [1, 3, 5], [1, 2, 3, 5])   # classes as persons: no change
     assert n_same == 0
     np.testing.assert_array_equal(same, scores)
+
+
+# ------------------------------- UBIPr protocol of Alonso-Fernandez et al. 2025 (synthetic annotations)
+
+def _alonso_images(n_persons, drop=()):
+    """One image per (person, eye, session, distance index 1..5), minus the (person, eye, session, d) in drop."""
+    rows = [(p, eye, s, d) for p in range(1, n_persons + 1) for eye in "LR" for s in (1, 2) for d in range(1, 6)
+            if (p, eye, s, d) not in drop]
+    persons, eyes, sessions, d = (np.array(c) for c in zip(*rows))
+    return persons, eyes, sessions, d
+
+
+def _alonso_brute_force(persons, sessions, d):
+    """Every comparison of the protocol by enumeration: {(first, second): genuine}."""
+    out = {}
+    for a in range(len(persons)):
+        for b in range(len(persons)):
+            if sessions[a] != 1 or d[a] > d[b]:
+                continue
+            if persons[a] == persons[b] and (d[a] < d[b] or sessions[b] == 2):
+                out[(a, b)] = True
+            elif persons[a] != persons[b] and sessions[b] == 2:
+                out[(a, b)] = False
+    return out
+
+
+def test_alonso2025_pairs_reproduce_the_paper_counts():
+    persons, eyes, sessions, d = _alonso_images(86)
+    assert len(persons) == 1720                                       # 86 x 2 eyes x 2 sessions x 5 distances
+    pairs = alonso2025_pairs(persons, sessions, d)
+    genuine, intra = pairs["genuine"], pairs["di"] == pairs["dj"]
+    assert (int(genuine.sum()), int((~genuine).sum())) == (8600, 438600)
+    assert (ALONSO2025_PAPER["genuine"], ALONSO2025_PAPER["impostor"]) == (8600, 438600)
+    assert alonso2025_nominal_counts(86) == (8600, 438600) and alonso2025_nominal_counts(2) == (200, 120)
+    assert int((genuine & intra).sum()) == 5 * 344 and int((genuine & ~intra).sum()) == 10 * 688
+    combos = set(zip(pairs["di"].tolist(), pairs["dj"].tolist()))
+    assert len(combos) == 15 and all(i <= j for i, j in combos)
+    for i, j in combos:
+        at = (pairs["di"] == i) & (pairs["dj"] == j)
+        assert int((at & genuine).sum()) == (344 if i == j else 688) and int((at & ~genuine).sum()) == 29240
+    first, second = pairs["first"], pairs["second"]
+    assert (sessions[first] == 1).all() and (d[first] == pairs["di"]).all() and (d[second] == pairs["dj"]).all()
+    assert (persons[first[genuine]] == persons[second[genuine]]).all()
+    assert (persons[first[~genuine]] != persons[second[~genuine]]).all() and (sessions[second[~genuine]] == 2).all()
+    assert (sessions[second[genuine & intra]] == 2).all()             # intra: session 1 vs session 2 only
+    assert set(sessions[second[genuine & ~intra]].tolist()) == {1, 2}  # cross: both sessions at Dj
+    assert (eyes[first[genuine]] != eyes[second[genuine]]).any()      # both eyes are one identity
+    assert not (first == second).any()
+
+
+def test_alonso2025_pairs_match_brute_force_with_missing_images():
+    persons, _, sessions, d = _alonso_images(4, drop={(1, "L", 2, 3), (2, "R", 1, 1), (3, "L", 1, 5),
+                                                      (4, "L", 2, 1), (4, "R", 2, 1)})
+    pairs = alonso2025_pairs(persons, sessions, d)
+    got = dict(zip(zip(pairs["first"].tolist(), pairs["second"].tolist()), pairs["genuine"].tolist()))
+    assert len(got) == len(pairs["first"]) and got == _alonso_brute_force(persons, sessions, d)
+    assert sum(got.values()) < alonso2025_nominal_counts(4)[0]
+    order = np.lexsort((pairs["second"], pairs["first"], pairs["dj"], pairs["di"]))
+    assert (order == np.arange(len(order))).all()                     # combination, then first, then second
+    empty = alonso2025_pairs([], [], [])
+    assert all(len(v) == 0 for v in empty.values()) and empty["genuine"].dtype == bool
+
+
+def test_alonso2025_select_takes_one_frontal_image_per_cell():
+    # class 1 / 2 = person 1, class 3 = person 3 (session 1 only), class 5 = person 5; three captures per cell
+    rows = [  # class, person, session, distance, pose, gaze, image_idx
+        (1, 1, 1, 8, 0, 0, 1), (1, 1, 1, 8, 0, 30, 2), (1, 1, 1, 8, 0, 0, 3),      # two frontal: the first wins
+        (1, 1, 2, 8, 0, -30, 1), (1, 1, 2, 8, 30, 30, 2),                          # none frontal: closest is idx 1
+        (2, 1, 1, 4, -30, 0, 4), (2, 1, 1, 4, 0, 0, 5),
+        (3, 3, 1, 8, 0, 0, 1),                                                     # no session 2: person dropped
+        (5, 5, 1, 7, 0, 0, 1), (5, 5, 2, 7, 45, 0, 1), (5, 5, 2, 7, 0, 30, 2),     # |45| > |30|: idx 2 wins
+        (5, 5, 3, 7, 0, 0, 3),                                                     # session 3: never selected
+    ]
+    cls, person, session, dist, pose, gaze, idx = (np.array(c) for c in zip(*rows))
+    closest = alonso2025_select(cls, person, session, dist, pose, gaze, idx)
+    assert np.flatnonzero(closest).tolist() == [0, 3, 6, 8, 10]
+    strict = alonso2025_select(cls, person, session, dist, pose, gaze, idx, rule="strict")
+    assert np.flatnonzero(strict).tolist() == []                      # no person keeps a frontal session-2 image
+    gaze2 = gaze.copy()
+    gaze2[3] = 0                                                      # class 1, session 2 becomes frontal
+    strict = alonso2025_select(cls, person, session, dist, pose, gaze2, idx, rule="strict")
+    assert np.flatnonzero(strict).tolist() == [0, 3, 6]
+    shuffled = np.random.default_rng(0).permutation(len(rows))       # the selection does not depend on row order
+    again = alonso2025_select(cls[shuffled], person[shuffled], session[shuffled], dist[shuffled], pose[shuffled],
+                              gaze[shuffled], idx[shuffled])
+    assert sorted(shuffled[again].tolist()) == [0, 3, 6, 8, 10]
+    with pytest.raises(ValueError, match="frontal rule"):
+        alonso2025_select(cls, person, session, dist, pose, gaze, idx, rule="any")
+
+
+def test_pair_list_counts_match_the_raw_scores():
+    rng = np.random.default_rng(3)
+    scores = np.r_[rng.normal(0.6, 0.15, 400), rng.normal(0.1, 0.15, 3000), np.nan].clip(-1, 1)
+    genuine = np.r_[np.ones(400, bool), np.zeros(3001, bool)]
+    clusters = rng.integers(0, 7, len(scores))
+    counts = pair_list_counts(scores, genuine, clusters)
+    assert counts["genuine"].shape == (len(np.unique(clusters)), N_BINS)
+    assert counts["genuine"].sum() == 400 and counts["impostor"].sum() == 3000      # NaN skipped
+    row = metrics_from_counts(counts["genuine"].sum(0), counts["impostor"].sum(0))
+    g, i = np.floor((scores[:400] + 1) * 1e4) / 1e4 - 1, np.floor((scores[400:-1] + 1) * 1e4) / 1e4 - 1
+    assert row["eer"] == pytest.approx(eer(g, i)[0], abs=1e-9)
+    for k, c in enumerate(counts["subjects"]):
+        assert counts["genuine"][k].sum() == int((genuine & (clusters == c)).sum())
 
 
 def test_external_manifest_selection(tmp_path):

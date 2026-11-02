@@ -63,7 +63,9 @@ Writes to --out-dir:
   ubipr_skipped.csv        images left out, with the reason
   qc_contact_sheet.png     48 random crops plus up to 4 VISOB images (--visob-examples), for humans
   ubipr_summary.json       counts per session, class, distance and eye, skipped, flags, misfiled crops,
-                           person links, crop parameters, git commit, timing
+                           person links, crop parameters, the images and comparisons of 15's x1
+                           protocols (alonso2025_protocol: both frontal rules next to the paper's
+                           8,600 genuine / 438,600 impostor scores), git commit, timing
 
 Usage:
   python scripts/20_prepare_ubipr.py --source /kaggle/working/ubipr.tar --out-dir /kaggle/working/ubipr
@@ -85,6 +87,9 @@ import pandas as pd
 from PIL import Image, ImageDraw
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, REPO)
+from src.eval.verification import (ALONSO2025_DISTANCES, ALONSO2025_PAPER, alonso2025_nominal_counts,  # noqa: E402
+                                   alonso2025_pairs, alonso2025_select)
 NAME_RE = re.compile(r"(?:^|[/\\])(?P<stem>C(?P<cls>\d+)_S(?P<session>\d+)_I(?P<idx>\d+))\.(?P<ext>jpe?g|txt)$",
                      re.IGNORECASE)
 DATE_RE = re.compile(r"(\d{4}_\d{2}_\d{2})")
@@ -366,6 +371,24 @@ def mark_conflicts(df):
 
 # ------------------------------------------------------------- contact sheet
 
+def alonso2025_protocol(df):
+    """Images and comparisons of 15 --modes x1 --x1-protocol alonso2025 (the pairing of Alonso-Fernandez et al.
+    2025) on the usable crops, for both frontal rules, next to the paper's counts. No model needed."""
+    usable = df[(df.usable == 1).to_numpy() & df.cam_distance.isin(ALONSO2025_DISTANCES).to_numpy()]
+    out = {"paper": dict(ALONSO2025_PAPER)}
+    for rule in ("closest", "strict"):
+        keep = alonso2025_select(usable.class_id, usable.person_id, usable.session, usable.cam_distance,
+                                 usable.pose, usable.gaze, usable.image_idx, rule)
+        sel = usable[keep]
+        index = sel.cam_distance.map({d: k + 1 for k, d in enumerate(ALONSO2025_DISTANCES)}).to_numpy()
+        pairs = alonso2025_pairs(sel.person_id.to_numpy(), sel.session.to_numpy(), index)
+        n = int(sel.person_id.nunique())
+        out[rule] = {"persons": n, "images": len(sel), "genuine": int(pairs["genuine"].sum()),
+                     "impostor": int((~pairs["genuine"]).sum()),
+                     "nominal_for_these_persons": list(alonso2025_nominal_counts(n))}
+    return out
+
+
 def visob_tiles(path, size=OUT_SIZE):
     """Up to 4 VISOB images at their native 240 x 160: the clean images of an examples_<tag>.npz
     (05) or the images in a folder; [] if path is None or missing."""
@@ -534,6 +557,7 @@ def main():
         "x1_protocol": {"templates (session 1, usable)": int(((df.session == 1) & (df.usable == 1)).sum()),
                         "probes (session 2, usable)": int(((df.session == 2) & (df.usable == 1)).sum()),
                         "classes with both": int(df[df.usable == 1].groupby("class_id").session.nunique().eq(2).sum())},
+        "alonso2025_protocol": alonso2025_protocol(df),
         "crop": {"centre": "midpoint of the two eye corners", "width": f"{args.k} x corner-to-corner distance",
                  "aspect_w_h": "3:2", "anchor_y": args.anchor_y, "border": "replicate", "rotation": "none",
                  "output_size_w_h": list(OUT_SIZE), "resample": "Lanczos", "padded_crops": int(df.crop_padded.sum()),
@@ -550,6 +574,12 @@ def main():
     print(f"{len(df)} crops ({summary['n_usable']} usable) of {summary['n_classes']} classes / {summary['n_persons']} "
           f"persons | skipped {len(skipped)} | flags {dict(flag_counts)}")
     print(f"x1 protocol: {summary['x1_protocol']}")
+    a = summary["alonso2025_protocol"]
+    print("x1 --x1-protocol alonso2025: " + " | ".join(
+        f"{rule}: {a[rule]['persons']} persons, {a[rule]['images']} images, {a[rule]['genuine']} genuine / "
+        f"{a[rule]['impostor']} impostor" for rule in ("closest", "strict"))
+        + f" | paper: {a['paper']['persons']} persons, {a['paper']['images']} images, {a['paper']['genuine']} / "
+          f"{a['paper']['impostor']}")
     print(f"wrote {args.out_dir} ({summary['seconds']} s)")
 
 

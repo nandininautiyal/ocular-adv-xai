@@ -366,3 +366,79 @@ def test_eval_verification_x1_and_p3_unchanged(tmp_path, model):
     assert "external" not in p3_summary and set(p3_summary) | {"external"} == set(both_summary)
     assert p3_summary["per_mode"]["p3"]["eer"] == both_summary["per_mode"]["p3"]["eer"]
     assert p3_metrics.subset.tolist() == ["all", "device=iphone", "device=samsung", "lighting=day", "lighting=office"]
+
+
+def test_eval_verification_x1_alonso2025(tmp_path, model):
+    from src.eval.verification import embed
+    make_tar(tmp_path / "ubipr.tar")
+    _, prep_summary = run_prepare(tmp_path / "ubipr.tar", tmp_path / "ubipr")
+    ext = ["--modes", "x1", "--external-manifest", str(tmp_path / "ubipr" / "ubipr_manifest.csv")]
+    ckpt = tmp_path / "Xception_ArcFace_tiny.keras"
+    model.save(ckpt)
+
+    # ours stays the default: the same metrics file byte for byte, and no new summary keys
+    _run15(tmp_path, ckpt, tmp_path / "default", *ext)
+    _, _, ours = _run15(tmp_path, ckpt, tmp_path / "ours", *ext, "--x1-protocol", "ours")
+    assert (tmp_path / "default" / "verification_metrics_t.csv").read_bytes() == \
+        (tmp_path / "ours" / "verification_metrics_t.csv").read_bytes()
+    assert (tmp_path / "default" / "verification_scores_t.csv").read_bytes() == \
+        (tmp_path / "ours" / "verification_scores_t.csv").read_bytes()
+    assert "protocol" not in ours["external"] and "pair_counts" not in ours["per_mode"]["x1"]
+
+    metrics, scores, summary = _run15(tmp_path, ckpt, tmp_path / "alonso", *ext, "--x1-protocol", "alonso2025",
+                                      "--save-embeddings")
+    # usable crops: classes 1-6 at 8 m (D1) and 4 m (D5) in both sessions, classes 7 / 8 (person 5) in session 1;
+    # persons 1 = {1, 2}, 3 = {3, 4}, 5 = {5, 6, 7, 8}. Session-1 images per distance: 2, 2, 4; session-2: 2, 2, 2.
+    # genuine intra: (4 + 4 + 8) x 2 distances = 32; cross D1-D5: 2 x 4 + 2 x 4 + 4 x 6 = 40;
+    # impostor per combination: 2 x 4 + 2 x 4 + 4 x 4 = 32, 3 combinations
+    assert metrics.subset.tolist() == ["all", "intra", "cross", "D1(8m)-D1(8m)", "D1(8m)-D5(4m)", "D5(4m)-D5(4m)"]
+    by = metrics.set_index("subset")
+    assert (by.loc["all", "n_genuine"], by.loc["all", "n_impostor"]) == (72, 96)
+    assert (by.loc["intra", "n_genuine"], by.loc["cross", "n_genuine"]) == (32, 40)
+    assert by.loc["D1(8m)-D5(4m)", "n_impostor"] == 32 and by.loc["all", "n_subjects"] == 3
+    assert by.loc["all", "n_probes"] == 16                              # session-1 images
+    assert metrics.rank1.isna().all() and metrics.eer.between(0, 1).all()
+    assert metrics.protocol.iloc[0].startswith("zero-shot cross-dataset verification, pairing of Alonso-Fernandez")
+    assert "7.6 Rs" in metrics.caveat.iloc[0]
+    x1 = summary["per_mode"]["x1"]
+    counts = x1["pair_counts"]
+    assert (counts["persons"], counts["images"], counts["images_flipped"]) == (3, 28, 14)
+    assert (counts["genuine"], counts["impostor"], counts["genuine_intra"], counts["genuine_cross"]) == (72, 96, 32, 40)
+    assert counts["paper"]["genuine"] == 8600 and counts["paper"]["impostor"] == 438600 and not counts["matches_paper"]
+    assert counts["nominal_for_these_persons"]["genuine"] == 300
+    assert counts["by_combination"]["D1(8m)-D5(4m)"] == {"genuine": 40, "impostor": 32}
+    assert counts["eye_class_session_distance_cells_missing"] == 3 * 20 - 28
+    assert x1["x1_protocol"] == "alonso2025" and x1["frontal_rule"] == "closest"
+    assert summary["external"]["protocol"] == "alonso2025" and summary["external"]["pair_counts"] == counts
+    assert set(scores.kind) == {"genuine", "impostor"} and "combination" in scores.columns
+    persons = {1: 1, 2: 1, 3: 3, 4: 3, 5: 5, 6: 5, 7: 5, 8: 5}
+    gen, imp = scores[scores.kind == "genuine"], scores[scores.kind == "impostor"]
+    assert (gen.subject.map(persons) == gen.other_subject.map(persons)).all()
+    assert (imp.subject.map(persons) != imp.other_subject.map(persons)).all()
+    assert (gen.subject != gen.other_subject).any()                   # left eye vs right eye of one person
+    # 20 reports the same counts without a model
+    assert prep_summary["alonso2025_protocol"]["closest"] == {"persons": 3, "images": 28, "genuine": 72,
+                                                              "impostor": 96, "nominal_for_these_persons": [300, 360]}
+
+    # 'L' crops are embedded mirrored, 'R' crops as they are
+    script = importlib.util.spec_from_file_location("eval15_ubipr", os.path.join(REPO, "scripts",
+                                                                                 "15_eval_verification.py"))
+    eval15 = importlib.util.module_from_spec(script)
+    script.loader.exec_module(eval15)
+    saved = np.load(tmp_path / "alonso" / "embeddings_ubipr_t.npz")
+    manifest = pd.read_csv(tmp_path / "ubipr" / "ubipr_manifest.csv").set_index("relpath")
+    for rel in ("crops/C1_S1_I1.png", "crops/C2_S1_I1.png"):
+        path = str(tmp_path / "ubipr" / rel)
+        flip = manifest.loc[rel, "eye"] == "L"
+        image = eval15.load_image(path, flip=flip)
+        np.testing.assert_array_equal(image, eval15.load_image(path)[:, ::-1] if flip else eval15.load_image(path))
+        k = saved["relpaths"].tolist().index(rel)
+        np.testing.assert_allclose(saved["embeddings"][k].astype(np.float32), embed(model, image)[0], atol=2e-3)
+    assert not np.array_equal(eval15.load_image(str(tmp_path / "ubipr" / "crops" / "C1_S1_I1.png"), flip=True),
+                              eval15.load_image(str(tmp_path / "ubipr" / "crops" / "C1_S1_I1.png")))
+
+    # strict frontal rule: every synthetic image is annotated pose 0 and gaze 0, so the same images are selected
+    strict, _, strict_summary = _run15(tmp_path, ckpt, tmp_path / "strict", *ext, "--x1-protocol", "alonso2025",
+                                       "--x1-frontal", "strict", "--max-subjects", "2")
+    assert strict_summary["per_mode"]["x1"]["frontal_rule"] == "strict"
+    assert strict_summary["per_mode"]["x1"]["pair_counts"]["persons"] == 2            # smoke run: first 2 persons
