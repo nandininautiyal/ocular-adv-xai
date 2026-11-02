@@ -18,7 +18,8 @@ from test_train_notebook import _parser, _split
 NOTEBOOK = os.path.join(REPO, "notebooks", "train_anatomy.ipynb")
 SCRIPTS = {"scripts/01_build_manifest.py", "scripts/02_make_splits.py", "scripts/03_train_baseline.py",
            "scripts/04_eval_clean.py", "scripts/15_eval_verification.py", "scripts/17_make_eye_masks.py",
-           "scripts/21_make_train_masks.py", "scripts/22_anatomical_shapley.py", "scripts/23_analyse_asa.py"}
+           "scripts/21_make_train_masks.py", "scripts/22_anatomical_shapley.py", "scripts/23_analyse_asa.py",
+           "scripts/24_gradient_masking.py"}
 
 
 def _cells():
@@ -311,8 +312,85 @@ def test_fields_the_notebook_reads_are_written_by_the_scripts(tmp_path):
                                                          "n_images", "code_commit", "code_dirty"])
     assert not absent("scripts/22_anatomical_shapley.py", ["minutes", "n_images", "n_rows", "git_commit", "n_done"])
     assert not absent("scripts/03_train_baseline.py", ["finished", "weights_sha256"])      # training_done
+    assert not absent("scripts/22_anatomical_shapley.py", ["attacks", "rows_per_target_kind"])   # checks_asa
+    assert not absent("scripts/24_gradient_masking.py", ["masking_flags", "checks_skipped", "seconds_per_image",
+                                                         "git_commit", "n_images", "arch", "has_attention"])
     import importlib.util
     spec = importlib.util.spec_from_file_location("s21", os.path.join(REPO, "scripts", "21_make_train_masks.py"))
     s21 = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(s21)
     assert s21.threshold_key(0.005) == "share_ge_0.5pct"            # the eyebrow line of checks_masks
+
+
+@pytest.mark.parametrize("settings", SETTINGS + [{"MASKING_ARCHS": ["parts"], "ASA_VERIF_PAIRS": False,
+                                                  "ASA_BASELINE_HIDING": None,
+                                                  "ASA_ATTACKS": "fgsm,pgd,aas_pgd,bpda_pgd"}])
+def test_masking_check_and_the_asa_flags(settings):
+    """24 runs on the smoke and the full model (seed SEEDS[0]) of every arch of MASKING_ARCHS that is trained, on
+    that model's own correct-image list, after its 04, with the same grids in the smoke and the full run; every 22
+    run of the session has the same 22 flags (the smoke runs time the full runs)."""
+    ns = _namespace(**settings)
+    cmd, s0 = ns["CMD"], ns["SEEDS"][0]
+    check = [a for a in ns["MASKING_ARCHS"] if a in ns["ARCHS"]]
+    assert ns["MASK_CHECK"] == check and "attnet_gate" not in check
+    for full, tags in ((False, ns["SMOKE_TAGS"]), (True, {a: ns["FULL_TAGS"][(a, s0)] for a in ns["ARCHS"]})):
+        for arch, t in tags.items():
+            assert (f"24_{t}" in cmd) == (arch in check)
+            if arch not in check:
+                continue
+            a24, a03, a04 = _args(cmd[f"24_{t}"]), _args(cmd[f"03_{t}"]), _args(cmd[f"04_{t}"])
+            assert a24["--ckpt"] == f"{a03['--out-dir']}/Xception_ArcFace_{t}.keras"
+            assert a24["--correct-csv"] == f"{a04['--out-dir']}/correct_test_{t}.csv"
+            assert a24["--tag"] == t and a24["--out-dir"] == ns["MASKING"]
+            assert ns["NEEDS"][f"24_{t}"] == [f"04_{t}"]
+            if full:
+                assert a24["--per-class"] == "1" and "--max-images" not in a24
+            else:
+                assert a24["--max-images"] == str(ns["MASKING_SMOKE_IMAGES"]) and "--per-class" not in a24
+            assert not [k for k in a24 if k.endswith(("-grid", "-levels", "steps", "restarts", "--taus", "--levels"))]
+    for (arch, s), t in ns["FULL_TAGS"].items():
+        assert (f"24_{t}" in cmd) == (arch in check and s == s0)
+    runs = [k for k in cmd if k.startswith("22_")]
+    assert runs
+    for name in runs:
+        a = _args(cmd[name])
+        assert a["--attacks"] == ns["ASA_ATTACKS"] and a["--pixel-conditions"] == ns["ASA_PIXEL_CONDITIONS"]
+        assert a.get("--baseline-hiding") == ns["ASA_BASELINE_HIDING"]
+        assert ("--verif-pairs" in a) == ns["ASA_VERIF_PAIRS"]
+    defaults = _namespace()
+    assert "aas_pgd" in defaults["ASA_ATTACKS"].split(",") and defaults["ASA_VERIF_PAIRS"] is True
+    assert set(defaults["MASK_CHECK"]) == {"attn_mask", "parts", "gap"}
+    # the masking check is one of a model's steps: planned and estimated with it, skipped once its summary exists
+    assert "MODEL_STEPS" in _cell(11) and "EST['24_h']" in _cell(11)
+    assert "'24': f'{MASKING}/summary_masking_{t}.json'" in _cell(12)
+
+
+def test_verification_pairs_keep_classes_with_a_template(tmp_path):
+    """22 --verif-pairs stops on an image without a second image of its class: cells 10 and 13 keep only classes
+    with two or more images when ASA_VERIF_PAIRS is on."""
+    import pandas as pd
+    frame = pd.DataFrame({"relpath": list("abcde"), "true_idx": [0, 0, 1, 2, 2]})
+    assert list(_helpers(tmp_path)["with_templates"](frame).relpath) == ["a", "b", "d", "e"]
+    assert _helpers(tmp_path, ASA_VERIF_PAIRS=False)["with_templates"](frame) is frame
+    assert "with_templates(" in _cell(10) and "with_templates(" in _cell(13)
+
+
+def test_masking_flags_warn_but_a_missing_or_foreign_summary_fails(tmp_path):
+    ns = _helpers(tmp_path, MASKING=str(tmp_path / "masking"))
+    exec(_cell(5), ns)
+    os.makedirs(ns["MASKING"])
+    t = "an_parts_s1"
+    [(name, ok, _, hard)] = ns["checks_masking"](t)
+    assert not ok and hard
+    summary = {"git_commit": "0" * 40, "masking_flags": [], "checks_skipped": [], "n_images": 3, "arch": "parts"}
+    with open(f"{ns['MASKING']}/summary_masking_{t}.json", "w") as f:
+        json.dump(summary, f)
+    open(f"{ns['MASKING']}/rows_masking_{t}.csv", "w").close()
+    assert all(ok for _, ok, _, _ in ns["checks_masking"](t))
+    with open(f"{ns['MASKING']}/summary_masking_{t}.json", "w") as f:
+        json.dump(dict(summary, masking_flags=["pgd_budget_not_monotone"]), f)
+    (_, ok1, _, hard1), (_, ok2, detail, hard2) = ns["checks_masking"](t)
+    assert ok1 and hard1 and not ok2 and not hard2 and "pgd_budget_not_monotone" in detail
+    with open(f"{ns['MASKING']}/summary_masking_{t}.json", "w") as f:
+        json.dump(dict(summary, git_commit="1234567"), f)
+    assert not ns["checks_masking"](t)[0][1]

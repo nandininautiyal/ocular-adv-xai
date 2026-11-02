@@ -18,16 +18,19 @@ Conditions per image (the conventions of 05 and 14):
                     (the generator of 05: one numpy Generator seeded with --seed)
   attack            fgsm and pgd (src/attacks/whitebox.py, margin loss, the true
                     class), rounded to 8 bits within whole levels of each budget
-                    (src/attacks/budget.py); with --attacks ...,bpda_pgd also
-                    BPDA-PGD through each defence (src/attacks/adaptive.py, column
-                    adapted_to), which returns 8-bit images
+                    (src/attacks/budget.py); with --attacks ...,aas_pgd also the
+                    attention-scaled PGD of src/attacks/masking.py (non-adaptive
+                    like pgd; --taus; on a model without attention it is pgd); with
+                    --attacks ...,bpda_pgd also BPDA-PGD through each defence
+                    (src/attacks/adaptive.py, column adapted_to), which returns
+                    8-bit images
   defence_on_clean  each defence on the clean image
   noise+defence     each defence on each noise image (the matched control for
                     restoration)
-  attack+defence    each defence on each fgsm / pgd image; BPDA-PGD images only
+  attack+defence    each defence on each fgsm / pgd / aas_pgd image; BPDA-PGD images only
                     with the defence they were adapted to
 Budgets are whole 8-bit levels (--levels 1,2,4 = 1/255, 2/255, 4/255, written to
-7 decimals like 05). PGD and BPDA-PGD use --steps steps of 2.5 * epsilon / steps
+7 decimals like 05). PGD, AAS-PGD and BPDA-PGD use --steps steps of 2.5 * epsilon / steps
 and a random start seeded with --seed + the batch's first index (as in 14).
 
 For every condition image the true class is explained, and when the prediction
@@ -130,12 +133,12 @@ Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target
                        row in --correct-csv); only with --verif-pairs
   pred_idx, correct    prediction for the condition image and whether it is the true class
   margin_true          true-class margin of the condition image (negative = fooled)
-  attack_success       attack+defence rows: the attack reached its own goal. fgsm / pgd: it
+  attack_success       attack+defence rows: the attack reached its own goal. fgsm / pgd / aas_pgd: it
                        fooled the undefended model (pred of the attack row != true);
                        bpda_pgd[D]: it fooled the model behind the defence D it was computed
                        through (pred of this row != true), as 14's success_after_defence
   attack_success_undefended  attack+defence rows: the attack fooled the undefended model
-                       (equal to attack_success for fgsm / pgd)
+                       (equal to attack_success for fgsm / pgd / aas_pgd)
   defended_clean_correct  rows with a defence: D(clean) is classified correctly
   pert_linf, pert_l2   distance of the condition image from the clean image ([0, 1] scale)
   area_<g>, present_<g>   share of the image in part group g, and whether it has a pixel
@@ -146,7 +149,8 @@ Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target
   mass_<src>_<g>       part masses of src = layercam, eigencam, attention
   receipt_<g>          the parts model's receipt (units of --score; NaN for a group the
                        model has no part for)
-  receipt_sum          sum of the receipt over all of the model's parts (= v_full)
+  receipt_sum          sum of the receipt over all of the model's parts (= v_full); the masses and the
+                       receipt explain the classification score: NaN on genuine / impostor rows
   del_auc_<src>        normalised deletion AUC (src/xai/shapley.deletion_from_values: the score
                        rescaled from 1 with every part kept to 0 with every present part
                        hidden; lower = it gets there sooner) when the present groups are hidden
@@ -175,7 +179,7 @@ Writes to --out-dir:
                           (23 checks the rows against them): attack_success_rate (on the
                           undefended model, every attack), attack_success_after_defence_rate
                           (every attack x defence; the headline number of a BPDA-PGD attack),
-                          restoration_rate_among_successful_attacks (fgsm / pgd only: among the
+                          restoration_rate_among_successful_attacks (non-adaptive attacks only: among the
                           attacks that fooled the undefended model, the share the defence
                           classifies correctly; for BPDA-PGD it is 1 - success after defence)
                           and the flip rates of the controls; rows per target kind; the settings of
@@ -239,6 +243,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
 from src.attacks.adaptive import bpda_pgd  # noqa: E402
 from src.attacks.budget import levels, quantise  # noqa: E402
+from src.attacks.masking import DEFAULT_TAUS, aas_pgd, check_taus  # noqa: E402
 from src.attacks.whitebox import fgsm, pgd  # noqa: E402
 from src.defences.inference import DEFENCE_REGISTRY, make_defence  # noqa: E402
 from src.models.arcface_inference import find_feature_layer, load_checkpoint, predict_logits  # noqa: E402
@@ -267,7 +272,8 @@ def _load_script(name):
 _RUNNER = _load_script("05_run_experiment")          # budgets, image loading, git state, versions
 _ADAPTIVE = _load_script("14_adaptive_attacks")      # sampling, margins, JSON helpers
 
-ATTACKS = ("fgsm", "pgd", "bpda_pgd")
+ATTACKS = ("fgsm", "pgd", "aas_pgd", "bpda_pgd")
+NON_ADAPTIVE = ("fgsm", "pgd", "aas_pgd")      # computed on the undefended model; the image meets every defence
 SCORES = ("margin", "logit")
 SOURCES = ("asa", "layercam", "eigencam", "attention", "receipt", "random")
 CONDITIONS = ("clean", "noise", "attack", "defence_on_clean", "noise+defence", "attack+defence")
@@ -738,11 +744,12 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
 # One batch: every condition
 # ---------------------------------------------------------------------------
 
-def run_batch(ctx, epsilons, defences, attacks, steps, seed, rng, rates, timings):
+def run_batch(ctx, epsilons, defences, attacks, steps, seed, rng, rates, timings, taus=DEFAULT_TAUS):
     """All conditions of one batch of clean images; returns the rows.
 
     defences : dict name -> (defence function, parameter value)
     rng : numpy Generator for the noise control (one per run, as in 05)
+    taus : attention temperatures of aas_pgd
     """
     clean, labels = ctx.clean, ctx.labels
     rows = []
@@ -781,14 +788,16 @@ def run_batch(ctx, epsilons, defences, attacks, steps, seed, rng, rates, timings
     for eps in epsilons:
         runs = []                                   # (attack, adapted_to, images, defences to apply)
         common = {"label": labels}
-        for name in ("fgsm", "pgd"):
+        for name in NON_ADAPTIVE:
             if name not in attacks:
                 continue
             start = time.perf_counter()
             if name == "fgsm":
                 adv = fgsm(clean, ctx.model, eps, **common)
-            else:
+            elif name == "pgd":
                 adv = pgd(clean, ctx.model, eps, steps=steps, seed=seed, **common)
+            else:                                   # same start, step size and steps as pgd
+                adv = aas_pgd(clean, ctx.model, eps, steps=steps, seed=seed, taus=taus, **common)
             timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
             runs.append((name, None, quantise(adv, clean, eps), list(defences)))
         if "bpda_pgd" in attacks:
@@ -819,7 +828,7 @@ def run_batch(ctx, epsilons, defences, attacks, steps, seed, rng, rates, timings
 def conditions_per_image(n_eps, n_def, attacks, conditions=None):
     """Condition images per clean image (each explained with every baseline); with *conditions*, only
     those of the listed conditions (e.g. the conditions of --pixel-conditions)."""
-    plain = sum(a in attacks for a in ("fgsm", "pgd"))
+    plain = sum(a in attacks for a in NON_ADAPTIVE)
     adaptive = n_def if "bpda_pgd" in attacks else 0          # one BPDA-PGD image per defence, with that defence
     counts = {"clean": 1, "defence_on_clean": n_def, "noise": n_eps, "noise+defence": n_eps * n_def,
               "attack": n_eps * (plain + adaptive), "attack+defence": n_eps * (plain * n_def + adaptive)}
@@ -933,9 +942,12 @@ def main(argv=None):
                     help="sampling and noise seed (as in 05); PGD random starts use seed + the batch's first index")
     ap.add_argument("--levels", default="1,2,4", help="L-inf budgets in whole 8-bit levels (1,2,4 = 1/255, ...)")
     ap.add_argument("--attacks", default="fgsm,pgd",
-                    help="fgsm, pgd (non-adaptive, 8-bit) and optionally bpda_pgd (adaptive, through each defence)")
+                    help="fgsm, pgd (non-adaptive, 8-bit), optionally aas_pgd (non-adaptive, attention-temperature "
+                         "scaling, src/attacks/masking.py) and bpda_pgd (adaptive, through each defence)")
+    ap.add_argument("--taus", default=",".join(f"{t:g}" for t in DEFAULT_TAUS),
+                    help="attention temperatures aas_pgd tries at every step (as in 14 and 24)")
     ap.add_argument("--steps", type=int, default=10,
-                    help="steps of pgd and bpda_pgd (10 = whitebox.pgd's default, as in 05; 14 used 20)")
+                    help="steps of pgd, aas_pgd and bpda_pgd (10 = whitebox.pgd's default, as in 05; 14 used 20)")
     ap.add_argument("--defences", default="jpeg,bit_depth", help="jpeg and/or bit_depth ('none': no defence)")
     ap.add_argument("--jpeg-quality", type=int, default=75, help="JPEG quality of the jpeg defence")
     ap.add_argument("--bits", type=int, default=4, help="bit depth of the bit_depth defence")
@@ -1001,6 +1013,10 @@ def main(argv=None):
         ap.error("need at least one attack and one baseline")
     if "bpda_pgd" in attacks and not defence_names:
         ap.error("bpda_pgd attacks through a defence: give --defences")
+    try:
+        taus = check_taus([float(t) for t in args.taus.split(",") if t.strip()])
+    except ValueError as e:
+        ap.error(f"--taus: {e}")
     if min(args.steps, args.batch_size, args.asa_batch_size, args.per_class, args.workers) < 1:
         ap.error("--steps, --batch-size, --asa-batch-size, --per-class and --workers must be at least 1")
     part_estimators, pixel_estimators = split_list(args.part_baselines), split_list(args.pixel_baselines)
@@ -1203,7 +1219,8 @@ def main(argv=None):
                       pixel_conditions=pixel_conditions, pixel_methods=pixel_hiding,
                       templates=batch_templates(templates, start, len(batch), args.data_root),
                       verif_conditions=verif_conditions)
-        rows = run_batch(ctx, epsilons, defences, attacks, args.steps, args.seed + start, rng, rates, timings)
+        rows = run_batch(ctx, epsilons, defences, attacks, args.steps, args.seed + start, rng, rates, timings,
+                         taus)
         n_forward += ctx.n_forward
         forwards_by.update(ctx.n_forward_by)
         done = start + len(batch)
@@ -1245,7 +1262,9 @@ def main(argv=None):
                "group_presence": {g: int(present[:, p].sum()) for p, g in enumerate(names)},
                "epsilons": epsilons, "levels": [levels(e) for e in epsilons], "quantised_8bit": True,
                "attacks": attacks, "attack_loss": "margin (best other logit - true logit, margin-free logits)",
-               "steps": args.steps, "step_size": "2.5 * epsilon / steps (pgd, bpda_pgd)",
+               "steps": args.steps, "step_size": "2.5 * epsilon / steps (pgd, aas_pgd, bpda_pgd)",
+               **({"aas_taus": list(taus), "aas_tau_selection": "per step and image, the proposal after which "
+                   "the unscaled model's margin loss is largest"} if "aas_pgd" in attacks else {}),
                "random_start": "uniform in the epsilon ball, seed + first index of the batch",
                "noise": "epsilon * sign(uniform(-1, 1)) from numpy default_rng(seed), rounded to 8 bits (as in 05)",
                "defences": {d: {"quality": p} if d == "jpeg" else {"bits": p} for d, (_, p) in defences.items()},

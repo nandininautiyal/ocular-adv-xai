@@ -9,7 +9,7 @@ next to the rows file). The row accounting is checked first, as 12 does for 05,
 and any mismatch stops the analysis: no duplicate rows; one true-class row per
 image for every condition variant and baseline; adversarial-class rows exactly
 where the prediction is wrong; attack_success of defended rows equal to the
-attack's own outcome (fgsm / pgd: the attacked image fooled the model; BPDA-PGD:
+attack's own outcome (fgsm / pgd / aas_pgd: the attacked image fooled the model; BPDA-PGD:
 the defended image did, as 22 defines it), and attack_success_undefended equal
 to the outcome of the attacked image; efficiency (sum of phi = v_full - v_empty) in
 every row; for a parts model, the receipt summing to v_full (receipt_sum); with
@@ -35,7 +35,7 @@ Tables (CSV in --out-dir):
                           the same for the same-budget control (noise for attack, noise+defence
                           with the same defence for attack+defence), and their difference with
                           CI and Wilcoxon p (Holm)
-  phi_shift_by_outcome.csv  the same, split by whether the attack succeeded: fgsm / pgd fooled
+  phi_shift_by_outcome.csv  the same, split by whether the attack succeeded: fgsm / pgd / aas_pgd fooled
                           the undefended model; BPDA-PGD fooled the model behind the defence it
                           was computed through (its attack and attack+defence rows both take
                           that outcome)
@@ -239,17 +239,18 @@ def check_rows(rows, summary=None, tolerance=1e-6):
             raise ValueError("attack_success: some attack+defence rows have no attacked image")
         fooled = ~m.attacked_correct.astype(bool).to_numpy()
         adaptive = (m.adapted_to != "").to_numpy()
-        # the attack's own goal: fgsm / pgd fool the undefended model, BPDA-PGD the defended one (this row)
+        # the attack's own goal: fgsm / pgd / aas_pgd fool the undefended model, BPDA-PGD the defended one (this row)
         goal = np.where(adaptive, ~m.correct.astype(bool).to_numpy(), fooled)
         if ((m.outcome == "success").to_numpy() != goal).any():
             raise ValueError("attack_success of attack+defence rows differs from the outcome of the attack "
-                             "(fgsm / pgd: the attacked image; BPDA-PGD: the defended image)")
+                             "(fgsm / pgd / aas_pgd: the attacked image; BPDA-PGD: the defended image)")
         if "attack_success_undefended" in m and \
                 (np.asarray(parse_bool(m.attack_success_undefended, "attack_success_undefended")) != fooled).any():
             raise ValueError("attack_success_undefended of attack+defence rows differs from the outcome of the "
                              "attacked image")
         passed.append(f"attack_success of all {len(defended):,} defended true-class rows equals the attack's outcome "
-                      f"(fgsm / pgd on the undefended model, {int(adaptive.sum())} BPDA-PGD rows after the defence)")
+                      f"(fgsm / pgd / aas_pgd on the undefended model, {int(adaptive.sum())} BPDA-PGD rows after "
+                      "the defence)")
 
     phi = r[[f"phi_{g}" for g in groups]].to_numpy(np.float64)
     span = (r.v_full - r.v_empty).to_numpy(np.float64)
@@ -264,14 +265,21 @@ def check_rows(rows, summary=None, tolerance=1e-6):
                   f"in every row")
 
     if "receipt_sum" in r:          # parts models: the receipt splits the score of the full image exactly
-        receipt = r.receipt_sum.to_numpy(np.float64)
-        v_full = r.v_full.to_numpy(np.float64)
+        # it explains the classification score: genuine / impostor rows (score verif) have none (NaN, like the
+        # CAM and attention masses)
+        cls = ~r.target.isin(VERIF_TARGETS).to_numpy()
+        receipt = r.receipt_sum.to_numpy(np.float64)[cls]
+        v_full = r.v_full.to_numpy(np.float64)[cls]
         off = np.abs(receipt - v_full)
         bad = ~(off <= RECEIPT_TOLERANCE * np.maximum(1.0, np.abs(v_full)))
         if bad.any():
             raise ValueError(f"the parts receipt does not sum to v_full in {int(bad.sum())} rows "
                              f"(max gap {np.nanmax(off):.3g})")
-        passed.append(f"the parts receipt sums to v_full in every row (max gap {off.max():.2g}, float32 forward passes)")
+        if r.receipt_sum[~cls].notna().any():
+            raise ValueError("verification rows (genuine / impostor) have a parts receipt; it explains the "
+                             "classification score only")
+        passed.append(f"the parts receipt sums to v_full in every true / pred row (max gap {off.max():.2g}, "
+                      f"float32 forward passes)")
 
     verif = r[r.target.isin(VERIF_TARGETS)]
     if len(verif):
@@ -822,8 +830,9 @@ def report(tables, checks, summary, args):
               "compare the other sources with the random order and with each other.",
               "- Hidden parts use the clean image's eye mask in every condition; defended conditions explain the model "
               "on the defended image.",
-              "- Attack outcome: fgsm / pgd succeed when they fool the undefended model; BPDA-PGD succeeds when it "
-              "fools the model behind the defence it was computed through (`attack_success_after_defence_rate`).",
+              "- Attack outcome: fgsm / pgd / aas_pgd succeed when they fool the undefended model; BPDA-PGD "
+              "succeeds when it fools the model behind the defence it was computed through "
+              "(`attack_success_after_defence_rate`).",
               "- Rank agreement uses phi oriented like the ASA deletion order (sign-flipped where v_full < v_empty), "
               "so it and the deletion AUC share one convention.", ""]
     sens = tables.get("baseline_sensitivity", pd.DataFrame())

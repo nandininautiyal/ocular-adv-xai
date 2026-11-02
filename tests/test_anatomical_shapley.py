@@ -596,3 +596,82 @@ def test_resume_keeps_the_new_rows_and_columns(script, pair_inputs, tmp_path, mo
     summary = json.loads((out / "summary_asa_fr.json").read_text())
     assert summary["resumed"] and summary["forward_passes_by_method"] == whole["forward_passes_by_method"]
     assert summary["rows_per_target_kind"] == whole["rows_per_target_kind"]
+
+
+# ---------------------------------------------------------------------------
+# aas_pgd (src/attacks/masking.py) as an attack of 22
+# ---------------------------------------------------------------------------
+
+AAS_OPTS = ["--max-images", "2", "--levels", "2", "--defences", "jpeg", "--steps", "2", "--baselines", "mean",
+            "--cams", "none", "--part-baselines", "none", "--pixel-baselines", "none", "--seed", "3"]
+
+
+def test_aas_pgd_equals_pgd_without_attention(script, analyse, inputs, tmp_path):
+    """conftest's model has no attention pool, so aas_pgd is pgd: its attack and attack+defence rows equal
+    pgd's in everything but the attack name and the wall times, and 23's accounting accepts them."""
+    assert script.conditions_per_image(1, 1, ["pgd", "aas_pgd", "bpda_pgd"]) == 1 + 1 + 1 + 1 + 3 + 3
+    out = tmp_path / "out"
+    script.main(common(inputs, out) + AAS_OPTS + ["--attacks", "pgd,aas_pgd", "--taus", "1,4", "--tag", "aas"])
+    rows = pd.read_csv(out / "rows_asa_aas.csv")
+    summary = json.loads((out / "summary_asa_aas.json").read_text())
+    assert summary["attacks"] == ["pgd", "aas_pgd"] and summary["aas_taus"] == [1.0, 4.0]
+    assert summary["n_rows"] == len(rows) and rows.image_id.nunique() == 2
+    keys = ["image_id", "condition", "defence", "baseline", "target"]
+    drop = ["row_id", "attack"] + [c for c in rows.columns if c.startswith("time_")]
+
+    def runs(name):
+        part = rows[rows.attack == name].sort_values(keys).reset_index(drop=True)
+        return part.drop(columns=drop)
+
+    pgd_rows, aas_rows = runs("pgd"), runs("aas_pgd")
+    assert len(aas_rows) and set(aas_rows.condition) == {"attack", "attack+defence"}
+    assert aas_rows.adapted_to.isna().all()
+    pd.testing.assert_frame_equal(aas_rows, pgd_rows)
+    assert "aas_pgd@0.0078431+jpeg" in summary["attack_success_after_defence_rate"]
+    analyse.check_rows(rows, summary)
+    for bad in (["--attacks", "aas_pgd", "--taus", "0,2"], ["--attacks", "aas_pgd", "--taus", "2,2"],
+                ["--attacks", "aas_pgd", "--taus", "x"]):
+        with pytest.raises(SystemExit):
+            script.main(common(inputs, tmp_path / "x") + AAS_OPTS + bad)
+    assert not (tmp_path / "x").exists()
+
+
+def test_aas_pgd_on_an_attention_model(script, analyse, parts_model, inputs, tmp_path):
+    """On the parts model (an attention pool) aas_pgd runs through the temperature-scaled copies, stays
+    within the budget in whole 8-bit levels and its rows pass 23's accounting."""
+    ckpt = tmp_path / "parts.keras"
+    parts_model.save(ckpt)
+    out = tmp_path / "out"
+    args = common(inputs, out)
+    args[1] = str(ckpt)
+    script.main(args + AAS_OPTS + ["--attacks", "aas_pgd", "--tag", "aas_parts"])
+    rows = pd.read_csv(out / "rows_asa_aas_parts.csv")
+    summary = json.loads((out / "summary_asa_aas_parts.json").read_text())
+    assert summary["anatomy"]["attention"] and summary["aas_taus"] == [1.0, 2.0, 4.0, 8.0, 16.0]
+    attacked = rows[rows.condition == "attack"]
+    assert len(attacked) and (attacked.attack == "aas_pgd").all()
+    assert (attacked.pert_linf <= 2 / 255 + 1e-6).all()
+    analyse.check_rows(rows, summary)
+
+
+def test_parts_model_with_verification_pairs(script, analyse, parts_model, pair_inputs, tmp_path):
+    """The receipt explains the classification score: genuine / impostor rows of a parts model have none, and
+    23's receipt check covers the true / pred rows only (it used to fail on the NaN receipts of verification rows)."""
+    ckpt = tmp_path / "parts.keras"
+    parts_model.save(ckpt)
+    out = tmp_path / "out"
+    args = common(pair_inputs, out)
+    args[1] = str(ckpt)
+    script.main(args + ["--max-images", "2", "--levels", "2", "--attacks", "fgsm", "--defences", "none",
+                        "--baselines", "mean", "--cams", "none", "--part-baselines", "none", "--pixel-baselines",
+                        "none", "--verif-pairs", "--tag", "parts_verif"])
+    rows = pd.read_csv(out / "rows_asa_parts_verif.csv")
+    summary = json.loads((out / "summary_asa_parts_verif.json").read_text())
+    verif = rows.target.isin(["genuine", "impostor"])
+    assert verif.any() and rows.receipt_sum[verif].isna().all() and rows.receipt_sum[~verif].notna().all()
+    checks = analyse.check_rows(rows, summary)
+    assert any("receipt sums to v_full" in c for c in checks)
+    broken = rows.copy()
+    broken.loc[verif.idxmax(), "receipt_sum"] = 0.0
+    with pytest.raises(ValueError, match="classification score only"):
+        analyse.check_rows(broken, summary)
