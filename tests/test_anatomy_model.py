@@ -415,7 +415,16 @@ def test_03_trains_every_arch_and_resumes(split_tree, tmp_path, monkeypatch, cap
         assert {"ce", "mask_loss", "val_ce", "val_mask_loss", "val_loss", "accuracy"} <= set(log.columns)
         np.testing.assert_allclose(log.val_loss, log.val_ce + log.val_mask_loss, rtol=1e-4)
         assert {"ce", "mask_loss"} <= set(pd.read_csv(out / "history_t.csv").columns)
-    assert run["best_val_loss"] == pytest.approx(log.val_loss.min())
+    # every arm is selected on the validation CE: val_ce for the mask-loss archs, val_loss (= CE) for the others
+    monitor = "val_ce" if arch in am.MASK_LOSS_ARCHS else "val_loss"
+    assert run["monitor"] == monitor and train_script.monitor_for(arch) == monitor
+    assert run["best_epoch"] == int(log.epoch[log[monitor].idxmin()]) + 1
+    assert run["best_monitor"] == pytest.approx(log[monitor].min())
+    assert run["best_val_loss"] == pytest.approx(float(log.val_loss[log[monitor].idxmin()]))
+    if arch in am.MASK_LOSS_ARCHS:
+        assert set(run["mask_area_below_min"]) == {"train", "validation", "test"}
+    else:
+        assert "mask_area_below_min" not in run
     assert not (out / "backup_t").exists()
 
     ckpt = out / "Xception_ArcFace_t.keras"              # the plain inference model, not the trainer
@@ -434,19 +443,42 @@ def test_03_trains_every_arch_and_resumes(split_tree, tmp_path, monkeypatch, cap
     assert "nothing to resume" in capsys.readouterr().out
 
 
-def test_03_baseline_record_and_flags_are_unchanged(split_tree, tmp_path, monkeypatch):
+def test_03_baseline_record_and_flags_are_unchanged(split_tree, tmp_path, monkeypatch, capsys):
     tree, masks, _ = split_tree
     monkeypatch.setattr(train_script, "build_model", lambda cfg: _tiny_baseline(cfg))
     run = _train(monkeypatch, tree, tmp_path / "models", "--epochs", "1")
     assert not {"arch", "anatomy", "masks", "masks_sha256", "mask_coverage"} & set(run)
     assert not set(train_script.ANATOMY_ARGS) & set(run["args"])        # the args of records before --arch
-    assert "anatomy" not in run["cfg"]
-    for extra, message in ((["--arch", "parts"], "needs --masks"), (["--masks", masks], "used only by"),
-                           (["--arch", "gap", "--masks", masks], "used only by"),
-                           (["--arch", "attnet_gate", "--masks", masks, "--mask-loss-weight", "2"], "mask-loss"),
-                           (["--allow-missing-masks"], "needs --masks")):
-        with pytest.raises(SystemExit):
+    assert "anatomy" not in run["cfg"] and "monitor" not in run
+    for extra, message in ((["--arch", "parts"], "--arch parts needs --masks"),
+                           (["--masks", masks], "--masks is used only by"),
+                           (["--arch", "gap", "--masks", masks], "--masks is used only by"),
+                           (["--arch", "attnet_gate", "--masks", masks, "--mask-loss-weight", "2"],
+                            "--mask-loss-weight is used only by"),
+                           (["--allow-missing-masks"], "--allow-missing-masks needs --masks")):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as stop:
             _train(monkeypatch, tree, tmp_path / "bad", *extra)
+        assert stop.value.code == 2                                     # argparse's error exit
+        assert message in capsys.readouterr().err, extra
+
+
+def test_callbacks_and_best_epoch_follow_the_monitor(tmp_path):
+    """The mask-loss archs are stopped, scheduled and checkpointed on val_ce, not on CE + lambda x KL."""
+    t = {"early_stop_patience": 5, "reduce_lr_factor": 0.2, "reduce_lr_patience": 2, "min_lr": 1e-6}
+    for monitor in ("val_loss", "val_ce"):
+        cbs = train_script.make_callbacks(t, str(tmp_path / "m.keras"), str(tmp_path / "log.csv"),
+                                          str(tmp_path / "backup"), monitor=monitor)
+        assert [c.monitor for c in cbs[:3]] == [monitor] * 3
+        state = next(c for c in cbs if isinstance(c, train_script.ResumeState))
+        assert state.monitor == monitor
+    # val_ce is lowest at epoch 2 and rises after it, while the total keeps falling with the KL term
+    log = pd.DataFrame({"epoch": [0, 1, 2, 3], "val_ce": [2.0, 1.5, 1.6, 1.7], "val_mask_loss": [3.0, 2.0, 1.0, 0.5]})
+    log["val_loss"] = log.val_ce + log.val_mask_loss
+    assert train_script.best_epoch(log) == (4, pytest.approx(2.2))
+    assert train_script.best_epoch(log, "val_ce") == (2, pytest.approx(3.5))
+    assert train_script.best_epoch(log.drop(columns="val_ce"), "val_ce") == (None, None)
+    assert [train_script.monitor_for(a) for a in ("baseline", "gap", "attn", "attnet_gate", "attn_mask", "parts")]         == ["val_loss"] * 4 + ["val_ce"] * 2
 
 
 def _tiny_baseline(cfg):
@@ -517,5 +549,16 @@ def test_04_and_15_feed_the_region_input(split_tree, tmp_path, monkeypatch, caps
         verif.region_lookup(model, None, relpaths)
     with pytest.raises(SystemExit, match="no mask"):
         verif.region_lookup(model, str(masks), relpaths + ["cond/enrollment_left_eye/1141/1141_9999_l_c.png"])
+    # x1 (external images, no eye masks for them) is refused for attnet_gate: after loading the model, and
+    # before loading it when --region-masks is given
+    with pytest.raises(SystemExit, match="x1 is not available for attnet_gate"):
+        verif.region_lookup(model, str(masks), relpaths, external=True)
+    monkeypatch.setattr(sys, "argv", ["15_eval_verification.py", "--ckpt", str(tmp_path / "never_loaded.keras"),
+                                      "--modes", "p3,x1", "--external-manifest", str(tmp_path / "ubipr.csv"),
+                                      "--region-masks", str(masks)])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as stop:
+        verif.main()
+    assert stop.value.code == 2 and "x1 is not available for attnet_gate" in capsys.readouterr().err
     assert verif.region_lookup(_tiny_baseline({"model": {"n_classes": 3}, "training": {"learning_rate": 1e-3}}),
                                str(masks), relpaths) is None

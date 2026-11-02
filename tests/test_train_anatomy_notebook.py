@@ -147,6 +147,12 @@ def test_commands_follow_the_protocol(settings):
     # both models draw the same images (same list, seeds and limits), so their ASA values are paired
     keys = ("--correct-csv", "--seed", "--per-class", "--max-images")
     assert len({tuple(a.get(k) for k in keys) for a in full22.values()}) == 1
+    # the full runs continue a stopped run, and the two parallel runs (and the smoke runs that time them)
+    # use half the CPU threads each for inpainting
+    for n, a in full22.items():
+        assert a["--resume"] is True and "--resume" not in _args(cmd[f"22_smoke_{n}"])
+        assert a["--workers"] == _args(cmd[f"22_smoke_{n}"])["--workers"] == str(ns["ASA_WORKERS"])
+    assert _args(cmd["22_smoke"])["--workers"] == str(ns["ASA_WORKERS"])
     if settings.get("BASELINE_CKPT"):
         a = _args(cmd["04_base_ext"])
         assert a["--ckpt"] == settings["BASELINE_CKPT"] and a["--class-index"].endswith("/class_index_cs_s1.json")
@@ -154,6 +160,76 @@ def test_commands_follow_the_protocol(settings):
     # every step a step needs is a step of the session
     for name, needs in ns["NEEDS"].items():
         assert all(n in cmd for n in needs), name
+
+
+def _resume_cell(tmp_path, **overrides):
+    """Cells 2-4 and the resume cell (8) with PREVIOUS_OUTPUT unset, writing under tmp_path."""
+    w = str(tmp_path)
+    ns = _helpers(tmp_path, W=w, MODELS=f"{w}/trained_models", TRAIN_MASKS=f"{w}/train_masks", **overrides)
+    ns.update(PREV=None, MASK_COUNTS={"train": 3, "validation": 1, "test": 2, "open_set": 2})
+    os.makedirs(ns["MODELS"], exist_ok=True)
+    os.makedirs(ns["TRAIN_MASKS"], exist_ok=True)
+    exec(_cell(8), ns)
+    return ns
+
+
+def test_a_03_step_is_skipped_only_when_its_outputs_are_complete(tmp_path):
+    """A run record that says finished is not enough: a stop during 03's test evaluation leaves no weights or
+    results, and 03 --resume writes them only if the notebook launches the step again."""
+    ns = _resume_cell(tmp_path)
+    models, t = ns["MODELS"], "an_parts_s1"
+    finished, done = ns["training_finished"], ns["training_done"]
+    assert not finished(t) and not done(t)
+    with open(f"{models}/run_{t}.json", "w") as f:
+        json.dump({"finished": True, "weights_sha256": None}, f)
+    os.makedirs(f"{models}/backup_{t}")
+    assert not finished(t)                                    # the backup is removed after the record
+    os.rmdir(f"{models}/backup_{t}")
+    assert finished(t) and not done(t)                        # stopped before the weights and results
+    open(f"{models}/Xception_ArcFace_{t}.weights.h5", "w").close()
+    with open(f"{models}/run_{t}.json", "w") as f:
+        json.dump({"finished": True, "weights_sha256": "ab" * 32}, f)
+    assert not done(t)                                        # results_<tag>.json still missing
+    open(f"{models}/results_{t}.json", "w").close()
+    assert done(t)
+
+
+def test_reused_masks_must_cover_this_sessions_mask_list(tmp_path):
+    """masks64 copied from a session without attnet_gate has no open set: 21 must run again."""
+    ns = _resume_cell(tmp_path)
+    masks_done, folder = ns["masks_done"], ns["TRAIN_MASKS"]
+    assert not masks_done("an")
+    open(f"{folder}/masks64_an.npz", "w").close()
+    with open(f"{folder}/masks64_summary_an.json", "w") as f:
+        json.dump({"images_per_split": {"train": 3, "validation": 1, "test": 2}}, f)
+    assert masks_done("an") and not masks_done("an", ns["MASK_COUNTS"])
+    with open(f"{folder}/masks64_summary_an.json", "w") as f:
+        json.dump({"images_per_split": {"train": 3, "validation": 1, "test": 2, "open_set": 2}}, f)
+    assert masks_done("an", ns["MASK_COUNTS"])
+    cell11 = _cell(11)
+    assert "masks_done(TAG, MASK_COUNTS)" in cell11 and "not masks_done(TAG, MASK_COUNTS)" in cell11
+
+
+@pytest.mark.parametrize("clock, mask_ready, runs", [(1.0, True, True), (11.1, True, False), (1.0, False, False)])
+def test_external_baseline_04_waits_for_time_and_for_the_mask_model(tmp_path, clock, mask_ready, runs):
+    """Cell 13 runs 04 on BASELINE_CKPT in the foreground only when it ends before HARD_STOP_H and 22 could use
+    it (the mask model's checkpoint and correct-image list exist)."""
+    w = str(tmp_path)
+    ns = _helpers(tmp_path, RUN_FULL=True, ASA_ARCH="parts", W=w, MODELS=f"{w}/trained_models",
+                  EVAL=f"{w}/eval_clean", ASA=f"{w}/asa", VERIF=f"{w}/verification",
+                  BASELINE_CKPT="/kaggle/input/cs/trained_models/Xception_ArcFace_cs_s1.keras")
+    calls = []
+    ns.update(EST={"04_h": 0.5, "22_min_per_image": 0.1}, hours=lambda: clock,
+              sh=lambda cmd, check=True, gpu=None: calls.append(cmd) or 1)
+    os.makedirs(ns["MODELS"])
+    os.makedirs(ns["EVAL"])
+    if mask_ready:
+        t = ns["tag"]("parts", 1)
+        open(ns["ckpt"](ns["MODELS"], t), "w").close()
+        open(f"{ns['EVAL']}/correct_test_{t}.csv", "w").close()
+    exec(_cell(13), ns)
+    assert calls == ([ns["CMD"]["04_base_ext"]] if runs else [])
+    assert ("04_base_ext" in ns["A"]) == runs
 
 
 def test_plan_puts_the_mask_models_after_the_masks(tmp_path):
@@ -233,7 +309,8 @@ def test_fields_the_notebook_reads_are_written_by_the_scripts(tmp_path):
                                                           "n_images_embedded", "subset", "mode", "eer", "git_commit"])
     assert not absent("scripts/21_make_train_masks.py", ["images_per_split", "timing", "segmenting_s", "total_s",
                                                          "n_images", "code_commit", "code_dirty"])
-    assert not absent("scripts/22_anatomical_shapley.py", ["minutes", "n_images", "n_rows", "git_commit"])
+    assert not absent("scripts/22_anatomical_shapley.py", ["minutes", "n_images", "n_rows", "git_commit", "n_done"])
+    assert not absent("scripts/03_train_baseline.py", ["finished", "weights_sha256"])      # training_done
     import importlib.util
     spec = importlib.util.spec_from_file_location("s21", os.path.join(REPO, "scripts", "21_make_train_masks.py"))
     s21 = importlib.util.module_from_spec(spec)

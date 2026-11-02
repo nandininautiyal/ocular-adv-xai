@@ -32,7 +32,7 @@ Training recipe (all optional; without them a run trains exactly as before):
                  with the same --out-dir and --tag (copy backup_<tag>/, log_<tag>.csv and the
                  checkpoint back into --out-dir first). BackupAndRestore keeps the model, the
                  optimizer (incl. the learning rate) and the epoch; the state of EarlyStopping,
-                 ReduceLROnPlateau and ModelCheckpoint (best val_loss, waits, best epoch) is
+                 ReduceLROnPlateau and ModelCheckpoint (best monitored loss, waits, best epoch) is
                  kept next to it in backup_<tag>/callback_state.json, and EarlyStopping's best
                  weights are reloaded from the checkpoint. The checkpoint is written to
                  <name>.partial.keras and then renamed, so a stop while it is saved leaves the
@@ -74,13 +74,19 @@ whose behaviour and outputs are unchanged):
   The training loop, callbacks, --resume, --reshuffle and --save-weights work as for the baseline.
   The checkpoint is always the plain inference model (dual input; triple for attnet_gate) under the
   same name Xception_ArcFace_<tag>.keras (every arch is Xception + ArcFace): put the arch in --tag.
-  For attn_mask and parts, val_loss (which the callbacks monitor) is CE + lambda x mask loss, and
-  the logs add ce, mask_loss, val_ce and val_mask_loss. run_<tag>.json adds arch, anatomy (the
-  effective settings, also under cfg), masks, masks_sha256, mask_classes and mask_coverage per
-  split; a baseline record has exactly the fields it had before.
+  For attn_mask and parts, val_loss is CE + lambda x mask loss, and the logs add ce, mask_loss,
+  val_ce and val_mask_loss. They still optimise CE + lambda x mask loss, but early stopping, the
+  learning-rate drops, the best checkpoint and best_epoch follow val_ce (the validation CE, the
+  same quantity as the val_loss of every other arch), so every arm is selected and scheduled by
+  the same rule and only the head (and its training loss) differs. run_<tag>.json adds arch,
+  monitor (val_ce or val_loss) and best_monitor (its value at the best epoch), anatomy (the
+  effective settings, also under cfg), masks, masks_sha256, mask_classes, mask_coverage per split
+  and, for attn_mask and parts, mask_area_below_min (images whose eye region, or each part,
+  covers less than anatomy.min_part_area of the image and so get mask-loss weight 0); a baseline
+  record has exactly the fields it had before.
 
 Writes to --out-dir:
-  Xception_ArcFace_<tag>.keras       best checkpoint (lowest val_loss)
+  Xception_ArcFace_<tag>.keras       best checkpoint (lowest val_loss; val_ce for attn_mask, parts)
   class_index_<tag>.json             subject -> class index
   log_<tag>.csv                      CSVLogger, one row per epoch (all sessions with --resume)
   history_<tag>.csv                  per-epoch metrics (all sessions with --resume)
@@ -90,8 +96,9 @@ Writes to --out-dir:
                                      args, the effective cfg, package versions, split dir,
                                      images per split and per phase, sha256 of the sorted class
                                      list (UTF-8, names joined with "\n"), epochs run (all
-                                     sessions), best epoch (1-based) and its val_loss, training
-                                     minutes (this session and all sessions), resumed yes/no,
+                                     sessions), best epoch (1-based, by the monitored loss) and
+                                     its val_loss, training minutes (this session and all
+                                     sessions), resumed yes/no,
                                      checkpoint path and sha256, and the weights file with
                                      --save-weights
   Xception_ArcFace_<tag>.weights.h5  with --save-weights
@@ -107,7 +114,7 @@ command again in the next session):
       --cfg configs/cross_session.yml --reshuffle --resume --save-weights --tag cs
 Mask-supervised attention model (masks from 21_make_train_masks.py), same recipe:
   python scripts/03_train_baseline.py --split-dir /tmp/ocular_cross_session --n-classes 300 \
-      --cfg configs/anatomy.yml --arch attn_mask --masks /kaggle/working/masks/masks64_cs.npz \
+      --cfg configs/anatomy.yml --arch attn_mask --masks /kaggle/working/train_masks/masks64_cs.npz \
       --reshuffle --resume --save-weights --tag cs_attn_mask_s1
 """
 import os
@@ -139,6 +146,18 @@ from src.models.recognition_model import ArcFace, CustomDataGen, build_model, lo
 
 MASK_GRID = 8                     # feature cells per side that the mask targets are computed on
 ANATOMY_ARGS = ("arch", "masks", "mask_loss_weight", "allow_missing_masks")
+
+
+def monitor_for(arch):
+    """The validation loss that EarlyStopping, ReduceLROnPlateau, ModelCheckpoint and best_epoch() follow.
+
+    val_loss for every arch but attn_mask and parts. Their MaskTrainer logs val_loss = CE + lambda x
+    mask loss, and val_ce = the compiled CE alone (with the model's regularisation losses, exactly what
+    val_loss is for the other archs). Selecting and scheduling them on val_ce keeps the rule the same
+    for every arm, so a difference between, e.g., attn and attn_mask comes from the head and its
+    training loss, not from a different stopping epoch.
+    """
+    return "val_ce" if arch in MASK_LOSS_ARCHS else "val_loss"
 
 
 def accuracies(model, gen, n_classes):
@@ -279,10 +298,18 @@ class ResumeState(Callback):
         super().__init__()
         self.path, self.ckpt_path = path, ckpt_path
         self.early_stop, self.reduce_lr, self.checkpoint = early_stop, reduce_lr, checkpoint
+        self.monitor = early_stop.monitor
         self.epochs = {}
         if os.path.exists(path):
             with open(path) as f:
-                self.epochs = json.load(f)["epochs"]
+                saved = json.load(f)
+            # a state without "monitor" was written when every arch monitored val_loss
+            if saved.get("monitor", "val_loss") == self.monitor:
+                self.epochs = saved["epochs"]
+            else:
+                print(f"WARNING: {path} holds the callback state of a run that monitored "
+                      f"{saved.get('monitor', 'val_loss')}, this run monitors {self.monitor}: EarlyStopping, "
+                      "ReduceLROnPlateau and ModelCheckpoint start afresh")
         self.initial_epoch = None
         self.minutes_before = 0.0
         self.t0 = time.time()
@@ -321,7 +348,7 @@ class ResumeState(Callback):
         self.minutes_before = state["minutes"]
         if os.path.exists(self.ckpt_path):
             self.checkpoint.best = state["checkpoint"]["best"]
-        else:   # without the old best checkpoint, the next epoch must write one whatever its val_loss
+        else:   # without the old best checkpoint, the next epoch must write one whatever its loss
             print(f"WARNING: {self.ckpt_path} not found (copy it back into --out-dir before resuming); the next "
                   "epoch writes a new checkpoint, and the best epoch of the run record may not be the one saved")
         if resuming and self.early_stop.restore_best_weights and os.path.exists(self.ckpt_path):
@@ -340,7 +367,7 @@ class ResumeState(Callback):
         if not np.isclose(lr, state["lr"], rtol=1e-6):
             print(f"WARNING: learning rate after the restore {lr:g} differs from the saved {state['lr']:g}")
         where = f"resuming at epoch {epoch + 2}" if resuming else f"no epoch left to train after epoch {epoch + 1}"
-        print(f"{where}: best val_loss {es['best']:.4f} (epoch {es['best_epoch'] + 1}), lr {lr:g}, "
+        print(f"{where}: best {self.monitor} {es['best']:.4f} (epoch {es['best_epoch'] + 1}), lr {lr:g}, "
               f"{self.minutes_before:.1f} min trained before")
 
     def on_epoch_end(self, epoch, logs=None):
@@ -356,7 +383,7 @@ class ResumeState(Callback):
         }
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path + ".tmp", "w") as f:
-            json.dump({"epochs": self.epochs}, f, indent=1)
+            json.dump({"monitor": self.monitor, "epochs": self.epochs}, f, indent=1)
         os.replace(self.path + ".tmp", self.path)
 
     def minutes(self):
@@ -378,8 +405,10 @@ class AtomicModelCheckpoint(ModelCheckpoint):
         os.replace(partial, filepath)
 
 
-def make_callbacks(t, ckpt, log_path, backup_dir=None, resumed=False):
+def make_callbacks(t, ckpt, log_path, backup_dir=None, resumed=False, monitor="val_loss"):
     """Callbacks for cfg["training"] *t*; with *backup_dir*, the training state is backed up after every epoch.
+
+    EarlyStopping, ReduceLROnPlateau and ModelCheckpoint follow *monitor* (monitor_for(arch)).
 
     The order matters: ReduceLROnPlateau adds "lr" to the logs before CSVLogger writes them, and
     BackupAndRestore comes last, so a backed-up epoch has its checkpoint, log row and callback
@@ -390,11 +419,11 @@ def make_callbacks(t, ckpt, log_path, backup_dir=None, resumed=False):
     """
     checkpoint = AtomicModelCheckpoint if backup_dir else ModelCheckpoint
     callbacks = [
-        EarlyStopping(monitor="val_loss", patience=t["early_stop_patience"],
+        EarlyStopping(monitor=monitor, patience=t["early_stop_patience"],
                       restore_best_weights=bool(t.get("early_stop_restore_best", False))),
-        ReduceLROnPlateau(monitor="val_loss", factor=t["reduce_lr_factor"],
+        ReduceLROnPlateau(monitor=monitor, factor=t["reduce_lr_factor"],
                           patience=t["reduce_lr_patience"], min_lr=t["min_lr"]),
-        checkpoint(ckpt, save_best_only=True, monitor="val_loss"),
+        checkpoint(ckpt, save_best_only=True, monitor=monitor),
         CSVLogger(log_path, append=resumed),
     ]
     if backup_dir:
@@ -410,12 +439,14 @@ def merged_log(path):
     return log.drop_duplicates("epoch", keep="last").sort_values("epoch").reset_index(drop=True)
 
 
-def best_epoch(log):
-    """(1-based epoch with the lowest val_loss, that val_loss) of a CSVLogger table; (None, None) without val_loss."""
-    if "val_loss" not in log or not log.val_loss.notna().any():
+def best_epoch(log, monitor="val_loss"):
+    """(1-based epoch with the lowest *monitor*, the val_loss of that epoch) of a CSVLogger table;
+    (None, None) without the monitor column. With the default monitor: the epoch of the lowest
+    val_loss and that val_loss, the epoch ModelCheckpoint keeps."""
+    if monitor not in log or not log[monitor].notna().any():
         return None, None
-    row = log.loc[log.val_loss.idxmin()]
-    return int(row.epoch) + 1, float(row.val_loss)
+    row = log.loc[log[monitor].idxmin()]
+    return int(row.epoch) + 1, (float(row.val_loss) if "val_loss" in log else None)
 
 
 def save_best_weights(ckpt, path, fallback_model):
@@ -593,6 +624,10 @@ def main():
         train_gen, val_gen, test_gen = masked_generators(args, table, settings, classes, aug, plain, bs, size)
         print("mask coverage:", {s: g.coverage() for s, g in
                                  (("train", train_gen), ("validation", val_gen), ("test", test_gen))})
+        if args.arch in MASK_LOSS_ARCHS:
+            print(f"images whose mask target gets weight 0 (eye region / part below min_part_area "
+                  f"{settings['min_part_area']}):",
+                  {s: g.below_min_area() for s, g in (("train", train_gen), ("validation", val_gen))})
     else:
         train_gen = ClassListDataGen(os.path.join(args.split_dir, "train"), aug, classes, batch_size=bs,
                                      target_size=size, reshuffle=args.reshuffle)
@@ -669,7 +704,11 @@ def main():
         json.dump(train_gen.generator.class_indices, f, indent=1)
     print("class index written to:", class_index)
     t = cfg["training"]
-    callbacks = make_callbacks(t, ckpt, log_path, backup_dir if args.resume else None, resumed)
+    monitor = monitor_for(args.arch)
+    if monitor != "val_loss":
+        print(f"early stopping, learning-rate drops and the best checkpoint follow {monitor} (the validation CE), "
+              "as val_loss does for the archs without a mask loss")
+    callbacks = make_callbacks(t, ckpt, log_path, backup_dir if args.resume else None, resumed, monitor)
     state = next((c for c in callbacks if isinstance(c, ResumeState)), None)
     epochs = t["epochs"]
     stopped = state.early_stopped_at() if resumed else None
@@ -699,7 +738,7 @@ def main():
     # the run record goes out first, and with --resume the backup is removed only after it: a session
     # stopped in between resumes with nothing left to train, or finds the record and trains nothing
     commit, dirty = git_state()
-    best, best_val_loss = best_epoch(log)
+    best, best_val_loss = best_epoch(log, monitor)
     record = {
         "tag": args.tag, "finished": True, "git_commit": commit, "git_dirty": dirty,
         "argv": sys.argv, "args": run_args(args), "seed": args.seed, "cfg": cfg, "versions": package_versions(),
@@ -718,11 +757,15 @@ def main():
         "class_index": class_index, "log": log_path,
     }
     if args.arch != "baseline":            # a baseline record keeps exactly the fields it had before --arch
-        record.update({"arch": args.arch, "anatomy": settings,
+        best_monitor = (float(log.loc[log.epoch == best - 1, monitor].iloc[0])
+                        if best is not None and monitor in log else None)
+        record.update({"arch": args.arch, "monitor": monitor, "best_monitor": best_monitor, "anatomy": settings,
                        "masks": os.path.abspath(args.masks) if args.masks else None,
                        "masks_sha256": file_sha256(args.masks) if args.masks else None,
                        "mask_classes": table.class_names if table else None,
                        "mask_coverage": {s: g.coverage() for s, g in gens.items()} if table else None})
+        if args.arch in MASK_LOSS_ARCHS:
+            record["mask_area_below_min"] = {s: g.below_min_area() for s, g in gens.items()}
 
     write_json(run_path, record)
     print("run record written to:", run_path)

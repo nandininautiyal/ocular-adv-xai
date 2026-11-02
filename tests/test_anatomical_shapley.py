@@ -149,6 +149,83 @@ def test_rows_obey_the_game_and_the_image_contract(run):
     assert finite.mean() > 0.9
 
 
+def test_adaptive_attack_success_is_judged_after_the_defence(run):
+    """BPDA-PGD is computed through the defence to fool f(D(x')): its attack_success is the defended outcome
+    (as 14's success_after_defence); fgsm / pgd keep the undefended outcome. Both are in the summary."""
+    rows, summary = run["rows"], run["summary"]
+    rows = rows.assign(adapted_to=rows.adapted_to.fillna(""))
+    defended = rows[rows.condition == "attack+defence"]
+    bpda, plain = defended[defended.attack == "bpda_pgd"], defended[defended.attack != "bpda_pgd"]
+    assert len(bpda) and len(plain)
+    assert (bpda.attack_success.astype(bool) == ~bpda.correct.astype(bool)).all()
+    assert (plain.attack_success.astype(bool) == plain.attack_success_undefended.astype(bool)).all()
+    keys = ["image_id", "attack", "adapted_to", "epsilon"]
+    attacked = rows[(rows.condition == "attack") & (rows.target == "true") & (rows.baseline == "blur")]
+    m = defended.merge(attacked[keys + ["correct"]], on=keys, suffixes=("", "_attacked"), validate="many_to_one")
+    assert (m.attack_success_undefended.astype(bool) == ~m.correct_attacked.astype(bool)).all()
+    after = summary["attack_success_after_defence_rate"]
+    true_blur = bpda[(bpda.target == "true") & (bpda.baseline == "blur")]
+    for eps, g in true_blur.groupby("epsilon"):
+        r = after[f"bpda_pgd[jpeg]@{eps:.6g}+jpeg"]
+        assert r["n"] == 4 and r["rate"] == pytest.approx((~g.correct.astype(bool)).mean())
+    assert any(k.startswith("pgd@") for k in after)
+    assert not any("bpda" in k for k in summary["restoration_rate_among_successful_attacks"])
+
+
+def test_resume_continues_a_stopped_run(script, inputs, tmp_path, monkeypatch, capsys):
+    """Rows are written after every batch: a run stopped after its first batch continues with --resume and
+    gives the rows and rates of an uninterrupted run."""
+    opts = ["--max-images", "4", "--levels", "2", "--attacks", "fgsm", "--defences", "jpeg", "--baselines", "mean",
+            "--cams", "layercam", "--batch-size", "2", "--seed", "5", "--tag", "r"]
+    script.main(common(inputs, tmp_path / "whole") + opts)
+    want = pd.read_csv(tmp_path / "whole" / "rows_asa_r.csv")
+    whole = json.loads((tmp_path / "whole" / "summary_asa_r.json").read_text())
+
+    class Stopped(RuntimeError):
+        pass
+
+    real, calls = script.run_batch, []
+
+    def stop_at_second_batch(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise Stopped()
+        return real(*args, **kwargs)
+
+    out = tmp_path / "resumed"
+    monkeypatch.setattr(script, "run_batch", stop_at_second_batch)
+    with pytest.raises(Stopped):
+        script.main(common(inputs, out) + opts + ["--resume"])
+    state = json.loads((out / "parts_asa_r" / "state.json").read_text())
+    assert state["n_done"] == 2 and not (out / "rows_asa_r.csv").exists()
+    assert sorted(os.listdir(out / "parts_asa_r")) == ["rows_000000.csv", "state.json"]
+    monkeypatch.setattr(script, "run_batch", real)
+    capsys.readouterr()
+    script.main(common(inputs, out) + opts + ["--resume", "--workers", "1"])   # --workers does not change rows
+    assert "resuming after 2 of 4 images" in capsys.readouterr().out
+    pd.testing.assert_frame_equal(pd.read_csv(out / "rows_asa_r.csv"), want)
+    summary = json.loads((out / "summary_asa_r.json").read_text())
+    assert summary["resumed"] and summary["resumed_after_images"] == 2 and not (out / "parts_asa_r").exists()
+    for section in ("attack_success_rate", "attack_success_after_defence_rate", "noise_control_flip_rate",
+                    "restoration_rate_among_successful_attacks"):
+        assert summary[section] == whole[section], section
+    assert summary["asa_forward_passes"] == whole["asa_forward_passes"]
+    capsys.readouterr()                                    # the same command again: nothing to do
+    script.main(common(inputs, out) + opts + ["--resume"])
+    assert "nothing to resume" in capsys.readouterr().out
+    # a stopped run continues only with its own settings; without --resume it starts again from scratch
+    calls.clear()
+    monkeypatch.setattr(script, "run_batch", stop_at_second_batch)
+    with pytest.raises(Stopped):
+        script.main(common(inputs, out) + opts + ["--resume", "--tag", "r2"])
+    monkeypatch.setattr(script, "run_batch", real)
+    with pytest.raises(SystemExit, match="other settings"):
+        script.main(common(inputs, out) + opts + ["--resume", "--tag", "r2", "--seed", "6"])
+    script.main(common(inputs, out) + opts + ["--tag", "r2"])
+    assert not json.loads((out / "summary_asa_r2.json").read_text())["resumed"]
+    pd.testing.assert_frame_equal(pd.read_csv(out / "rows_asa_r2.csv"), want)
+
+
 def test_noise_follows_the_05_convention(run, model, inputs):
     """Sign noise from default_rng(seed), drawn per batch and budget in order, rounded to 8 bits."""
     rows = run["rows"]

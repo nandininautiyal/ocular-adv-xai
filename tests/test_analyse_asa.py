@@ -76,6 +76,7 @@ def test_row_accounting(analyse):
     summary = summary_of(analyse, rows)
     assert summary["attack_success_rate"] == {f"pgd@{EPS:.6g}": {"rate": 0.5, "n": N}}
     assert summary["restoration_rate_among_successful_attacks"] == {f"pgd@{EPS:.6g}+jpeg": {"rate": 1.0, "n": 6}}
+    assert summary["attack_success_after_defence_rate"] == {f"pgd@{EPS:.6g}+jpeg": {"rate": 0.0, "n": N}}
     assert summary["noise_defence_flip_rate"] == {f"noise@{EPS:.6g}+jpeg": {"rate": 0.0, "n": N}}
     checks = analyse.check_rows(rows, summary)
     assert len(checks) == 7
@@ -103,6 +104,38 @@ def test_row_accounting(analyse):
     with pytest.raises(ValueError, match="only in the summary"):
         analyse.check_rows(rows, {**summary, "attack_success_rate": {**summary["attack_success_rate"],
                                                                      "fgsm@0.0039216": {"rate": 0.0, "n": N}}})
+
+
+def test_adaptive_rows_take_the_outcome_after_the_defence(analyse):
+    """A BPDA-PGD image succeeds when the defended image is wrong: its attack and attack+defence rows get that
+    outcome, it has no restoration rate, and attack_success that disagrees stops the analysis."""
+    rows = make_rows()
+    rows["attack_success_undefended"] = rows.attack_success
+    bpda = rows[rows.condition.isin(["attack", "attack+defence"])].copy()
+    bpda["attack"], bpda["adapted_to"] = "bpda_pgd", "jpeg"
+    beaten = bpda.image_id % 3 == 0                            # the defended image is wrong for every 3rd subject
+    d = bpda.condition == "attack+defence"
+    bpda.loc[d, "correct"] = ~beaten[d]
+    bpda.loc[d, "pred_idx"] = np.where(beaten[d], (bpda.image_id[d] + 1) % N, bpda.image_id[d])
+    bpda.loc[d, "attack_success_undefended"] = bpda.loc[d, "attack_success"]
+    bpda.loc[d, "attack_success"] = beaten[d]
+    extra = bpda[d & beaten].assign(target="pred", target_idx=lambda f: (f.image_id + 1) % N)
+    rows = pd.concat([rows, bpda, extra], ignore_index=True)
+    r = analyse.prepare(rows)
+    adaptive = r[r.attack == "bpda_pgd"]
+    assert ((adaptive.outcome == "success") == (adaptive.image_id % 3 == 0)).all()
+    plain = r[(r.attack == "pgd") & (r.condition == "attack")]
+    assert ((plain.outcome == "success") == ~plain.correct).all()
+    summary = summary_of(analyse, rows)
+    name = f"bpda_pgd[jpeg]@{EPS:.6g}+jpeg"
+    assert summary["attack_success_after_defence_rate"][name] == {"rate": 4 / N, "n": N}
+    assert name not in summary["restoration_rate_among_successful_attacks"]
+    assert any("24 BPDA-PGD rows after the defence" in c for c in analyse.check_rows(rows, summary))
+    wrong = rows.copy()
+    wrong.loc[(wrong.attack == "bpda_pgd") & (wrong.condition == "attack+defence"), "attack_success"] = \
+        wrong.loc[(wrong.attack == "bpda_pgd") & (wrong.condition == "attack+defence"), "attack_success_undefended"]
+    with pytest.raises(ValueError, match="attack_success"):
+        analyse.check_rows(wrong)
 
 
 def test_phi_shift_against_the_noise_control(analyse):
@@ -147,6 +180,27 @@ def test_baseline_sensitivity(analyse):
     assert clean.pair == "blur~mean" and clean.n == N
     assert clean.spearman_median == pytest.approx(1.0) and clean.sign_agreement_median == pytest.approx(1.0)
     assert set(table.scope) == {"variant", "pooled"}
+    assert (table.same_empty_share == 1.0).all()               # v_empty = 0 in every synthetic game
+    rows = make_rows()
+    rows.loc[rows.baseline == "mean", "v_empty"] = 0.5
+    rows.loc[rows.baseline == "mean", "v_full"] += 0.5
+    assert (analyse.baseline_sensitivity(analyse.prepare(rows), n_boot=20).same_empty_share == 0.0).all()
+
+
+def test_report_flags_the_shared_empty_coalition_of_inpaint_and_mean(analyse):
+    """With full-coverage masks the inpaint game's empty coalition is the mean image: the report says how
+    often the two games share v_empty, so their agreement is not read as two independent baselines."""
+    import argparse
+    rows = make_rows()
+    rows = pd.concat([rows, rows[rows.baseline == "mean"].assign(baseline="inpaint")], ignore_index=True)
+    tables = {"baseline_sensitivity": analyse.baseline_sensitivity(analyse.prepare(rows), n_boot=20)}
+    assert set(tables["baseline_sensitivity"].pair) == {"blur~inpaint", "blur~mean", "inpaint~mean"}
+    text = analyse.report(tables, [], None, argparse.Namespace(n_boot=20))
+    assert "The inpaint and mean games share v_empty in 100.0% of the rows" in text
+    assert "mean-colour image" in text and "same v_empty" in text
+    text = analyse.report({"baseline_sensitivity": analyse.baseline_sensitivity(analyse.prepare(make_rows()), 20)},
+                          [], None, argparse.Namespace(n_boot=20))
+    assert "share v_empty in" not in text                      # no inpaint~mean pair, no note
 
 
 def test_faithfulness(analyse):
@@ -160,6 +214,25 @@ def test_faithfulness(analyse):
     assert cam.p_vs_asa < 0.01 and cam.p_vs_asa_holm >= cam.p_vs_asa
     assert set(clean.source) == {"asa", "layercam", "random"}
     assert set(table.condition) == {"clean", "attack"}
+
+
+def test_rank_agreement_uses_the_asa_order_convention(analyse):
+    """Where v_full < v_empty (the true class of an attacked image) the ASA deletion order deletes the most
+    negative phi first; rank agreement orients phi the same way, so a source whose masses rank the parts in
+    that order agrees with +1 (not -1)."""
+    rows = make_rows()
+    clean = rows.condition == "clean"
+    for g in GROUPS:                                           # every clean game flipped: phi -> -phi
+        rows.loc[clean, f"phi_{g}"] = -rows.loc[clean, f"phi_{g}"]
+    rows.loc[clean, "v_full"] = -rows.loc[clean, "v_full"]     # v_full < v_empty = 0, efficiency holds
+    table = analyse.faithfulness(analyse.prepare(rows), n_boot=50)
+    cam = table[(table.condition == "clean") & (table.baseline == "blur") & (table.target == "true")]
+    assert cam.set_index("source").loc["layercam"].rank_agreement_median == pytest.approx(1.0)
+    from src.xai.shapley import asa_order, oriented_phi, order_from_scores
+    phi, present = np.array([-3.0, -1.5, -1.0, -0.5]), np.ones(4, bool)
+    np.testing.assert_array_equal(oriented_phi(phi, -9.0, -3.0), -phi)
+    np.testing.assert_array_equal(oriented_phi(phi, 3.0, -3.0), phi)
+    assert asa_order(phi, -9.0, -3.0, present) == order_from_scores(-phi, present)
 
 
 def test_attribution_restoration(analyse):

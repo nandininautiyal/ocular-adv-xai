@@ -148,8 +148,14 @@ def test_group_fractions_and_targets():
     eye = frac[..., :4].sum(-1)
     np.testing.assert_allclose(targets[..., 0], (eye + eps) / (eye + eps).sum(axis=(1, 2), keepdims=True), rtol=1e-6)
     np.testing.assert_allclose(targets.sum(axis=(1, 2)), 1.0, rtol=1e-6)
-    assert weights.tolist() == [[1.0], [1.0]]
+    # image 0: 96 eye pixels of 4096 (2.3 %); image 1 has no eye pixel: its near-uniform target gets weight 0
+    assert weights.tolist() == [[1.0], [0.0]]
     np.testing.assert_allclose(targets[1], 1 / 64)                 # no eye: uniform target
+    # the eye-region weight uses min_part_area like the parts mode: 96 / 4096 = 0.0234
+    _, weights = mg.mask_targets(frac, GROUPS, "eye", eps=eps, min_part_area=0.03)
+    assert weights.tolist() == [[0.0], [0.0]]
+    _, weights = mg.mask_targets(frac, GROUPS, "eye", eps=eps, min_part_area=0.0, has_mask=[False, True])
+    assert weights.tolist() == [[0.0], [1.0]]
 
     targets, weights = mg.mask_targets(frac, GROUPS, "parts", eps=eps, min_part_area=0.005,
                                        has_mask=[True, False])
@@ -268,6 +274,28 @@ def test_missing_masks_stop_or_get_weight_zero(tmp_path):
     index_array = region_gen.generator.index_array[:4]
     assert region.shape == (4, 8, 8, 1)
     assert (region[region_gen.rows[index_array] < 0] == 0).all()
+
+
+def test_images_without_enough_eye_get_no_mask_loss(tmp_path):
+    """attn_mask: an image whose eye region is (almost) empty gets weight 0, like an absent part in the parts
+    mode, and below_min_area counts those images per split (run_<tag>.json records it)."""
+    labels = coded_tree(tmp_path)
+    empty = sorted(labels)[1]
+    labels[empty] = np.zeros_like(labels[empty])                    # skin only: no eye pixel at all
+    write_masks(tmp_path / "m.npz", labels)
+    plain = ImageDataGenerator(rescale=1.0 / 255)
+    _, masked = _generators(tmp_path, tmp_path / "m.npz", mode="eye", datagen=plain)
+    assert masked.below_min_area() == 1
+    for i in range(len(masked)):
+        index_array = masked.batch_indices(i)
+        (_, _, targets, weights), _ = masked[i]
+        is_empty = np.array([masked.masks.relpaths[masked.rows[j]] == empty for j in index_array])
+        assert (weights[is_empty] == 0).all() and (weights[~is_empty] == 1).all()
+    _, parts = _generators(tmp_path, tmp_path / "m.npz", mode="parts", datagen=plain)
+    counts = parts.below_min_area()
+    assert set(counts) == set(GROUPS) and counts["iris"] >= 1 and counts["skin"] == 0
+    _, region = _generators(tmp_path, tmp_path / "m.npz", mode="region", datagen=plain)
+    assert region.below_min_area() is None
 
 
 def test_reshuffle_draws_a_new_order(tmp_path):

@@ -33,7 +33,10 @@ Targets
 frac[g] (8 x 8): share of each cell's label pixels in part group g
 (anatomy.part_groups; unknown pixels are in no group).
 - eye (attn_mask): t = (eye + eps) / sum(eye + eps), eye = sum of every group
-  but skin; weight 1.
+  but skin; weight 1 if the eye region covers at least min_part_area of the
+  image, else 0 (an image with almost no eye pixels, e.g. a segmenter failure,
+  would otherwise get a near-uniform target and pull the map towards average
+  pooling).
 - parts: t_p = (frac_p + eps) / sum(frac_p + eps) per part; weight 1 if the part
   covers at least min_part_area of the image, else 0.
 - region (attnet_gate): the eye-region fraction (N, 8, 8, 1), also at test time.
@@ -209,19 +212,18 @@ def eye_fraction(frac, groups):
 def mask_targets(frac, groups, mode, eps=1e-3, min_part_area=0.005, has_mask=None):
     """Target maps (N, grid, grid, K) and map weights (N, K) for the mask loss.
 
-    mode "eye": one map from the eye region, weight 1; "parts": one map per group,
-    weight 1 where the group covers >= min_part_area of the image. Images with
-    has_mask False get weight 0.
+    mode "eye": one map from the eye region; "parts": one map per group. A map gets
+    weight 1 where its region (the eye region, or the group) covers >= min_part_area
+    of the image, else 0. Images with has_mask False get weight 0.
     """
     frac = np.asarray(frac, np.float64)                  # normalised in float64, returned as float32
     if mode == "eye":
         maps = eye_fraction(frac, groups)
-        weights = np.ones((len(frac), 1), np.float32)
     elif mode == "parts":
         maps = frac
-        weights = (frac.mean(axis=(1, 2)) >= min_part_area).astype(np.float32)
     else:
         raise ValueError(f"mode must be 'eye' or 'parts', got {mode!r}")
+    weights = (maps.mean(axis=(1, 2)) >= min_part_area).astype(np.float32)
     targets = (maps + eps) / (maps + eps).sum(axis=(1, 2), keepdims=True)
     if has_mask is not None:
         weights = weights * np.asarray(has_mask, np.float32)[:, None]
@@ -323,6 +325,23 @@ class MaskedDataGen(tf.keras.utils.Sequence):
         """{"n_images", "n_with_mask", "share"} of this split."""
         n = len(self.rows)
         return {"n_images": n, "n_with_mask": n - self.n_missing, "share": (n - self.n_missing) / n if n else None}
+
+    def below_min_area(self, chunk=4096):
+        """Images of this split with a mask whose target gets weight 0 because its region covers less
+        than min_part_area of the image, on the masks before augmentation (an augmented copy can
+        differ slightly): mode "eye" an int, mode "parts" {group: int}, mode "region" None."""
+        if self.mode == "region":
+            return None
+        rows = self.rows[self.rows >= 0]
+        counts = np.zeros(1 if self.mode == "eye" else len(self.groups), np.int64)
+        for start in range(0, len(rows), chunk):
+            frac = group_fractions(self.masks.labels_for(rows[start:start + chunk]), self.masks.class_names,
+                                   self.groups, self.grid)
+            maps = eye_fraction(frac, self.groups) if self.mode == "eye" else frac
+            counts += (maps.mean(axis=(1, 2)) < self.min_part_area).sum(axis=0)
+        if self.mode == "eye":
+            return int(counts[0])
+        return {g: int(c) for g, c in zip(self.groups, counts)}
 
     def __len__(self):
         return len(self.generator)

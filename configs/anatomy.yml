@@ -1,7 +1,10 @@
 # Anatomy-guided models (03_train_baseline.py --arch gap | attn | attn_mask | parts | attnet_gate):
 # configs/cross_session.yml unchanged plus the anatomy section at the end, so a difference from the
 # cross-session baseline comes from the head (and its mask loss) only: same backbone, fine_tune_at,
-# ArcFace s and m, learning rate, batch size, schedule and augmentation.
+# ArcFace s and m, learning rate, batch size, schedule and augmentation. The selection rule is the same
+# too: early stopping, the learning-rate drops and the best checkpoint follow the validation CE for every
+# arch (03 monitors val_ce for attn_mask and parts, whose val_loss adds lambda x mask loss), so the
+# "val_loss" in the comments below means the validation CE.
 model:
   input_shape: [256, 256, 3]
   n_classes: 300          # VISOB IDs 1141-3279 plus 7000 (confirmed: 300 class folders)

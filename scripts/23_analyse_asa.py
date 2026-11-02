@@ -9,7 +9,9 @@ next to the rows file). The row accounting is checked first, as 12 does for 05,
 and any mismatch stops the analysis: no duplicate rows; one true-class row per
 image for every condition variant and baseline; adversarial-class rows exactly
 where the prediction is wrong; attack_success of defended rows equal to the
-outcome of the attacked image; efficiency (sum of phi = v_full - v_empty) in
+attack's own outcome (fgsm / pgd: the attacked image fooled the model; BPDA-PGD:
+the defended image did, as 22 defines it), and attack_success_undefended equal
+to the outcome of the attacked image; efficiency (sum of phi = v_full - v_empty) in
 every row; for a parts model, the receipt summing to v_full (receipt_sum); and
 the counts and rates of the summary JSON.
 
@@ -30,12 +32,23 @@ Tables (CSV in --out-dir):
                           the same for the same-budget control (noise for attack, noise+defence
                           with the same defence for attack+defence), and their difference with
                           CI and Wilcoxon p (Holm)
-  phi_shift_by_outcome.csv  the same, split by whether the attack fooled the undefended model
+  phi_shift_by_outcome.csv  the same, split by whether the attack succeeded: fgsm / pgd fooled
+                          the undefended model; BPDA-PGD fooled the model behind the defence it
+                          was computed through (its attack and attack+defence rows both take
+                          that outcome)
   baseline_sensitivity.csv  agreement of phi between hiding baselines (blur, mean, inpaint):
                           Spearman over present groups and the share of groups with the same sign,
-                          per condition variant and pooled
+                          per condition variant and pooled, and same_empty_share: the share of
+                          rows in which the two games have the same v_empty. With masks whose
+                          groups cover every pixel (17's masks and the default groups), the
+                          inpaint game's empty coalition is the mean-colour image, so mean and
+                          inpaint share v_empty in every row and part of their agreement is
+                          built in (the report says so)
   faithfulness.csv        LayerCAM, Eigen-CAM, attention and the parts receipt against ASA, on
-                          clean and attacked images: rank agreement with phi (median, CI) and
+                          clean and attacked images: rank agreement with phi (median, CI; phi is
+                          oriented as the ASA deletion order orients it, i.e. sign-flipped where
+                          v_full < v_empty, so a source that ranks the parts in that order
+                          agrees with +1, and both columns use one convention) and
                           deletion AUC (median, CI) with the paired difference from the random
                           order and from the ASA order (Wilcoxon p, Holm). The ASA order is
                           deleted on its own game, which favours it: compare the other sources
@@ -43,7 +56,9 @@ Tables (CSV in --out-dir):
   attribution_restoration.csv  per attack x budget x defence x baseline: distance of the defended
                           adversarial phi from the defended clean phi, against the distance of
                           the defended noise phi (noise+defence control), for all images and,
-                          among successful attacks, by whether the label was restored
+                          among successful attacks, by whether the label was restored (for
+                          BPDA-PGD a success means the defended label is wrong, so it has no
+                          restored split)
 Figures: fig_phi_shift.png, fig_deletion.png. Report: report_asa.md.
 
 Usage:
@@ -73,6 +88,8 @@ CONTROL = {"attack": "noise", "attack+defence": "noise+defence"}
 RATE_SECTIONS = {"clean": "clean_flip_rate", "noise": "noise_control_flip_rate",
                  "defence_on_clean": "defence_on_clean_flip_rate", "noise+defence": "noise_defence_flip_rate",
                  "attack": "attack_success_rate"}
+DEFENDED_SECTIONS = ("attack_success_after_defence_rate", "restoration_rate_among_successful_attacks")
+SAME_EMPTY_ATOL = 1e-5         # v_empty of two games on the same image: one fill, two forward passes
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +131,14 @@ def prepare(rows):
     if defended.any():
         success = parse_bool(r.attack_success[defended], "attack_success (attack+defence rows)")
         outcome[defended] = np.where(success, "success", "failed")
+        # a BPDA-PGD image succeeds when it fools the model behind the defence it was computed through:
+        # its undefended (attack) rows take the outcome of that defended row
+        adaptive = defended & (r.adapted_to != "").to_numpy() & (r.defence == r.adapted_to).to_numpy()
+        keys = ["image_id", "attack", "adapted_to", "eps"]
+        beat = dict(zip(r.loc[adaptive, keys].itertuples(index=False, name=None), outcome[adaptive]))
+        idx = np.flatnonzero(attacked & (r.adapted_to != "").to_numpy())
+        for i, k in zip(idx, r.iloc[idx][keys].itertuples(index=False, name=None)):
+            outcome[i] = beat.get(k, outcome[i])
     r["outcome"] = outcome
     return r
 
@@ -122,15 +147,16 @@ def summary_rates(r):
     """The rates of summary_asa_<tag>.json, recomputed from the rows (true-class rows of one
     baseline: one per image and variant)."""
     per = r[(r.target == "true") & (r.baseline == r.baseline.iloc[0])]
-    out = {s: {} for s in list(RATE_SECTIONS.values()) + ["restoration_rate_among_successful_attacks"]}
+    out = {s: {} for s in list(RATE_SECTIONS.values()) + list(DEFENDED_SECTIONS)}
     for key, g in per.groupby(VARIANT, sort=True):
         info = dict(zip(VARIANT, key))
         name = variant_name(**info)
         if info["condition"] in RATE_SECTIONS:
             out[RATE_SECTIONS[info["condition"]]][name] = {"rate": float((~g.correct).mean()), "n": int(len(g))}
         elif info["condition"] == "attack+defence":
+            out["attack_success_after_defence_rate"][name] = {"rate": float((~g.correct).mean()), "n": int(len(g))}
             g = g[g.outcome == "success"]
-            if len(g):
+            if len(g) and not info["adapted_to"]:      # restoration among the attacks that fooled the model
                 out["restoration_rate_among_successful_attacks"][name] = {"rate": float(g.correct.mean()),
                                                                           "n": int(len(g))}
     return out
@@ -178,14 +204,26 @@ def check_rows(rows, summary=None, tolerance=1e-6):
 
     defended = true[true.condition == "attack+defence"]
     if len(defended):
-        attacked = true.loc[true.condition == "attack", ["image_id", "attack", "adapted_to", "eps", "baseline",
-                                                         "correct"]]
-        m = defended[["image_id", "attack", "adapted_to", "eps", "baseline", "outcome"]].merge(
-            attacked, on=["image_id", "attack", "adapted_to", "eps", "baseline"], how="left", validate="many_to_one")
-        if m.correct.isna().any() or ((m.outcome == "success").to_numpy() != ~m.correct.astype(bool).to_numpy()).any():
-            raise ValueError("attack_success of attack+defence rows differs from the outcome of the attacked image")
-        passed.append(f"attack_success of all {len(defended):,} defended true-class rows equals the outcome of the "
-                      f"attacked image")
+        on = ["image_id", "attack", "adapted_to", "eps", "baseline"]
+        attacked = true.loc[true.condition == "attack", on + ["correct"]].rename(
+            columns={"correct": "attacked_correct"})
+        cols = on + ["outcome", "correct"] + (["attack_success_undefended"] if "attack_success_undefended" in r else [])
+        m = defended[cols].merge(attacked, on=on, how="left", validate="many_to_one")
+        if m.attacked_correct.isna().any():
+            raise ValueError("attack_success: some attack+defence rows have no attacked image")
+        fooled = ~m.attacked_correct.astype(bool).to_numpy()
+        adaptive = (m.adapted_to != "").to_numpy()
+        # the attack's own goal: fgsm / pgd fool the undefended model, BPDA-PGD the defended one (this row)
+        goal = np.where(adaptive, ~m.correct.astype(bool).to_numpy(), fooled)
+        if ((m.outcome == "success").to_numpy() != goal).any():
+            raise ValueError("attack_success of attack+defence rows differs from the outcome of the attack "
+                             "(fgsm / pgd: the attacked image; BPDA-PGD: the defended image)")
+        if "attack_success_undefended" in m and \
+                (np.asarray(parse_bool(m.attack_success_undefended, "attack_success_undefended")) != fooled).any():
+            raise ValueError("attack_success_undefended of attack+defence rows differs from the outcome of the "
+                             "attacked image")
+        passed.append(f"attack_success of all {len(defended):,} defended true-class rows equals the attack's outcome "
+                      f"(fgsm / pgd on the undefended model, {int(adaptive.sum())} BPDA-PGD rows after the defence)")
 
     phi = r[[f"phi_{g}" for g in groups]].to_numpy(np.float64)
     span = (r.v_full - r.v_empty).to_numpy(np.float64)
@@ -344,8 +382,10 @@ def baseline_sensitivity(r, n_boot):
     key = ["image_id", *VARIANT, "target"]
     per_pair = []
     for a, b in itertools.combinations(baselines, 2):
-        m = r[r.baseline == a][key + ["true_idx"] + phi_cols + present_cols].merge(
-            r[r.baseline == b][key + phi_cols], on=key, suffixes=("", "_b"), validate="one_to_one")
+        m = r[r.baseline == a][key + ["true_idx", "v_empty"] + phi_cols + present_cols].merge(
+            r[r.baseline == b][key + ["v_empty"] + phi_cols], on=key, suffixes=("", "_b"), validate="one_to_one")
+        m["same_v_empty"] = np.isclose(m.v_empty.to_numpy(np.float64), m.v_empty_b.to_numpy(np.float64),
+                                       rtol=0.0, atol=SAME_EMPTY_ATOL)
         pa, pb = m[phi_cols].to_numpy(np.float64), m[[f"{c}_b" for c in phi_cols]].to_numpy(np.float64)
         present = m[present_cols].to_numpy(bool)
         m["spearman"] = [rank_agreement(x, y, p) for x, y, p in zip(pa, pb, present)]
@@ -360,7 +400,7 @@ def baseline_sensitivity(r, n_boot):
         for k, g in m.groupby(keys, sort=True):
             info = dict(zip(keys, k))
             row = {"scope": scope, **{c: info.get(c, "") for c in VARIANT}, "target": info["target"],
-                   "pair": info["pair"], "n": int(len(g))}
+                   "pair": info["pair"], "n": int(len(g)), "same_empty_share": float(g.same_v_empty.mean())}
             for metric in ("spearman", "sign_agreement"):
                 est, lo, hi = _median_ci(g[metric], g.true_idx, n_boot)
                 row.update({f"{metric}_median": est, f"{metric}_ci_low": lo, f"{metric}_ci_high": hi,
@@ -370,8 +410,12 @@ def baseline_sensitivity(r, n_boot):
 
 
 def faithfulness(r, n_boot):
-    """CAMs, attention and receipt against ASA on clean and attacked images."""
-    from src.xai.shapley import rank_agreement
+    """CAMs, attention and receipt against ASA on clean and attacked images.
+
+    Rank agreement correlates the source's masses with phi oriented as asa_order orients it
+    (oriented_phi: sign-flipped where v_full < v_empty, e.g. the true class of an attacked image),
+    the convention of the ASA deletion order next to it."""
+    from src.xai.shapley import oriented_phi, rank_agreement
     groups = groups_in(r.columns)
     present_cols = [f"present_{g}" for g in groups]
     sources = [s for s in CAM_SOURCES
@@ -382,7 +426,8 @@ def faithfulness(r, n_boot):
     for key, g in sub.groupby(VARIANT + ["baseline", "target"], sort=True):
         info = dict(zip(VARIANT + ["baseline", "target"], key))
         subjects = g.true_idx.to_numpy()
-        phi = g[[f"phi_{x}" for x in groups]].to_numpy(np.float64)
+        phi = np.stack([oriented_phi(p, full, empty) for p, full, empty in
+                        zip(g[[f"phi_{x}" for x in groups]].to_numpy(np.float64), g.v_full, g.v_empty)])
         present = g[present_cols].to_numpy(bool)
         for source in auc_sources:
             row = {**info, "source": source, "n": int(len(g))}
@@ -564,7 +609,21 @@ def report(tables, checks, summary, args):
               "- The deletion AUC of the ASA order is computed on the same game as ASA itself, which favours it; "
               "compare the other sources with the random order and with each other.",
               "- Hidden parts use the clean image's eye mask in every condition; defended conditions explain the model "
-              "on the defended image.", ""]
+              "on the defended image.",
+              "- Attack outcome: fgsm / pgd succeed when they fool the undefended model; BPDA-PGD succeeds when it "
+              "fools the model behind the defence it was computed through (`attack_success_after_defence_rate`).",
+              "- Rank agreement uses phi oriented like the ASA deletion order (sign-flipped where v_full < v_empty), "
+              "so it and the deletion AUC share one convention.", ""]
+    sens = tables.get("baseline_sensitivity", pd.DataFrame())
+    shared = sens[(sens.scope == "pooled") & sens.pair.isin(["inpaint~mean", "mean~inpaint"])] if len(sens) else sens
+    if len(shared):
+        share = float(np.average(shared.same_empty_share, weights=shared.n))
+        lines[-1:-1] = [f"- The inpaint and mean games share v_empty in {share:.1%} of the rows. With no pixel kept, "
+                        "inpainting has nothing to fill from and uses the mean colour; 17's masks map the background "
+                        "to skin, so with the default groups every pixel is in a part and the inpaint game's empty "
+                        "coalition is the mean-colour image. Its v_empty and deletion end point are then those of the "
+                        "mean game, its phi measure the drop to the mean image (with the other parts inpainted), and "
+                        "part of the mean ~ inpaint agreement below is built in."]
 
     shift = tables.get("phi_shift", pd.DataFrame())
     if len(shift):
@@ -583,8 +642,9 @@ def report(tables, checks, summary, args):
     if len(faith):
         t = faith[faith.target == "true"]
         lines += ["## Faithfulness (true class)", "",
-                  "Rank agreement = Spearman between phi and the source's part masses; deletion AUC: lower = the score "
-                  "falls sooner when parts are hidden in the source's order.", ""]
+                  "Rank agreement = Spearman between phi (oriented like the ASA deletion order: sign-flipped where "
+                  "v_full < v_empty) and the source's part masses; deletion AUC: lower = the score falls sooner when "
+                  "parts are hidden in the source's order.", ""]
         body = []
         for r in t.itertuples():
             body.append([variant_name(r.condition, r.attack, r.adapted_to, r.eps), r.baseline, r.source,
@@ -597,14 +657,14 @@ def report(tables, checks, summary, args):
         lines += _markdown(["condition", "baseline", "source", "rank agreement", "deletion AUC", "AUC - random"],
                            body) + [""]
 
-    sens = tables.get("baseline_sensitivity", pd.DataFrame())
     if len(sens):
         t = sens[sens.scope == "pooled"]
         lines += ["## Baseline sensitivity (all conditions pooled)", ""]
-        lines += _markdown(["target", "pair", "n", "Spearman (median)", "same sign (median)"],
+        lines += _markdown(["target", "pair", "n", "Spearman (median)", "same sign (median)", "same v_empty"],
                            [[r.target, r.pair, r.n,
                              _ci(r.spearman_median, r.spearman_ci_low, r.spearman_ci_high, ".2f"),
-                             _ci(r.sign_agreement_median, r.sign_agreement_ci_low, r.sign_agreement_ci_high, ".2f")]
+                             _ci(r.sign_agreement_median, r.sign_agreement_ci_low, r.sign_agreement_ci_high, ".2f"),
+                             f"{r.same_empty_share:.0%}"]
                             for r in t.itertuples()]) + [""]
 
     rest = tables.get("attribution_restoration", pd.DataFrame())

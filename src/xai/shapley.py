@@ -223,7 +223,10 @@ def make_cache(image, methods=METHODS):
 
 def _inpaint_fill(image, keep):
     """Telea inpainting of the hidden pixels on the 8-bit image, back on the [0, 1] scale.
-    With no pixel kept there is nothing to fill from: the mean colour is used instead."""
+    With no pixel kept there is nothing to fill from: the mean colour is used instead. This is
+    not an edge case: when the groups cover every pixel (17's masks map the background to skin,
+    and the default groups cover all six classes) it happens for the empty coalition of every
+    image, so the inpaint game's v(empty) is the mean game's."""
     if not keep.any():
         return make_cache(image, ("mean",))["mean"]
     uint8 = np.round(np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -596,14 +599,22 @@ def order_from_scores(scores, present):
     return [int(p) for p in idx[np.argsort(-scores[idx], kind="stable")]]
 
 
+def oriented_phi(phi, v_full, v_empty):
+    """phi signed so that larger = a larger share of the gap v_full - v_empty: phi itself when the
+    full image scores at least as high as the empty one, -phi when it scores lower (e.g. the true
+    class of an attacked image). :func:`asa_order` ranks this quantity; compare other attributions
+    with it (rank agreement) so that both use one convention."""
+    sign = -1.0 if v_full < v_empty else 1.0
+    return sign * np.asarray(phi, np.float64)
+
+
 def asa_order(phi, v_full, v_empty, present):
     """Present groups by their share of the gap v_full - v_empty, largest first: phi from high
     to low when the full image scores higher than the empty one, from low to high when it
-    scores lower (e.g. the true class of an attacked image). The deletion curve is rescaled
-    to run from 1 to 0 either way, and for an additive game this order gives the lowest
-    possible deletion AUC (every partial sum of the deleted contributions is largest)."""
-    sign = -1.0 if v_full < v_empty else 1.0
-    return order_from_scores(sign * np.asarray(phi, np.float64), present)
+    scores lower (e.g. the true class of an attacked image; :func:`oriented_phi`). The deletion
+    curve is rescaled to run from 1 to 0 either way, and for an additive game this order gives
+    the lowest possible deletion AUC (every partial sum of the deleted contributions is largest)."""
+    return order_from_scores(oriented_phi(phi, v_full, v_empty), present)
 
 
 def deletion_from_values(values, order):

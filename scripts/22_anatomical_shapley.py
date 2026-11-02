@@ -42,6 +42,18 @@ condition: the perturbations are a few 8-bit levels and move no anatomy. For
 defended conditions ASA explains the model on the defended image (the defence
 is not applied again to the coalition images).
 
+The inpaint game and full-coverage masks: with no pixel kept, inpainting has
+nothing to fill from and the mean colour is used (src/xai/shapley.py). 17's masks
+map the background to skin, so the default groups (iris, sclera + caruncle, lid,
+brow, skin) cover every pixel of every image, and the empty coalition of the
+inpaint game is then the mean-colour image in EVERY image: v_empty and the end of
+every deletion curve of inpaint rows equal those of mean rows, and each inpaint
+phi carries the jump from the mean image to an inpainted one. Read inpaint phi as
+"the part's share of the drop from the image to the mean image, with the other
+parts inpainted", and do not count mean ~ inpaint agreement as two independent
+baselines (23 reports how often the two games share v_empty). Groups that leave a
+class out (--groups) keep those pixels in every coalition and avoid this.
+
 Other explanations of the same image, in part masses (share of each map's mass
 on each part group, src/xai/shapley.part_masses):
   --cams layercam,eigencam   LayerCAM (the row's target class) and Eigen-CAM
@@ -73,7 +85,12 @@ Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target
                        where the prediction is wrong), and its class index
   pred_idx, correct    prediction for the condition image and whether it is the true class
   margin_true          true-class margin of the condition image (negative = fooled)
-  attack_success       attack+defence rows: the attack fooled the undefended model
+  attack_success       attack+defence rows: the attack reached its own goal. fgsm / pgd: it
+                       fooled the undefended model (pred of the attack row != true);
+                       bpda_pgd[D]: it fooled the model behind the defence D it was computed
+                       through (pred of this row != true), as 14's success_after_defence
+  attack_success_undefended  attack+defence rows: the attack fooled the undefended model
+                       (equal to attack_success for fgsm / pgd)
   defended_clean_correct  rows with a defence: D(clean) is classified correctly
   pert_linf, pert_l2   distance of the condition image from the clean image ([0, 1] scale)
   area_<g>, present_<g>   share of the image in part group g, and whether it has a pixel
@@ -99,9 +116,24 @@ Writes to --out-dir:
   rows_asa_<tag>.csv      the rows above
   images_asa_<tag>.csv    the sampled images (for --exclude-from of a later run)
   summary_asa_<tag>.json  settings, git commit and git_dirty, package versions, timing,
-                          forward passes, row counts per condition, and the attack-success,
-                          restoration and flip rates per variant (23 checks the rows
-                          against them)
+                          forward passes, row counts per condition, and the rates per variant
+                          (23 checks the rows against them): attack_success_rate (on the
+                          undefended model, every attack), attack_success_after_defence_rate
+                          (every attack x defence; the headline number of a BPDA-PGD attack),
+                          restoration_rate_among_successful_attacks (fgsm / pgd only: among the
+                          attacks that fooled the undefended model, the share the defence
+                          classifies correctly; for BPDA-PGD it is 1 - success after defence)
+                          and the flip rates of the controls
+  parts_asa_<tag>/        while the run is unfinished: the rows of every finished batch and
+                          the state to continue from (--resume); removed at the end
+
+Resume (--resume): rows are written after every batch of --batch-size images, with the noise
+generator, rates, timings and counts, so a run stopped (e.g. at Kaggle's time limit) keeps its
+finished batches; the SAME command with --resume continues after the last finished batch and
+gives the rows of an uninterrupted run (the random starts are seeded per batch, the noise
+generator state is restored). It stops if the settings or the sampled images differ from the
+stopped run's, and does nothing if this command has already finished (its summary is there).
+Without --resume a left-over parts_asa_<tag>/ is removed and the run starts from scratch.
 
 Cost: with the defaults (levels 1,2,4, fgsm and pgd, jpeg and bit_depth) every image has
 30 condition images, so ASA needs up to 30 x 3 baselines x 32 = 2,880 forward passes per
@@ -114,19 +146,22 @@ Usage (Kaggle, with the checkpoint dataset attached and 01, 02, 04, 17 already r
     python scripts/22_anatomical_shapley.py --ckpt <checkpoint.keras> \
         --correct-csv /kaggle/working/eval_clean/correct_test_full.csv \
         --masks /kaggle/working/eye_masks/masks_full.npz --max-images 4 --tag smoke
-  full (one image per class, 300 images; check the time estimate of the smoke run first):
+  full (one image per class, 300 images; check the time estimate of the smoke run first;
+  --resume continues a stopped run when the same command is run again):
     python scripts/22_anatomical_shapley.py --ckpt <checkpoint.keras> \
         --correct-csv /kaggle/working/eval_clean/correct_test_full.csv \
         --masks /kaggle/working/eye_masks/masks_full.npz --per-class 1 --seed 2 \
-        --exclude-from /kaggle/working/asa/images_asa_smoke.csv --tag full
+        --exclude-from /kaggle/working/asa/images_asa_smoke.csv --resume --tag full
 """
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; set before importing tensorflow
 import argparse
+import hashlib
 import importlib.util
 import inspect
 import itertools
 import json
+import shutil
 import sys
 import time
 from collections import Counter, defaultdict
@@ -203,6 +238,8 @@ def variant_name(condition, attack=None, adapted_to=None, epsilon=None, defence=
 RATE_SECTIONS = {"clean": "clean_flip_rate", "noise": "noise_control_flip_rate",
                  "defence_on_clean": "defence_on_clean_flip_rate", "noise+defence": "noise_defence_flip_rate",
                  "attack": "attack_success_rate"}
+DEFENDED_SECTIONS = ("attack_success_after_defence_rate", "restoration_rate_among_successful_attacks")
+RESUME_FREE = ("resume", "workers")      # arguments that do not change the rows (a resumed run may change them)
 
 
 class Rates:
@@ -219,8 +256,19 @@ class Rates:
         self.counts[(section, name)][0] += int(hits.sum())
         self.counts[(section, name)][1] += int(hits.size)
 
+    def to_list(self):
+        """[[section, name, hits, n], ...]: the counts as JSON (the resume state)."""
+        return [[s, name, k, n] for (s, name), (k, n) in sorted(self.counts.items())]
+
+    @classmethod
+    def from_list(cls, items):
+        rates = cls()
+        for section, name, k, n in items:
+            rates.counts[(section, name)] = [int(k), int(n)]
+        return rates
+
     def as_dict(self):
-        out = {s: {} for s in list(RATE_SECTIONS.values()) + ["restoration_rate_among_successful_attacks"]}
+        out = {s: {} for s in list(RATE_SECTIONS.values()) + list(DEFENDED_SECTIONS)}
         for (section, name), (k, n) in sorted(self.counts.items()):
             low, high = _ADAPTIVE.wilson(k, n)
             out[section][name] = {"rate": k / n if n else float("nan"), "n": n, "ci_low": low, "ci_high": high}
@@ -330,12 +378,15 @@ class Context:
 
 
 def condition_rows(ctx, images, info, extra=None, timings=None):
-    """Rows of one condition: every image x baseline x target. Returns (rows, predictions)."""
+    """Rows of one condition: every image x baseline x target. Returns (rows, predictions).
+
+    extra : dict column -> per-image values, or a function of the predictions (N,) returning one
+    """
     timings = {} if timings is None else timings
-    extra = extra or {}
     start = time.perf_counter()
     logits = predict_logits(ctx.model, images)
     pred = logits.argmax(1)
+    extra = (extra(pred) if callable(extra) else extra) or {}
     margin_true = _ADAPTIVE.margins(logits, ctx.labels)
     flipped = pred != ctx.labels
     targets = {"true": ctx.labels}
@@ -460,13 +511,20 @@ def run_batch(ctx, epsilons, defences, attacks, steps, seed, rng, rates, timings
                 runs.append(("bpda_pgd", d, adv, [d]))
         for name, adapted_to, adv, apply in runs:
             pred = add(adv, info("attack", name, adapted_to, eps))
-            success = pred != labels
-            rates.add(RATE_SECTIONS["attack"], variant_name("attack", name, adapted_to, eps), success)
+            undefended = pred != labels
+            rates.add(RATE_SECTIONS["attack"], variant_name("attack", name, adapted_to, eps), undefended)
+            adaptive = adapted_to is not None
             for d in apply:
-                pred = add(defences[d][0](adv), info("attack+defence", name, adapted_to, eps, d),
-                           {"attack_success": success, "defended_clean_correct": defended_clean_correct[d]})
-                rates.add("restoration_rate_among_successful_attacks",
-                          variant_name("attack+defence", name, adapted_to, eps, d), (pred == labels)[success])
+                def extra(defended_pred, undefended=undefended, d=d, adaptive=adaptive):
+                    # BPDA-PGD is computed through d to fool f(d(x)): its success is judged after d (as in 14)
+                    return {"attack_success": (defended_pred != labels) if adaptive else undefended,
+                            "attack_success_undefended": undefended,
+                            "defended_clean_correct": defended_clean_correct[d]}
+                pred = add(defences[d][0](adv), info("attack+defence", name, adapted_to, eps, d), extra)
+                variant = variant_name("attack+defence", name, adapted_to, eps, d)
+                rates.add("attack_success_after_defence_rate", variant, pred != labels)
+                if not adaptive:            # restoration of the label among the attacks that fooled the model
+                    rates.add("restoration_rate_among_successful_attacks", variant, (pred == labels)[undefended])
     return rows
 
 
@@ -486,6 +544,13 @@ def conditions_per_image(n_eps, n_def, attacks):
 
 def split_list(text):
     return [part.strip() for part in str(text).split(",") if part.strip() and part.strip() != "none"]
+
+
+def write_state(path, state):
+    """The resume state as JSON, replaced atomically."""
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(path + ".tmp", path)
 
 
 def main(argv=None):
@@ -526,6 +591,9 @@ def main(argv=None):
                          "and core); results do not depend on it")
     ap.add_argument("--out-dir", default="/kaggle/working/asa")
     ap.add_argument("--tag", default="full")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue a stopped run of the same command after its last finished batch "
+                         "(parts_asa_<tag>/ in --out-dir); nothing to do if it has finished")
     args = ap.parse_args(argv)
 
     # --- settings, checked before anything slow is loaded --------------------------------
@@ -594,6 +662,37 @@ def main(argv=None):
         raise SystemExit(f"--groups do not fit the mask file: {err}")
     mask_labels = mask_file["labels"][[mask_file["index"][r] for r in df.relpath]]
 
+    # --- resume: the same settings and images as the stopped run, checked before the model loads ---------
+    identity = {"args": {k: v for k, v in vars(args).items() if k not in RESUME_FREE},
+                "images": df.link_path.astype(str).tolist()}
+    resume_key = hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    parts_dir = os.path.join(args.out_dir, f"parts_asa_{args.tag}")
+    state_path = os.path.join(parts_dir, "state.json")
+    summary_path = os.path.join(args.out_dir, f"summary_asa_{args.tag}.json")
+    state = None
+    if args.resume and os.path.exists(summary_path) and not os.path.isdir(parts_dir):
+        try:
+            with open(summary_path, encoding="utf-8") as f:
+                finished = json.load(f).get("resume_key") == resume_key
+        except ValueError:
+            finished = False
+        if finished:
+            print(f"{summary_path} says this command has finished run '{args.tag}': nothing to resume "
+                  "(use another --tag or --out-dir to run it again)")
+            return
+    if os.path.isdir(parts_dir):
+        if args.resume and os.path.exists(state_path):
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+            if state.get("resume_key") != resume_key:
+                raise SystemExit(f"{parts_dir} holds a stopped run with other settings or other sampled images; "
+                                 f"run its own command again, or use another --tag (or remove that folder)")
+        else:
+            print(f"{'no resume state in' if args.resume else 'WARNING: without --resume,'} {parts_dir}: "
+                  "removed, starting from scratch")
+            shutil.rmtree(parts_dir)
+    start_at = int(state["n_done"]) if state else 0
+
     n_conditions = conditions_per_image(len(epsilons), len(defences), attacks)
     upper = n_conditions * len(baselines) * 2 ** len(names)
     print(f"images: {len(df)} from {df.true_idx.nunique()} classes | attacks: {attacks} | levels: "
@@ -636,9 +735,18 @@ def main(argv=None):
     # --- experiment ------------------------------------------------------------------
     base_cols = [c for c in BASE_COLS if c in df.columns]
     rng = np.random.default_rng(args.seed)
-    rates, timings, all_rows, n_forward = Rates(), {}, [], 0
+    rates, timings, n_forward, minutes_before = Rates(), {}, 0, 0.0
+    os.makedirs(parts_dir, exist_ok=True)
+    if state:                       # continue after the last finished batch, with its noise stream and counts
+        rng.bit_generator.state = state["rng"]
+        rates = Rates.from_list(state["rates"])
+        timings, n_forward, minutes_before = dict(state["seconds"]), int(state["n_forward"]), float(state["minutes"])
+        for name in os.listdir(parts_dir):          # a batch written after the last state was saved runs again
+            if name.startswith("rows_") and name.endswith(".csv") and int(name[5:-4]) >= start_at:
+                os.remove(os.path.join(parts_dir, name))
+        print(f"resuming after {start_at} of {len(df)} images ({minutes_before:.1f} min before)")
     t0 = time.time()
-    for start in range(0, len(df), args.batch_size):
+    for start in range(start_at, len(df), args.batch_size):
         batch = df.iloc[start:start + args.batch_size]
         clean = np.stack([_RUNNER.load_image(_RUNNER.resolve_path(r, args.data_root)) for r in batch.itertuples()])
         labels = batch.true_idx.to_numpy()
@@ -647,20 +755,29 @@ def main(argv=None):
                       args.target_layer, capabilities, receipt_index, args.asa_batch_size, args.seed,
                       args.workers)
         rows = run_batch(ctx, epsilons, defences, attacks, args.steps, args.seed + start, rng, rates, timings)
-        for k, row in enumerate(rows):
-            row["row_id"] = len(all_rows) + k
-        all_rows += rows
         n_forward += ctx.n_forward
         done = start + len(batch)
         minutes = (time.time() - t0) / 60
-        print(f"  {done}/{len(df)} images | {minutes:.1f} min | ETA {minutes / done * (len(df) - done):.1f} min | "
+        # the batch's rows, then the state that points past them (both replaced atomically): a stop in
+        # between only makes a resumed run compute this batch again
+        part = os.path.join(parts_dir, f"rows_{start:06d}.csv")
+        pd.DataFrame(rows).to_csv(part + ".tmp", index=False)
+        os.replace(part + ".tmp", part)
+        write_state(state_path, {"resume_key": resume_key, "n_done": done, "n_images": int(len(df)),
+                                 "rng": rng.bit_generator.state, "rates": rates.to_list(),
+                                 "seconds": timings, "n_forward": int(n_forward),
+                                 "minutes": minutes_before + minutes})
+        print(f"  {done}/{len(df)} images | {minutes:.1f} min | ETA "
+              f"{minutes / (done - start_at) * (len(df) - done):.1f} min | "
               f"{ctx.n_forward / len(batch):.0f} ASA forward passes per image", flush=True)
 
     # --- outputs ---------------------------------------------------------------------
-    rows = pd.DataFrame(all_rows)
+    # the rows of every batch, read back from the parts (the same path for a resumed and an uninterrupted run)
+    parts = sorted(name for name in os.listdir(parts_dir) if name.startswith("rows_") and name.endswith(".csv"))
+    rows = pd.concat([pd.read_csv(os.path.join(parts_dir, name)) for name in parts], ignore_index=True, sort=False)
+    rows.insert(0, "row_id", np.arange(len(rows)))
     first = ["row_id"] + base_cols
     rows = rows[first + [c for c in rows.columns if c not in first]]
-    os.makedirs(args.out_dir, exist_ok=True)
     rows.to_csv(os.path.join(args.out_dir, f"rows_asa_{args.tag}.csv"), index=False)
     df[[c for c in BASE_COLS if c in df.columns]].to_csv(os.path.join(args.out_dir, f"images_asa_{args.tag}.csv"),
                                                          index=False)
@@ -687,14 +804,21 @@ def main(argv=None):
                "asa_forward_passes": {"total": int(n_forward), "per_image": n_forward / max(len(df), 1),
                                       "upper_bound_per_image": upper},
                "seconds": {k: round(v, 1) for k, v in timings.items()},
-               "minutes": round((time.time() - t0) / 60, 2),
+               "minutes": round(minutes_before + (time.time() - t0) / 60, 2),
+               "resumed": state is not None, "resumed_after_images": start_at if state else None,
+               "resume_key": resume_key,
                **rates.as_dict()}
-    with open(os.path.join(args.out_dir, f"summary_asa_{args.tag}.json"), "w", encoding="utf-8") as f:
+    with open(summary_path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(_ADAPTIVE._json_safe(summary), f, indent=2)
+    os.replace(summary_path + ".tmp", summary_path)
+    shutil.rmtree(parts_dir, ignore_errors=True)         # finished: the summary says so from now on
 
-    print("attack success (95 % Wilson interval):")
-    for name, r in summary["attack_success_rate"].items():
-        print(f"  {name:<32}{r['rate']:.3f} [{r['ci_low']:.3f}, {r['ci_high']:.3f}]  n={r['n']}")
+    for section, title in (("attack_success_rate", "attack success on the undefended model"),
+                           ("attack_success_after_defence_rate", "attack success after the defence (BPDA-PGD: "
+                                                                 "the defence it was computed through)")):
+        print(f"{title} (95 % Wilson interval):")
+        for name, r in summary[section].items():
+            print(f"  {name:<40}{r['rate']:.3f} [{r['ci_low']:.3f}, {r['ci_high']:.3f}]  n={r['n']}")
     print(f"{len(rows):,} rows | {n_forward / max(len(df), 1):.0f} ASA forward passes per image | "
           f"{summary['minutes']} min | wrote results to {args.out_dir}")
 

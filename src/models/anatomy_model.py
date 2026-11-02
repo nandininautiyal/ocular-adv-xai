@@ -550,8 +550,9 @@ class MaskTrainer(tf.keras.Model):
     cross-entropy is the compiled CategoricalCrossentropy on the ArcFace output,
     which reads the logits of its Softmax op exactly as model.fit does for the
     baseline (never eager cross-entropy on probabilities). Logged: ``loss`` (the
-    total objective, which ModelCheckpoint / EarlyStopping monitor as val_loss),
-    ``ce``, ``mask_loss`` (unweighted KL) and ``accuracy``.
+    total objective that is minimised), ``ce``, ``mask_loss`` (unweighted KL) and
+    ``accuracy``. 03 stops, schedules and checkpoints on ``val_ce`` (its
+    monitor_for), the same quantity the other archs' val_loss is.
 
     Everything that saves or restores goes to the inference model: ``save`` (so
     ModelCheckpoint writes the plain dual-input model that load_checkpoint reads),

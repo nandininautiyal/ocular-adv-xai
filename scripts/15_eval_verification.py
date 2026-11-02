@@ -54,6 +54,9 @@ Cross-dataset (VISOB not needed; 20_prepare_ubipr.py already run):
 Any arch of 03 --arch loads. The attnet_gate model needs the eye masks at test time: add
 --region-masks masks64_<tag>.npz (21) or masks_<tag>.npz (17) covering every embedded image
 (matched by condition, phase and file name; a missing mask stops the run). Other archs ignore it.
+attnet_gate runs p1, p2 and p3 only: the masks are keyed by VISOB relpaths (condition / phase_eye /
+file), and nothing makes masks for the external images of x1, so --modes x1 with --region-masks
+stops before the model loads (and an attnet_gate checkpoint with x1 stops right after it loads).
 """
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; set before importing tensorflow
@@ -297,13 +300,20 @@ def embed_images(model, relpaths, root, batch_size, workers, region_of=None):
     return emb
 
 
-def region_lookup(model, region_masks, relpaths):
+X1_NO_REGION = ("x1 is not available for attnet_gate: its region input needs eye masks, and the masks of 17 / 21 "
+                "are keyed by VISOB relpaths; nothing makes them for the external (UBIPr) images")
+
+
+def region_lookup(model, region_masks, relpaths, external=False):
     """None for a dual-input model; for attnet_gate a function relpaths -> region inputs (n, 8, 8, 1)
-    from --region-masks, after checking that every image to embed has a mask."""
+    from --region-masks, after checking that every image to embed has a mask. *external*: x1 is
+    requested, which a model with a region input cannot run (no masks for the external images)."""
     if len(model.inputs) == 2:
         if region_masks:
             print(f"NOTE: --region-masks is ignored: this {model_arch(model)} model has no region input")
         return None
+    if external:
+        raise SystemExit(X1_NO_REGION)
     if not region_masks:
         raise SystemExit(f"this {model_arch(model)} model has a region input: pass --region-masks")
     from src.data.masked_generator import MaskTable, regions_for_rows
@@ -593,6 +603,8 @@ def main():
     if unknown or not requested:
         raise SystemExit(f"unknown modes {sorted(unknown)}; choose from {sorted(PROTOCOLS)}")
     modes = [m for m in PROTOCOLS if m in requested]
+    if "x1" in modes and args.region_masks:
+        ap.error(X1_NO_REGION + " (--region-masks is for attnet_gate, which runs p1, p2 and p3 only)")
     if "x1" in modes and not args.external_manifest:
         raise SystemExit("x1 needs --external-manifest (ubipr_manifest.csv from 20_prepare_ubipr.py)")
     if "x1" in modes and not os.path.exists(args.external_manifest):
@@ -633,8 +645,7 @@ def main():
     timing["load_model_s"] = round(time.time() - t, 1)
     print(f"loaded: {args.ckpt} ({timing['load_model_s']} s) | arch: {model_arch(model)}")
     relpaths = sorted(set().union(*(set(selected[m].relpath) for m in visob)))
-    region_of = region_lookup(model, args.region_masks,
-                              relpaths + (selected["x1"].relpath.tolist() if "x1" in selected else []))
+    region_of = region_lookup(model, args.region_masks, relpaths, external="x1" in selected)
     emb = emb_x = None
     if relpaths:
         print(f"embedding {len(relpaths)} images (batch {args.batch_size}) from {root}", flush=True)
