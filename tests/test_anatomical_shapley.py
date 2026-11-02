@@ -354,6 +354,41 @@ def test_attention_and_receipt_columns(script, parts_model, images, labels, scor
     assert np.isnan(rows[0]["del_auc_receipt"])                    # image 0 has a lid with no receipt
 
 
+def test_warm_up_covers_the_timed_regions(script, parts_model, images, labels, monkeypatch):
+    """After warm_up, a condition builds no sub-model inside the timed regions and every coalition forward
+    pass uses a batch size the warm-up already ran (one-time costs stay out of the time_ columns)."""
+    from src.models import anatomy_model, arcface_inference
+    from src.xai import shapley
+    caps = script.anatomy_capabilities(parts_model)
+    groups = normalise_groups(DEFAULT_GROUPS)
+    index = [caps["receipt_parts"].index(g) for g in GROUPS]
+    base = [{"image_id": i, "true_idx": int(labels[i])} for i in range(2)]
+    ctx = script.Context(parts_model, images[:2], labels[:2], base, eye_labels(2), CLASSES, groups, ["mean"],
+                         "margin", ["layercam", "eigencam"], None, caps, index, 10, 0,
+                         part_estimators=("kernelshap", "lime"), pixel_estimators=("kernelshap", "lime"),
+                         pixel_samples=24, patch=64, pixel_conditions=("clean",), pixel_methods=("mean",))
+    arcface_inference._CACHE.pop(parts_model, None)          # start cold: no cached sub-model
+    anatomy_model._SUB_MODELS.pop(parts_model, None)
+    assert script._chunk_sizes(500, 96) == {96, 20} and script._chunk_sizes(16, 96) == {16}
+    assert script._chunk_sizes(192, 96) == {96}
+    sizes = script.warm_up_sizes(ctx)
+    assert sizes == list(range(1, 11))                 # 2^5 games > 10 per pass; 24 pixel coalitions -> 10, 10, 4
+    assert script.warm_up(ctx) > 0
+    built = (set(arcface_inference._CACHE[parts_model]), set(anatomy_model._SUB_MODELS[parts_model]))
+    assert {"attention", "parts"} <= built[1] and len(built[0]) >= 2         # logits and the CAM layer
+
+    used, forward = [], shapley._forward
+
+    def recording(model, batch, output, batch_size):
+        used.extend(min(batch_size, len(batch) - i) for i in range(0, len(batch), batch_size))
+        return forward(model, batch, output, batch_size)
+
+    monkeypatch.setattr(shapley, "_forward", recording)
+    rows, _ = script.condition_rows(ctx, images[:2], {"condition": "clean"})
+    assert rows and used and set(used) <= set(sizes)
+    assert (set(arcface_inference._CACHE[parts_model]), set(anatomy_model._SUB_MODELS[parts_model])) == built
+
+
 def test_parts_model_end_to_end(script, analyse, parts_model, inputs, tmp_path):
     """22 on a saved parts checkpoint, then 23's checks, including the receipt summing to v_full."""
     ckpt = tmp_path / "parts.keras"
@@ -524,6 +559,7 @@ def test_runtime_and_js_columns(fu_run):
         assert row.js_asa__lime_parts == pytest.approx(pairwise_js(maps)[("a", "b")], abs=1e-9)
     hardware = fu_run["summary"]["runtime"]["hardware"]
     assert hardware["cpu_threads"] and "gpus" in hardware
+    assert fu_run["summary"]["runtime"]["warmup_seconds"] > 0
 
 
 def test_fu_analysis_end_to_end(fu_run, analyse):
@@ -549,7 +585,7 @@ def test_fu_analysis_end_to_end(fu_run, analyse):
     assert set(shift.target) == {"genuine", "impostor"} and set(shift.condition) == {"attack"}
     text = (out / "report_asa.md").read_text(encoding="utf-8")
     for section in ("Sampling baselines against exact ASA", "Verification pairs", "measured on our hardware",
-                    "Agreement between attributions"):
+                    "Agreement between attributions", "untimed warm-up"):
         assert section in text, section
     # verification rows that break the accounting stop the analysis
     rows = fu_run["rows"]

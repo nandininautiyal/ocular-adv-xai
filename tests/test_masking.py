@@ -321,6 +321,29 @@ def test_monotonicity_and_masking_flags(masking_script):
     assert masking_script.drops({"a": 0.5, "b": 0.4, "c": 0.6}, 0.01) == [("a", "b")]
 
 
+def test_monotonicity_against_the_best_earlier_rate_on_sorted_grids(masking_script):
+    """A slow slide (each step within the tolerance, the total beyond it) fails, and grids typed out of order
+    are checked in ascending order."""
+    drops = masking_script.drops
+    assert drops({"10": 0.600, "50": 0.592, "200": 0.584}, 0.01) == [("10", "200")]
+    assert drops({"10": 0.600, "50": 0.595, "200": 0.598}, 0.01) == []
+    assert drops({"1": float("nan"), "2": 0.5, "4": 0.3}, 0.01) == [("2", "4")]
+    s = masking_script.settings_from(levels=(1,), steps_levels=(1,), steps_grid=(200, 50, 10),
+                                     budget_grid=(255, 1, 2, 4))
+    records = []
+    for test, levels, steps, rate in ([("steps", 1, n, r) for n, r in ((10, 0.55), (50, 0.6), (200, 0.5))]
+                                      + [("budget", L, 50, r) for L, r in ((1, 0.3), (2, 0.5), (4, 0.7), (255, 1.0))]):
+        records += [{"test": test, "attack": "pgd", "budget_levels": levels, "steps": steps, "success": k < rate * 20,
+                     "condition": None, "tau_mean": np.nan, "tau_not1_share": np.nan} for k in range(20)]
+    summary = masking_script.summarise(pd.DataFrame(records), s)
+    assert list(summary["pgd_success_vs_budget"]) == ["1", "2", "4", "255"]
+    assert list(summary["pgd_success_vs_steps"]["1levels"]) == ["10", "50", "200"]
+    assert summary["monotonicity"]["budget_drops"] == []
+    assert summary["monotonicity"]["steps_drops"] == {"1levels": [("50", "200")]}
+    assert "pgd_budget_not_monotone" not in summary["masking_flags"]
+    assert "pgd_steps_not_monotone@1levels" in summary["masking_flags"]
+
+
 def _write_images(tmp_path, images, labels):
     records = []
     for i, (img, label) in enumerate(zip(images, labels)):
@@ -375,6 +398,7 @@ def test_24_end_to_end(masking_script, tmp_path, kind, model, images, labels, x)
     assert set(summary["attack_comparison"]) == {f"{a}@{L}levels" for a in ("pgd", "aas_pgd", "rr_pgd") for L in (1, 2)}
     assert summary["settings"]["taus"] == list(DEFAULT_TAUS) and summary["checks_skipped"] == []
     assert set(summary["seconds"]) == {"steps", "budget", "pgd", "aas_pgd", "rr_pgd", "gradient"}
+    assert summary["batch_size"] == 2 and summary["n_batches"] == 2 and summary["seconds_per_batch"] > 0
     aas = rows[(rows.test == "compare") & (rows.attack == "aas_pgd")]
     if kind == "plain":
         assert summary["attention_stats"] == {} and "attn_max_weight" not in rows.columns

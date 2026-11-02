@@ -74,7 +74,9 @@ Tables (CSV in --out-dir):
   verification_shift.csv  phi_shift.csv for the genuine and the impostor games (column target)
   runtime.csv             wall time per explanation (one image and condition): median, IQR and forward
                           passes per method (and hiding baseline for ASA and the sampling baselines),
-                          measured on the run's hardware (summary runtime.hardware)
+                          measured on the run's hardware (summary runtime.hardware); mean_s is
+                          sensitive to one-time costs in runs of 22 without a warm-up, so the report
+                          quotes the median and IQR
   agreement.csv           pairwise Jensen-Shannon divergence (base 2) of the 256 x 256 attribution maps:
                           median with CI per pair, condition, hiding baseline and target
 Figures: fig_phi_shift.png, fig_deletion.png. Report: report_asa.md.
@@ -959,12 +961,17 @@ def _report_fu(tables, summary, args):
             where = [hw.get("platform"), f"{hw.get('cpu_threads')} CPU threads",
                      ("GPU " + "; ".join(map(str, hw["gpus"]))) if hw.get("gpus") else "no GPU"]
         where = ", ".join(str(x) for x in where if x)
+        warmup = (summary.get("runtime") or {}).get("warmup_seconds")
+        warm = (f"22 ran an untimed warm-up first ({warmup:.1f} s: sub-models built, one forward pass at every "
+                "coalition batch size), so one-time costs are not in these times." if warmup is not None else
+                "This run of 22 had no warm-up: the first batch's times include building the sub-models and "
+                "first-call costs, which the median and IQR resist but the mean (runtime.csv mean_s) does not.")
         lines += ["## Run time per explanation", "",
                   "Wall time per image and condition and forward passes, measured on our hardware"
                   f"{' (' + where + ')' if where else ''}: the ratios between methods are the point, not the "
                   "absolute times. Batched methods (CAMs, attention, receipt) get their batch's time divided by its "
                   "images; LayerCAM also needs one backward pass. The sampling baselines run stand-alone (their own "
-                  "coalition images and forward passes).", ""]
+                  f"coalition images and forward passes). {warm}", ""]
         lines += _markdown(["method", "baseline", "n", "median (s)", "IQR (s)", "forward passes (median)"],
                            [[r.method, r.baseline, r.n, f"{r.median_s:.4f}", f"{r.q25_s:.4f}-{r.q75_s:.4f}",
                              _num(r.forwards_median, ".0f")] for r in rt.itertuples()]) + [""]

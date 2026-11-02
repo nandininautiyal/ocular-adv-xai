@@ -111,7 +111,10 @@ passes (nfwd_<method>) of exact ASA (per hiding baseline: building the coalition
 forward passes), the part and pixel baselines (stand-alone, the regression included), LayerCAM,
 Eigen-CAM, attention and the receipt (computed per batch: the batch's time divided by its images;
 LayerCAM also needs one backward pass). 23 summarises them; they are measured on the run's hardware
-(summary: runtime.hardware).
+(summary: runtime.hardware). Before the first batch of a run (and again for a last batch of another
+size) an untimed warm-up builds the lazily cached CAM, attention and parts sub-models and runs one
+forward pass at every coalition batch size, so one-time costs stay out of the time_ columns
+(summary: runtime.warmup_seconds).
 
 Agreement: every attribution of a row becomes one 256 x 256 non-negative map (ASA, the part
 baselines and the receipt: positive part values spread uniformly over the part's pixels; pixel
@@ -741,6 +744,43 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
 
 
 # ---------------------------------------------------------------------------
+# Warm-up before the timed regions
+# ---------------------------------------------------------------------------
+
+def _chunk_sizes(n, cap):
+    """Batch sizes of the forward passes over *n* images, *cap* per pass."""
+    return {min(n, cap)} | ({n % cap} if n > cap and n % cap else set())
+
+
+def warm_up_sizes(ctx):
+    """Every batch size the timed coalition forward passes can use: 1 up to 2^P or --asa-batch-size (an ASA
+    game and the distinct coalitions of a part baseline never exceed 2^P images, and LIME's distinct rows
+    vary from image to image), and the chunks of the pixel baselines' coalition sets of *ctx*."""
+    cap = ctx.asa_batch_size
+    sizes = set(range(1, min(2 ** len(ctx.names), cap) + 1))
+    for plans in ctx.pixel_plans:
+        for _, coalitions in plans.values():
+            sizes |= _chunk_sizes(len(np.unique(coalitions, axis=0)), cap)
+    return sorted(sizes)
+
+
+def warm_up(ctx, coalitions=True):
+    """One untimed pass over what the timed regions would otherwise pay for on first use: the CAM, attention
+    and parts sub-models (built lazily and cached per model) at this batch's size and, with *coalitions*, one
+    forward pass at every coalition batch size of :func:`warm_up_sizes` (GPU kernels are tuned per input
+    shape). Embeddings run through the same sub-model as the logits. Nothing is counted or kept.
+    Returns the seconds it took."""
+    start = time.perf_counter()
+    logits = predict_logits(ctx.model, ctx.clean)
+    explanations(ctx.model, ctx.clean, {"true": ctx.labels}, ctx.cams, ctx.target_layer, ctx.capabilities,
+                 ctx.receipt_index, logits, ctx.score)
+    if coalitions:
+        for size in warm_up_sizes(ctx):
+            model_outputs(ctx.model, np.repeat(ctx.clean[:1], size, axis=0), "logits", ctx.asa_batch_size)
+    return time.perf_counter() - start
+
+
+# ---------------------------------------------------------------------------
 # One batch: every condition
 # ---------------------------------------------------------------------------
 
@@ -1206,6 +1246,7 @@ def main(argv=None):
                 os.remove(os.path.join(parts_dir, name))
         print(f"resuming after {start_at} of {len(df)} images ({minutes_before:.1f} min before)")
     t0 = time.time()
+    warmed, warmup_seconds = set(), 0.0     # batch sizes already warmed up (the last batch may be smaller)
     for start in range(start_at, len(df), args.batch_size):
         batch = df.iloc[start:start + args.batch_size]
         clean = np.stack([_RUNNER.load_image(_RUNNER.resolve_path(r, args.data_root)) for r in batch.itertuples()])
@@ -1219,6 +1260,9 @@ def main(argv=None):
                       pixel_conditions=pixel_conditions, pixel_methods=pixel_hiding,
                       templates=batch_templates(templates, start, len(batch), args.data_root),
                       verif_conditions=verif_conditions)
+        if len(batch) not in warmed:
+            warmup_seconds += warm_up(ctx, coalitions=not warmed)
+            warmed.add(len(batch))
         rows = run_batch(ctx, epsilons, defences, attacks, args.steps, args.seed + start, rng, rates, timings,
                          taus)
         n_forward += ctx.n_forward
@@ -1305,7 +1349,10 @@ def main(argv=None):
                "runtime": {"hardware": hardware(),
                            "note": "time_<method> / nfwd_<method> columns: wall time in seconds and forward passes "
                                    "per image and condition, measured on this hardware; batched methods (CAMs, "
-                                   "attention, receipt) get their batch's time divided by its images"},
+                                   "attention, receipt) get their batch's time divided by its images",
+                           "warmup": "untimed, before the first batch (and a smaller last batch): sub-models "
+                                     "built and one forward pass at every coalition batch size",
+                           "warmup_seconds": round(warmup_seconds, 2)},
                "conditions_per_image": n_conditions,
                "asa_forward_passes": {"total": int(n_forward), "per_image": n_forward / max(len(df), 1),
                                       "upper_bound_per_image": upper},

@@ -313,8 +313,10 @@ def test_fields_the_notebook_reads_are_written_by_the_scripts(tmp_path):
     assert not absent("scripts/22_anatomical_shapley.py", ["minutes", "n_images", "n_rows", "git_commit", "n_done"])
     assert not absent("scripts/03_train_baseline.py", ["finished", "weights_sha256"])      # training_done
     assert not absent("scripts/22_anatomical_shapley.py", ["attacks", "rows_per_target_kind"])   # checks_asa
+    assert not absent("scripts/22_anatomical_shapley.py", ["anatomy", "attention"])              # checks_asa
     assert not absent("scripts/24_gradient_masking.py", ["masking_flags", "checks_skipped", "seconds_per_image",
                                                          "git_commit", "n_images", "arch", "has_attention"])
+    assert not absent("scripts/24_gradient_masking.py", ["seconds_per_batch", "batch_size"])     # masking_hours
     import importlib.util
     spec = importlib.util.spec_from_file_location("s21", os.path.join(REPO, "scripts", "21_make_train_masks.py"))
     s21 = importlib.util.module_from_spec(spec)
@@ -328,7 +330,8 @@ def test_fields_the_notebook_reads_are_written_by_the_scripts(tmp_path):
 def test_masking_check_and_the_asa_flags(settings):
     """24 runs on the smoke and the full model (seed SEEDS[0]) of every arch of MASKING_ARCHS that is trained, on
     that model's own correct-image list, after its 04, with the same grids in the smoke and the full run; every 22
-    run of the session has the same 22 flags (the smoke runs time the full runs)."""
+    run of the session has the same 22 flags (the smoke runs time the full runs), except that aas_pgd runs only on
+    models with an attention pool (on the baseline it is pgd itself)."""
     ns = _namespace(**settings)
     cmd, s0 = ns["CMD"], ns["SEEDS"][0]
     check = [a for a in ns["MASKING_ARCHS"] if a in ns["ARCHS"]]
@@ -352,9 +355,13 @@ def test_masking_check_and_the_asa_flags(settings):
         assert (f"24_{t}" in cmd) == (arch in check and s == s0)
     runs = [k for k in cmd if k.startswith("22_")]
     assert runs
+    arch_of = {"22_smoke": ns["SMOKE_ASA_ARCH"], "22_smoke_mask": ns["ASA_MASK_ARCH"], "22_mask": ns["ASA_MASK_ARCH"],
+               "22_smoke_base": "baseline", "22_base": "baseline"}
     for name in runs:
         a = _args(cmd[name])
-        assert a["--attacks"] == ns["ASA_ATTACKS"] and a["--pixel-conditions"] == ns["ASA_PIXEL_CONDITIONS"]
+        attention = arch_of[name] in ("attn", "attn_mask", "parts")
+        expected = [x for x in ns["ASA_ATTACKS"].split(",") if x != "aas_pgd" or attention]
+        assert a["--attacks"] == ",".join(expected) and a["--pixel-conditions"] == ns["ASA_PIXEL_CONDITIONS"]
         assert a.get("--baseline-hiding") == ns["ASA_BASELINE_HIDING"]
         assert ("--verif-pairs" in a) == ns["ASA_VERIF_PAIRS"]
     defaults = _namespace()
@@ -363,6 +370,54 @@ def test_masking_check_and_the_asa_flags(settings):
     # the masking check is one of a model's steps: planned and estimated with it, skipped once its summary exists
     assert "MODEL_STEPS" in _cell(11) and "EST['24_h']" in _cell(11)
     assert "'24': f'{MASKING}/summary_masking_{t}.json'" in _cell(12)
+
+
+def test_aas_pgd_only_where_there_is_an_attention_pool(tmp_path):
+    """ATTENTION_ARCHS are the archs built with an attention pool; with a baseline the 22 runs of the base model leave
+    aas_pgd out (it would be pgd itself), and checks_asa expects the attacks of each model from its summary."""
+    import yaml
+    from src.attacks.masking import has_attention
+    from src.models import anatomy_model as am
+    with open(os.path.join(REPO, "configs", "anatomy.yml")) as f:
+        cfg = yaml.safe_load(f)
+    cfg["model"].update({"backbone": "tiny", "fine_tune_at": 0, "dense_units": 8, "n_classes": 3})
+    cfg["anatomy"]["hidden"] = 4
+    ns = _helpers(tmp_path, ASA=str(tmp_path / "asa"), ANALYSIS=str(tmp_path / "analysis"),
+                  BASELINE_CKPT="/kaggle/input/cs/trained_models/Xception_ArcFace_cs_s1.keras")
+    assert set(ns["ATTENTION_ARCHS"]) == {a for a in am.ARCHS if has_attention(am.build_anatomy_model(cfg, a))}
+    assert "aas_pgd" not in _args(ns["CMD"]["22_base"])["--attacks"].split(",")
+    assert "aas_pgd" in _args(ns["CMD"]["22_mask"])["--attacks"].split(",")
+    exec(_cell(5), ns)
+    os.makedirs(ns["ASA"])
+    os.makedirs(f"{ns['ANALYSIS']}/an_base")
+    open(f"{ns['ASA']}/rows_asa_an_base.csv", "w").close()
+    open(f"{ns['ANALYSIS']}/an_base/report_asa.md", "w").close()
+
+    def check(attacks, attention):
+        with open(f"{ns['ASA']}/summary_asa_an_base.json", "w") as f:
+            json.dump({"git_commit": "0" * 40, "attacks": attacks, "anatomy": {"attention": attention},
+                       "rows_per_target_kind": {"true_class": 1, "genuine": 1}}, f)
+        return all(ok for _, ok, _, _ in ns["checks_asa"]("an_base"))
+
+    assert check(["fgsm", "pgd"], False) and check(["fgsm", "pgd", "aas_pgd"], True)
+    assert not check(["fgsm", "pgd", "aas_pgd"], False) and not check(["fgsm", "pgd"], True)
+
+
+def test_masking_estimate_per_batch():
+    """Cell 11 estimates 24's full run per batch when the smoke run filled one (a batch of 4 images costs about as
+    much as one of 16), else per image, which can only overstate it."""
+    import ast
+    tree = ast.parse(_cell(11))
+    [fn] = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "masking_hours"]
+    ns = {"N_CLASSES": 300}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "cell11", "exec"), ns)
+    full = {"seconds_per_batch": 360.0, "seconds_per_image": 22.5, "n_images": 16, "batch_size": 16}
+    assert ns["masking_hours"](full) == pytest.approx((360.0 * 19 + 300) / 3600)
+    partial = dict(full, n_images=4, seconds_per_batch=300.0, seconds_per_image=75.0)
+    assert ns["masking_hours"](partial) == pytest.approx((75.0 * 300 + 300) / 3600)
+    older = {"seconds_per_image": 10.0, "n_images": 4}                  # a summary written before seconds_per_batch
+    assert ns["masking_hours"](older) == pytest.approx((10.0 * 300 + 300) / 3600)
+    assert _namespace()["MASKING_SMOKE_IMAGES"] == 16                  # one full batch of 24's --batch-size 16
 
 
 def test_verification_pairs_keep_classes_with_a_template(tmp_path):

@@ -250,7 +250,12 @@ def gradient_stats(model, images, labels, loss="margin", taus=None):
     Returns a dict of (N,) arrays: ``zero_share`` (components exactly 0),
     ``nonfinite_share`` (NaN or inf), ``l2``, ``linf`` and ``l1`` (norms of the finite
     components). With *taus* (attention models only), also ``l2_tau<t>``: the gradient
-    norm of the model scaled by t, which grows with t when the softmax saturates.
+    norm of the model whose attention logits are divided by t. A saturated softmax puts
+    almost all weight, and so the gradient, on one cell: the unscaled norm is then large
+    and peaky, and raising t spreads the weights and SHRINKS the norm (tests/test_masking.py
+    checks this on a saturated tiny model); an unsaturated softmax gives norms that barely
+    change with t. The norms alone do not show masking: aas_pgd and the random restarts
+    against pgd (scripts/24_gradient_masking.py, test (b)) are the decisive comparison.
     """
     x, _ = as_batch(images)
     labels = tf.constant(np.asarray(labels, np.int32).reshape(-1))

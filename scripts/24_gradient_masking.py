@@ -18,9 +18,11 @@ Tests, per image:
   (a) PGD success against the number of steps (--steps-grid, default 10, 50,
       200; at each budget of --steps-levels) and against the budget in levels
       (--budget-grid, default 1, 2, 4, 8, 16, 32, 255; --budget-steps steps).
-      Success must not fall when steps or budget grow (beyond --monotone-tol)
-      and must reach --unbounded-min (0.99) at 255 levels, the whole [0, 1]
-      range.
+      Both grids are sorted ascending. Success must not fall when steps or
+      budget grow: a rate more than --monotone-tol below the best rate at fewer
+      steps or a smaller budget fails (so does a slow slide over several
+      settings). It must reach --unbounded-min (0.99) at 255 levels, the whole
+      [0, 1] range.
   (b) pgd vs aas_pgd (attention-temperature scaling, src/attacks/masking.py,
       temperatures --taus) vs random-restart PGD (--restarts starts; restart 0
       is the pgd run, so it can only add successes) at each budget of
@@ -29,7 +31,9 @@ Tests, per image:
   (c) Input-gradient statistics of the margin loss on the clean images and on
       the pgd images of (b): the share of exactly zero and of non-finite
       gradient components, the L1 / L2 / L-inf norms and, for an attention
-      model, the L2 norm at every temperature of --taus. Attention saturation
+      model, the L2 norm at every temperature of --taus (under a saturated
+      softmax it falls as the temperature rises; src/attacks/masking.py,
+      gradient_stats; test (b) decides, not these norms). Attention saturation
       on the same images: the largest weight and the normalised entropy (1 =
       uniform over the 64 cells, 0 = one cell) of every attention map.
 
@@ -54,9 +58,11 @@ Writes to --out-dir:
 Refuses three-input models (attnet_gate: its region input is not an image).
 
 Usage (Kaggle, with the checkpoint dataset attached and 01, 02, 04 already run):
-  smoke (2-3 min; prints the ETA of the full run's per-image cost):
+  smoke (one full batch of --batch-size 16 images: the PGD steps run per batch, so a batch of 4
+  costs about as much as one of 16 and its per-image rate would overstate the full run; estimate
+  the full run as seconds_per_batch x its number of batches):
     python scripts/24_gradient_masking.py --ckpt <checkpoint.keras> \\
-        --correct-csv /kaggle/working/eval_clean/correct_test_<tag>.csv --max-images 4 --tag smoke
+        --correct-csv /kaggle/working/eval_clean/correct_test_<tag>.csv --max-images 16 --tag smoke
   full (one image per class):
     python scripts/24_gradient_masking.py --ckpt <checkpoint.keras> \\
         --correct-csv /kaggle/working/eval_clean/correct_test_<tag>.csv --per-class 1 \\
@@ -259,9 +265,16 @@ def run_batch(model, clean, labels, base_rows, settings, seed=0, timings=None):
 # ---------------------------------------------------------------------------
 
 def drops(rates, tol):
-    """Consecutive pairs (a, b) of an ordered {setting: rate} where the rate falls by more than *tol*."""
-    keys = list(rates)
-    return [(a, b) for a, b in zip(keys, keys[1:]) if rates[b] < rates[a] - tol]
+    """Pairs (a, b) of an ordered {setting: rate} (ascending steps or budgets) where the rate at b is more
+    than *tol* below the rate at a, the best of all earlier settings, so a slow slide over several settings
+    counts as well as one step down. NaN rates (no images) are skipped."""
+    out, best = [], None
+    for key, value in rates.items():
+        if best is not None and value < rates[best] - tol:
+            out.append((best, key))
+        if np.isfinite(value) and (best is None or value > rates[best]):
+            best = key
+    return out
 
 
 def _median(values):
@@ -279,9 +292,10 @@ def summarise(rows, settings):
     for levels in s["steps_levels"]:
         g = steps[steps.budget_levels == levels]
         out["pgd_success_vs_steps"][f"{levels}levels"] = {
-            str(n): rate(g.success[g.steps == n]) for n in s["steps_grid"]}
+            str(n): rate(g.success[g.steps == n]) for n in sorted(s["steps_grid"])}
     budget = rows[rows.test == "budget"]
-    out["pgd_success_vs_budget"] = {str(L): rate(budget.success[budget.budget_levels == L]) for L in s["budget_grid"]}
+    out["pgd_success_vs_budget"] = {str(L): rate(budget.success[budget.budget_levels == L])
+                                    for L in sorted(s["budget_grid"])}
     compare = rows[rows.test == "compare"]
     for levels in s["levels"]:
         for attack in COMPARE_ATTACKS:
@@ -430,9 +444,10 @@ def main(argv=None):
         ap.error(f"--taus: {e}")
     settings = settings_from(
         levels=parse_levels(ap, args.levels, "--levels"), steps=args.steps,
-        steps_grid=parse_positive_ints(ap, args.steps_grid, "--steps-grid"),
+        steps_grid=tuple(sorted(parse_positive_ints(ap, args.steps_grid, "--steps-grid"))),
         steps_levels=parse_levels(ap, args.steps_levels, "--steps-levels"),
-        budget_grid=parse_levels(ap, args.budget_grid, "--budget-grid"), budget_steps=args.budget_steps,
+        budget_grid=tuple(sorted(parse_levels(ap, args.budget_grid, "--budget-grid"))),
+        budget_steps=args.budget_steps,
         restarts=args.restarts, taus=taus, step_size=args.step_size, monotone_tol=args.monotone_tol,
         unbounded_min=args.unbounded_min, gain_tol=args.gain_tol, zero_grad_max=args.zero_grad_max,
         saturation_max=args.saturation_max)
@@ -484,6 +499,7 @@ def main(argv=None):
               f"| {minutes * 60 / done:.1f} s per image", flush=True)
 
     rows = pd.DataFrame(all_rows)
+    n_batches = -(-len(df) // args.batch_size)
     results = summarise(rows, settings)
     summary = {"tag": args.tag, "ckpt": args.ckpt, "git_commit": _ADAPTIVE.git_commit(), "arch": arch,
                "has_attention": attention, "n_images": int(len(df)), "n_classes": int(df.true_idx.nunique()),
@@ -500,6 +516,10 @@ def main(argv=None):
                **results,
                "seconds": {k: round(v, 1) for k, v in timings.items()},
                "seconds_per_image": round((time.time() - t0) / max(1, len(df)), 2),
+               # a batch costs about as much with 4 images as with 16 (the PGD steps run per batch), so a
+               # full run is estimated per batch from a smoke run that fills one batch
+               "batch_size": args.batch_size, "n_batches": n_batches,
+               "seconds_per_batch": round((time.time() - t0) / max(1, n_batches), 2),
                "minutes": round((time.time() - t0) / 60, 1)}
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -513,6 +533,8 @@ def main(argv=None):
         print(f"PGD success vs steps at {key}:", {n: round(r["rate"], 3) for n, r in rates.items()})
     print("attack comparison:", {k: round(r["rate"], 3) for k, r in results["attack_comparison"].items()})
     print("masking flags:", results["masking_flags"] or "none", "| skipped:", results["checks_skipped"] or "none")
+    print(f"{summary['seconds_per_batch']} s per batch of up to {args.batch_size} images "
+          f"({summary['seconds_per_image']} s per image)")
     print("wrote results to", args.out_dir)
 
 
