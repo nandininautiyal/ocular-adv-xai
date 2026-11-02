@@ -18,12 +18,20 @@ both follow the paper's text:
   resized to the eye box and flipped for left eyes -> alpha blend (Eq. 8). The
   paper's monocle image was not released; ``make_monocle_template`` draws a
   stand-in modelled on its Fig. 4 (gold rim, faint lens, bead chain).
+  The Haar eye cascade finds no eye in most VISOB periocular crops (3 of the 4
+  saved examples of the 27 Oct run), so ``locate_eye`` then centres a fixed-size
+  box on the iris (eye-mask label map, or the Hough circle of src/xai/masks.py)
+  and uses the image centre only when that fails too. ``return_placement=True``
+  reports which of the three was used ("haar", "iris", "centre_fallback").
 """
 
 import warnings
 
 import numpy as np
 import tensorflow as tf
+
+IRIS_LABEL = 1          # label id of "iris" in an eye-mask label map (masks_<tag>.npz class_names)
+BOX_SHARE = 0.45        # side of the iris-centred and central boxes, as a share of the image width
 
 # ---------------------------------------------------------------------------
 # Patch Occlusion
@@ -125,8 +133,94 @@ def detect_eye(image):
     return int(x), int(y), int(w), int(h)
 
 
+def iris_centre(image, eye_labels=None, iris_label=IRIS_LABEL):
+    """Centre (x, y) of the iris in pixel coordinates, or None if it cannot be found.
+
+    Parameters
+    ----------
+    image : ndarray (H, W, 3), float32, [0, 1]
+    eye_labels : ndarray (H, W) of label ids or None
+        Eye-mask label map of *image* in the same (model-input) geometry, as in
+        masks_<tag>.npz. If given, the centre is the centroid of the pixels
+        labelled *iris_label* (None if there are none); the Hough circle is not
+        tried, because a validated mask that finds no iris is the better evidence.
+        If None, the centre is the Hough iris circle of
+        ``src.xai.masks.get_concept_masks``, unless that function fell back to
+        its fixed guess (None then).
+    iris_label : int — label id of the iris (the pupil is part of it)
+
+    Returns
+    -------
+    centre : tuple (x, y) of floats, or None
+    """
+    h, w = np.shape(image)[:2]
+    if eye_labels is not None:
+        eye_labels = np.asarray(eye_labels)
+        if eye_labels.shape != (h, w):
+            raise ValueError(f"eye_labels must have shape {(h, w)}, got {eye_labels.shape}")
+        rows, cols = np.nonzero(eye_labels == iris_label)
+        if len(rows) == 0:
+            return None
+        return float(cols.mean()), float(rows.mean())
+
+    from src.xai.masks import MASK_SIZE, get_concept_masks  # needs OpenCV, like detect_eye
+
+    _, info = get_concept_masks(np.clip(image, 0.0, 1.0), return_info=True)
+    if info["fallback_used"]:
+        return None
+    # the masks are computed at MASK_SIZE (width, height); scale back to this image
+    return info["cx"] * w / MASK_SIZE[0], info["cy"] * h / MASK_SIZE[1]
+
+
+def locate_eye(image, eye_labels=None, iris_label=IRIS_LABEL, detect=True, use_iris=True,
+               box_share=BOX_SHARE):
+    """Eye box for the monocle, and how it was found.
+
+    Tried in order:
+      1. "haar": the Haar eye box of :func:`detect_eye` (paper, Section 3.3), if *detect*;
+      2. "iris": a square box of side *box_share* x the image width centred on
+         :func:`iris_centre` (eye-mask label map if given, else the Hough circle),
+         if *use_iris*;
+      3. "centre_fallback": the same box at the centre of the image.
+    ``detect=False, use_iris=False`` always gives the central box.
+
+    Parameters
+    ----------
+    image : ndarray (H, W, 3), float32, [0, 1]
+    eye_labels : ndarray (H, W) or None — eye-mask label map, see :func:`iris_centre`
+    iris_label : int — label id of the iris in *eye_labels*
+    detect : bool — try the Haar cascade
+    use_iris : bool — try the iris centre
+    box_share : float > 0 — side of the iris and central boxes as a share of the
+        image width. The default 0.45 (115 px) is the earlier central fallback; on
+        VISOB crops its rim falls inside the iris, while a Haar box that finds the
+        eye is larger (189 px in the one saved example)
+
+    Returns
+    -------
+    box : tuple (x, y, w, h)
+    placement : {"haar", "iris", "centre_fallback"}
+    """
+    if not box_share > 0:
+        raise ValueError(f"box_share must be positive, got {box_share!r}")
+    h, w = np.shape(image)[:2]
+    if detect:
+        box = detect_eye(image)
+        if box is not None:
+            return box, "haar"
+    side_len = int(round(box_share * w))
+    centre = iris_centre(image, eye_labels, iris_label) if use_iris else None
+    if centre is not None:
+        # pixel-index coordinates: a box starting at x covers x .. x + side_len - 1
+        cx, cy = centre
+        x, y = int(round(cx - (side_len - 1) / 2.0)), int(round(cy - (side_len - 1) / 2.0))
+        return (x, y, side_len, side_len), "iris"
+    return ((w - side_len) // 2, (h - side_len) // 2, side_len, side_len), "centre_fallback"
+
+
 def monocle_blending(image, monocle_template=None, eye_box=None, side=None, alpha=1.0,
-                     detect=True):
+                     detect=True, eye_labels=None, iris_label=IRIS_LABEL, use_iris=True,
+                     box_share=BOX_SHARE, return_placement=False):
     """Simulate a physical Monocle attack via alpha blending (paper Eq. 7-8).
 
     Parameters
@@ -135,27 +229,43 @@ def monocle_blending(image, monocle_template=None, eye_box=None, side=None, alph
     monocle_template : ndarray (H, W, 4), float32, [0, 1] with alpha channel,
         or None for :func:`make_monocle_template`
     eye_box : tuple (x, y, w, h) or None
-        Eye bounding box. If None, it is detected with :func:`detect_eye`
-        (when *detect* is True); if that fails, a central box covering 45 % of
-        the image width is used.
+        Eye bounding box. If None, it is found with :func:`locate_eye`: the Haar
+        eye box (when *detect* is True); if there is none, a box of side
+        *box_share* x the image width centred on the iris (when *use_iris* is
+        True); if the iris is not found either, the same box at the image
+        centre. A box may extend past the image border; only its inside part is
+        blended.
     side : {"left", "right", None}
         Eye side. The template is mirrored for left eyes so that the chain sits
         on the same side of the face for both eyes.
     alpha : float in [0, 1], overall opacity of the monocle
     detect : bool, whether to run the Haar cascade when *eye_box* is None
+    eye_labels : ndarray (256, 256) or None — eye-mask label map of *image*
+        (masks_<tag>.npz); its iris centroid replaces the Hough circle
+    iris_label : int — label id of the iris in *eye_labels*
+    use_iris : bool — centre the box on the iris when Haar finds no eye
+    box_share : float — side of the iris and central boxes as a share of the image width
+    return_placement : bool — also return how the box was found
 
     Returns
     -------
     adv_image : ndarray (256, 256, 3), float32, [0, 1]
+    placement : {"haar", "iris", "centre_fallback", "given"}
+        Only with *return_placement*; "given" when *eye_box* was passed.
     """
     adv = np.array(image, dtype=np.float32, copy=True)
-    h, w = adv.shape[:2]
-
-    if eye_box is None and detect:
-        eye_box = detect_eye(adv)
     if eye_box is None:
-        side_len = int(round(0.45 * w))
-        eye_box = ((w - side_len) // 2, (h - side_len) // 2, side_len, side_len)
+        eye_box, placement = locate_eye(adv, eye_labels, iris_label, detect=detect,
+                                        use_iris=use_iris, box_share=box_share)
+    else:
+        placement = "given"
+    adv = _blend(adv, eye_box, monocle_template, side, alpha)
+    return (adv, placement) if return_placement else adv
+
+
+def _blend(adv, eye_box, monocle_template, side, alpha):
+    """Alpha-blend the monocle template, resized to *eye_box*, into *adv* (a private copy)."""
+    h, w = adv.shape[:2]
     bx, by, bw, bh = eye_box
 
     template = make_monocle_template() if monocle_template is None else monocle_template

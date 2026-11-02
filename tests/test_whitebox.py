@@ -1,8 +1,10 @@
 import numpy as np
 import pytest
 
+from src.attacks.budget import quantise
 from src.attacks.whitebox import (ATTACK_REGISTRY, PAPER_ATTACK_REGISTRY, bim, cw, fgsm, mim,
                                   paper_fgsm, paper_pgd, pgd)
+from src.defences.inference import bit_depth_reduction
 from src.models.arcface_inference import predict_logits
 
 EPS = 4 / 255
@@ -68,6 +70,49 @@ def test_cw_finds_small_adversarial_examples(model, images, labels):
 def test_cw_returns_input_when_it_fails(model, images, labels):
     adv = cw(images[:2], model, label=labels[:2], steps=1, binary_steps=1, initial_const=1e-6)
     np.testing.assert_array_equal(adv, images[:2])
+
+
+def fooled(model, x, labels):
+    return predict_logits(model, x).argmax(1) != labels
+
+
+def test_cw_with_quantise_fn_returns_8bit_adversarial_images(model, images, labels):
+    clean = quantise(images[:2])                       # loaded PNGs are on the grid
+    plain = cw(clean, model, label=labels[:2], steps=20, binary_steps=3)
+    rounded = cw(clean, model, label=labels[:2], steps=20, binary_steps=3, quantise_fn=quantise)
+    assert rounded.shape == clean.shape and rounded.dtype == np.float32
+    assert np.allclose(rounded * 255, np.round(rounded * 255), atol=1e-4)
+    assert fooled(model, plain, labels[:2]).any()
+    assert (fooled(model, rounded, labels[:2]) | ~fooled(model, plain, labels[:2])).all()
+
+
+def test_cw_judges_success_after_quantise_fn(model, images, labels):
+    # A 6-bit grid is coarse enough that rounding the float result afterwards undoes
+    # most successes, which is what 8-bit rounding does to some kappa = 0 examples.
+    six_bit = lambda x: bit_depth_reduction(x, bits=6)  # noqa: E731
+    clean = six_bit(images)
+    plain = cw(clean, model, label=labels, steps=20, binary_steps=3)
+    aware = cw(clean, model, label=labels, steps=20, binary_steps=3, quantise_fn=six_bit)
+    assert fooled(model, plain, labels).all()
+    assert not fooled(model, six_bit(plain), labels).all()          # rounding afterwards loses some
+    assert fooled(model, aware, labels).all()                       # judged after rounding: none lost
+    assert np.allclose(aware * 63, np.round(aware * 63), atol=1e-4)
+
+
+def test_cw_successes_clear_the_kappa_margin(model, images, labels):
+    # Before, any misclassified iterate counted as a success, so kappa = 5 still returned
+    # examples on the decision boundary (margins 0.4-4 on this model).
+    adv = cw(images, model, label=labels, kappa=5.0, steps=20, binary_steps=3)
+    assert (-margin(model, adv, labels) > 5.0).all()
+
+
+def test_cw_quantise_fn_failures_and_bad_shapes(model, images, labels):
+    clean = quantise(images[:2])
+    adv = cw(clean, model, label=labels[:2], steps=1, binary_steps=1, initial_const=1e-6,
+             quantise_fn=quantise)
+    np.testing.assert_array_equal(adv, clean)
+    with pytest.raises(ValueError, match="shape"):
+        cw(clean, model, steps=1, binary_steps=1, quantise_fn=lambda x: x[:, :128])
 
 
 def test_paper_wrappers_load_without_torch(model, images):

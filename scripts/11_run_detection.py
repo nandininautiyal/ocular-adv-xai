@@ -53,6 +53,7 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
 
 from src.attacks.blackbox import monocle_blending, patch_occlusion  # noqa: E402
+from src.attacks.budget import levels_to_epsilon, quantise  # noqa: E402
 from src.attacks.whitebox import ATTACK_REGISTRY  # noqa: E402
 from src.detect.consistency import RobustZFusion, detection_features, score_columns  # noqa: E402
 from src.detect.evaluate import attack_clustering, auroc, leave_one_attack_out, tpr_at_fpr  # noqa: E402
@@ -68,23 +69,6 @@ def load_image(path):
     """(256, 256, 3) float32 in [0, 1], loaded like flow_from_directory does (nearest)."""
     img = tf.keras.utils.load_img(path, target_size=(256, 256))
     return np.asarray(img, dtype=np.float32) / 255.0
-
-
-def quantise(images, reference=None, epsilon=None):
-    """Round to the 8-bit grid a saved image has: what a deployed system actually receives.
-
-    With *reference* (the clean images, already on the grid) and *epsilon*, the result is
-    also clipped to the largest whole number of 8-bit levels within the budget, so rounding
-    never pushes a perturbation past epsilon (e.g. epsilon = 0.03 allows 7 levels, not 8).
-    """
-    images = np.asarray(images, dtype=np.float32)
-    out = np.round(np.clip(images, 0.0, 1.0) * 255.0) / 255.0
-    if reference is not None and epsilon is not None:
-        # budgets are written to ~5 decimals (0.0078431 * 255 = 1.99999), so allow for that
-        levels = np.floor(epsilon * 255.0 + 1e-3) / 255.0
-        reference = np.asarray(reference, dtype=np.float32)
-        out = np.clip(out, reference - levels, reference + levels)
-    return out.astype(np.float32)
 
 
 def resolve_path(row, data_root):
@@ -153,9 +137,13 @@ def main():
                     help="CSV with a link_path column (features_<tag>.csv of an earlier run); those "
                          "images are not used, e.g. to keep a final run disjoint from its pilot")
     ap.add_argument("--attacks", default="fgsm,bim,pgd,mim,cw,patch,monocle")
-    ap.add_argument("--epsilons", default="0.0039216,0.0078431,0.0156863",
-                    help="L-inf budgets: 1/255, 2/255 and 4/255. Budgets below 1/255 are not representable in "
-                         "8 bits and are only meaningful with --no-quantise")
+    budget = ap.add_mutually_exclusive_group()
+    budget.add_argument("--epsilons", default="0.0039216,0.0078431,0.0156863",
+                        help="L-inf budgets: 1/255, 2/255 and 4/255. Budgets below 1/255 are not representable "
+                             "in 8 bits and are only meaningful with --no-quantise")
+    budget.add_argument("--levels", default=None,
+                        help="L-inf budgets as whole 8-bit levels instead of --epsilons, e.g. 1,2,4 (= 1/255, "
+                             "2/255, 4/255, written to 7 decimals like the --epsilons defaults)")
     ap.add_argument("--no-quantise", action="store_true",
                     help="keep attacked images in float32. Default: round every attacked image to the "
                          "8-bit grid before success and detection scores are computed")
@@ -174,7 +162,16 @@ def main():
             print("memory growth:", e)
 
     attacks = [a.strip() for a in args.attacks.split(",") if a.strip()]
-    epsilons = [float(e) for e in args.epsilons.split(",")]
+    if args.levels is not None:
+        usage = f"--levels {args.levels}: give whole numbers of 8-bit levels from 1 to 255, e.g. 1,2,4"
+        try:
+            epsilons = [round(levels_to_epsilon(int(n)), 7) for n in args.levels.split(",") if n.strip()]
+        except ValueError as err:
+            ap.error(f"{usage} ({err})")
+        if not epsilons or min(epsilons) <= 0:
+            ap.error(usage)
+    else:
+        epsilons = [float(e) for e in args.epsilons.split(",")]
     transforms = [t.strip() for t in args.transforms.split(",") if t.strip()]
     xai_names = [x.strip() for x in args.xai.split(",") if x.strip()]
     for name in attacks:
