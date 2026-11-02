@@ -29,6 +29,19 @@ Protocols (--modes, any combination):
       template of another person (a probe is never scored against another class of its own
       person). Bootstrap clusters and n_subjects are persons. Subsets: --external-subsets
       (default camera distance and glasses), by the probe.
+      --x1-protocol alonso2025 replaces this pairing (not the crops) with that of
+      Alonso-Fernandez et al. 2025 (arXiv 2510.26282): one frontal image per eye, session and
+      distance (--x1-frontal) of the persons with two sessions; both eyes are one identity, so
+      crops with the manifest's eye 'L' (nose on the crop's right) are flipped horizontally
+      before embedding; single images are compared (no templates): session 1 at Di against
+      session 2 at Di (genuine, same person) or both sessions at Dj, i < j (genuine,
+      cross-distance), and session 1 at Di against session 2 at Dj of every other person
+      (impostor), with D1 = 8 m ... D5 = 4 m. The paper reports 8,600 genuine and 438,600
+      impostor scores (86 persons, 1,718 images); the summary JSON gives ours next to theirs.
+      Subsets: all, intra, cross and each of the 15 distance combinations. No rank-1 (no
+      gallery). Their crops (a 7.6 Rs square around the sclera centre, from their own manual
+      sclera annotation, which UBIPr's files do not hold) are NOT reproduced: both protocols
+      use 20's corner-based VISOB-like crops.
 
 Probes are compared only with templates (p1: images) of the same eye; a probe whose
 subject has no enrollment template for that eye is left out and counted. Per-device and
@@ -51,6 +64,7 @@ Usage (Kaggle, checkpoint dataset and VISOB attached, 01 already run):
 Cross-dataset (VISOB not needed; 20_prepare_ubipr.py already run):
   python scripts/15_eval_verification.py --ckpt <checkpoint>.keras --modes x1 \
       --external-manifest /kaggle/working/ubipr/ubipr_manifest.csv --tag ubipr
+  the pairing of Alonso-Fernandez et al. 2025: add --x1-protocol alonso2025 and another --tag
 Any arch of 03 --arch loads. The attnet_gate model needs the eye masks at test time: add
 --region-masks masks64_<tag>.npz (21) or masks_<tag>.npz (17) covering every embedded image
 (matched by condition, phase and file name; a missing mask stops the run). Other archs ignore it.
@@ -74,10 +88,12 @@ import tensorflow as tf
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
-from src.eval.verification import (BINS_PER_UNIT, FARS, bootstrap_metrics, build_templates, cmc,  # noqa: E402
-                                   embed, error_rates_from_counts, exclude_same_person, far_key,
-                                   metrics_from_counts, pair_counts, rank1_ci, ranks, roc_from_counts,
-                                   template_counts, template_scores)
+from src.eval.verification import (ALONSO2025_DISTANCES, ALONSO2025_PAPER, BINS_PER_UNIT, FARS,  # noqa: E402
+                                   alonso2025_nominal_counts, alonso2025_pairs, alonso2025_select,
+                                   bootstrap_metrics, build_templates, cmc, embed, error_rates_from_counts,
+                                   exclude_same_person, far_key, metrics_from_counts, pair_counts,
+                                   pair_list_counts, rank1_ci, ranks, roc_from_counts, template_counts,
+                                   template_scores)
 from src.models.arcface_inference import load_checkpoint  # noqa: E402
 from src.models.anatomy_model import embed_regions, feature_grid, model_arch, region_classes  # noqa: E402
 
@@ -93,6 +109,13 @@ PROTOCOLS = {
 }
 X1_CAVEAT = ("zero-shot cross-dataset and cross-sensor: a VISOB (smartphone) model on {name} images, eye crops "
              "re-framed from landmarks by 20_prepare_ubipr.py; n_subjects counts persons")
+X1_PROTOCOLS = ("ours", "alonso2025")
+X1_ALONSO_PROTOCOL = ("zero-shot cross-dataset verification, pairing of Alonso-Fernandez et al. 2025: single frontal "
+                      "images, session 1 vs session 2 within and across distances, both eyes one identity")
+X1_ALONSO_CAVEAT = ("pairing of Alonso-Fernandez et al. 2025 (frontal image per eye, session and distance; left-eye "
+                    "crops flipped; both eyes one identity), but on 20_prepare_ubipr.py's corner-based VISOB-like "
+                    "crops, not their 7.6 Rs squares around the sclera centre, and on this archive's images and "
+                    "persons, so the numbers of comparisons differ from theirs (see the summary JSON)")
 VISOB_MODES = ("p1", "p2", "p3")
 P1_CAVEAT = ("inflated by near-duplicate frames: consecutive frames of one bucket sit on both sides of a pair "
              "and in training; reproduces the base-paper protocol only")
@@ -171,10 +194,12 @@ def in_paper_classes(subjects):
     return ((s >= 1141) & (s <= 3279)) | (s == 7000)
 
 
-def load_image(path):
-    """(256, 256, 3) float32 in [0, 1], loaded like flow_from_directory does (nearest)."""
+def load_image(path, flip=False):
+    """(256, 256, 3) float32 in [0, 1], loaded like flow_from_directory does (nearest); flip: mirrored
+    left-right (x1 with --x1-protocol alonso2025: the crops of the eye labelled 'L')."""
     img = tf.keras.utils.load_img(path, target_size=(256, 256))
-    return np.asarray(img, dtype=np.float32) / 255.0
+    img = np.asarray(img, dtype=np.float32) / 255.0
+    return np.ascontiguousarray(img[:, ::-1]) if flip else img
 
 
 def git_commit():
@@ -217,7 +242,7 @@ def training_info(ckpt, class_index=None):
     return seen, source, phases
 
 
-def caveats(mode, train_phases, external_name="ubipr"):
+def caveats(mode, train_phases, external_name="ubipr", x1_protocol="ours"):
     """What a reader must know before quoting this mode's numbers for this checkpoint."""
     if mode == "p1":
         notes = [P1_CAVEAT]
@@ -237,8 +262,34 @@ def caveats(mode, train_phases, external_name="ubipr"):
             return [f"this checkpoint was trained on {train_phases['verification']} verification images, so p2 "
                     "is not cross-session for it and is inflated"]
     if mode == "x1":
-        return [X1_CAVEAT.format(name=external_name)]
+        return [X1_CAVEAT.format(name=external_name)] + ([X1_ALONSO_CAVEAT] if x1_protocol == "alonso2025" else [])
     return []
+
+
+def protocol_text(mode, args):
+    """The protocol description of a mode (x1: of the --x1-protocol in use)."""
+    if mode == "x1" and getattr(args, "x1_protocol", "ours") == "alonso2025":
+        return X1_ALONSO_PROTOCOL
+    return PROTOCOLS[mode]
+
+
+ALONSO_COLS = ("cam_distance", "pose", "gaze", "image_idx")
+
+
+def alonso2025_table(manifest, rule="closest"):
+    """x1 image table of --x1-protocol alonso2025: the usable images of external_table, then one frontal image
+    per class, session and distance of the persons with both sessions (alonso2025_select), with the distance index
+    D1 = 8 m ... D5 = 4 m and flip = True for the eye 'L'. Returns (table, number of unusable rows dropped)."""
+    table, unusable = external_table(manifest, ALONSO_COLS)
+    other = sorted(set(table.cam_distance.unique().tolist()) - set(ALONSO2025_DISTANCES))
+    if other:
+        raise SystemExit(f"{manifest}: camera distances {other} are not UBIPr's {list(ALONSO2025_DISTANCES)} m")
+    keep = alonso2025_select(table.subject, table.person, np.where(table.phase == "enrollment", 1, 2),
+                             table.cam_distance, table.pose, table.gaze, table.image_idx, rule)
+    table = table[keep].reset_index(drop=True)
+    table["distance_index"] = table.cam_distance.map({d: k + 1 for k, d in enumerate(ALONSO2025_DISTANCES)})
+    table["flip"] = (table.eye == "L").to_numpy()
+    return table, unusable
 
 
 def select_images(modes, args, seen):
@@ -259,7 +310,10 @@ def select_images(modes, args, seen):
             raise SystemExit(f"{args.p3_list} holds {int((~unseen).sum())} images of training subjects; "
                              "p3 must be open-set (use 02 --protocol open_set)")
         selected["p3"] = table[unseen]
-    if "x1" in modes:                     # the external dataset: its own manifest and root
+    if "x1" in modes and getattr(args, "x1_protocol", "ours") == "alonso2025":
+        selected["x1"], args.external_unusable = alonso2025_table(args.external_manifest,
+                                                                  getattr(args, "x1_frontal", "closest"))
+    elif "x1" in modes:                   # the external dataset: its own manifest and root
         selected["x1"], args.external_unusable = external_table(args.external_manifest,
                                                                 external_subset_cols(args))
     for mode, df in selected.items():
@@ -275,16 +329,21 @@ def external_subset_cols(args):
     return tuple(c.strip() for c in (getattr(args, "external_subsets", None) or "").split(",") if c.strip())
 
 
-def embed_images(model, relpaths, root, batch_size, workers, region_of=None):
+def embed_images(model, relpaths, root, batch_size, workers, region_of=None, flips=None):
     """Embeddings (N, D) of root/<relpath>, in order, with progress and a time estimate.
 
     region_of: for a model with a region input (attnet_gate), a function relpaths -> (n, 8, 8, 1) regions.
+    flips: optional (N,) bool, True for the images to mirror left-right before embedding.
     """
     emb, t0 = None, time.time()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for start in range(0, len(relpaths), batch_size):
             batch = relpaths[start:start + batch_size]
-            images = np.stack(list(pool.map(load_image, [os.path.join(root, r) for r in batch])))
+            paths = [os.path.join(root, r) for r in batch]
+            if flips is None:
+                images = np.stack(list(pool.map(load_image, paths)))
+            else:
+                images = np.stack(list(pool.map(load_image, paths, flips[start:start + batch_size])))
             if region_of is None:
                 e = embed(model, images, batch_size=batch_size)
             else:
@@ -438,6 +497,106 @@ def evaluate_templates(images, emb, args, mode, external=False):
     return rows, out_curve, sample, extra
 
 
+def distance_label(i):
+    """'D1(8m)' for the distance index i of the protocol of Alonso-Fernandez et al. 2025."""
+    return f"D{i}({ALONSO2025_DISTANCES[i - 1]}m)"
+
+
+def alonso2025_counts(images, pairs):
+    """Images and comparisons of --x1-protocol alonso2025 next to the paper's (for the summary JSON)."""
+    n_persons = int(images.person.nunique())
+    genuine, intra = pairs["genuine"], pairs["di"] == pairs["dj"]
+    nominal_g, nominal_i = alonso2025_nominal_counts(n_persons)
+    combos = {}
+    for i, j in sorted(set(zip(pairs["di"].tolist(), pairs["dj"].tolist()))):
+        at = (pairs["di"] == i) & (pairs["dj"] == j)
+        combos[f"{distance_label(i)}-{distance_label(j)}"] = {"genuine": int((at & genuine).sum()),
+                                                              "impostor": int((at & ~genuine).sum())}
+    cells = images.groupby(["subject", "phase", "cam_distance"]).size()
+    return {"persons": n_persons, "classes": int(images.subject.nunique()), "images": len(images),
+            "images_by_session": {"1": int((images.phase == "enrollment").sum()),
+                                  "2": int((images.phase == "verification").sum())},
+            "images_by_cam_distance": {str(k): int(v)
+                                       for k, v in images.cam_distance.value_counts().sort_index().items()},
+            "images_annotated_frontal": int(((images.pose == 0) & (images.gaze == 0)).sum()),
+            "images_flipped": int(images.flip.sum()),
+            "eye_class_session_distance_cells_missing": 4 * len(ALONSO2025_DISTANCES) * n_persons - len(cells),
+            "genuine": int(genuine.sum()), "genuine_intra": int((genuine & intra).sum()),
+            "genuine_cross": int((genuine & ~intra).sum()), "impostor": int((~genuine).sum()),
+            "by_combination": combos,
+            "nominal_for_these_persons": {"genuine": nominal_g, "impostor": nominal_i,
+                                          "rule": "every person with all 20 images: 4 genuine per person and "
+                                                  "distance, 8 per person and cross-distance pair, 4 impostor "
+                                                  "per ordered pair of persons and combination"},
+            "paper": dict(ALONSO2025_PAPER),
+            "matches_paper": bool(int(genuine.sum()) == ALONSO2025_PAPER["genuine"]
+                                  and int((~genuine).sum()) == ALONSO2025_PAPER["impostor"])}
+
+
+def evaluate_alonso2025(images, emb, args, mode="x1"):
+    """x1 with --x1-protocol alonso2025: single-image comparisons of Alonso-Fernandez et al. 2025.
+
+    Every comparison is counted for the person of its session-1 image (the bootstrap clusters). Subsets: all,
+    intra (Di = Dj), cross (Di != Dj) and each distance combination present. Returns (rows, curve, score sample,
+    extra).
+    """
+    pairs = alonso2025_pairs(images.person.to_numpy(), np.where(images.phase == "enrollment", 1, 2),
+                             images.distance_index.to_numpy())
+    if not pairs["genuine"].any() or pairs["genuine"].all():
+        raise SystemExit(f"{mode} (alonso2025): no genuine or no impostor comparison; check the manifest")
+    rows_of = images.row.to_numpy()
+    similarity = emb[rows_of] @ emb[rows_of].T             # (n_images, n_images): a few MB, unlike per-pair rows
+    scores = similarity[pairs["first"], pairs["second"]].astype(np.float32)
+    clusters = images.person.to_numpy()[pairs["first"]]
+    intra = pairs["di"] == pairs["dj"]
+    groups = [("all", np.ones(len(scores), bool)), ("intra", intra), ("cross", ~intra)]
+    for i, j in sorted(set(zip(pairs["di"].tolist(), pairs["dj"].tolist()))):
+        groups.append((f"{distance_label(i)}-{distance_label(j)}", (pairs["di"] == i) & (pairs["dj"] == j)))
+    rows, global_thr, out_curve = [], {}, None
+    for name, mask in groups:
+        counts = pair_list_counts(scores[mask], pairs["genuine"][mask], clusters[mask])
+        row = {"subset": name, "subset_rule": "distance combination (session-1 image at Di, other image at Dj)",
+               "n_subjects": len(counts["subjects"]), "n_probes": int(np.unique(pairs["first"][mask]).size),
+               **score_row(counts["genuine"], counts["impostor"], args)}
+        row["rank1"] = row["rank1_ci_low"] = row["rank1_ci_high"] = float("nan")
+        row["rank1_method"] = "not defined: single-image pairs, no gallery"
+        if name == "all":
+            global_thr = {far_key(f): row[f"thr_at_far_{far_key(f)}"] for f in FARS}
+            out_curve = curve(counts["genuine"], counts["impostor"], row)
+        operating_points(row, counts["genuine"], counts["impostor"], global_thr, args.threshold)
+        rows.append(row)
+        print(f"  {mode} alonso2025 {name}: {row['n_genuine']} genuine / {row['n_impostor']} impostor | "
+              f"EER {row['eer']:.4f} | TAR@FAR=1e-3 {row['tar_at_far_1e-3']:.4f}", flush=True)
+    pair_info = alonso2025_counts(images, pairs)
+    extra = {"x1_protocol": "alonso2025", "frontal_rule": getattr(args, "x1_frontal", "closest"),
+             "n_persons": pair_info["persons"],
+             "n_unusable_images_left_out": int(getattr(args, "external_unusable", 0)),
+             "bootstrap_clusters": "persons (of the session-1 image)", "pair_counts": pair_info}
+    print(f"  {mode} alonso2025: {pair_info['persons']} persons, {pair_info['images']} images, "
+          f"{pair_info['genuine']} genuine / {pair_info['impostor']} impostor comparisons (paper: "
+          f"{ALONSO2025_PAPER['persons']} persons, {ALONSO2025_PAPER['images']} images, "
+          f"{ALONSO2025_PAPER['genuine']} / {ALONSO2025_PAPER['impostor']})", flush=True)
+    sample = sample_pair_list_scores(images, pairs, scores, args.sample_scores, args.seed, mode)
+    return rows, out_curve, sample, extra
+
+
+def sample_pair_list_scores(images, pairs, scores, n, seed, mode):
+    """Uniform samples of the genuine and impostor comparisons of an explicit pair list, with their scores."""
+    rng = np.random.default_rng(seed)
+    relpath, subject = images.relpath.to_numpy(), images.subject.to_numpy()
+    cols = ("relpath", "subject", "person", "eye", "cam_distance")
+    frames = []
+    for kind, is_kind in (("genuine", pairs["genuine"]), ("impostor", ~pairs["genuine"])):
+        idx = np.flatnonzero(is_kind)
+        pick = np.sort(rng.choice(idx, min(n, len(idx)), replace=False))
+        a, b = pairs["first"][pick], pairs["second"][pick]
+        frame = _sample_frame(mode, kind, scores[pick], images, a, relpath[b], subject[b], cols)
+        frame["combination"] = [f"{distance_label(i)}-{distance_label(j)}"
+                                for i, j in zip(pairs["di"][pick], pairs["dj"][pick])]
+        frames.append(frame)
+    return pd.concat(frames)
+
+
 def _sample_frame(mode, kind, score, images, first, other, other_subject, cols=None):
     """Sampled comparisons: the first image's metadata, what it was compared with, and the score."""
     cols = {c: images[c].to_numpy()[first] for c in (cols or ("relpath", "subject", "eye", "device", "lighting"))}
@@ -580,7 +739,15 @@ def main():
                     help="root of the external relpaths (default: the folder of --external-manifest)")
     ap.add_argument("--external-name", default="ubipr", help="name of the external dataset in outputs and notes")
     ap.add_argument("--external-subsets", default="cam_distance,glasses",
-                    help="comma-separated manifest columns that split x1 into subsets (by the probe)")
+                    help="comma-separated manifest columns that split x1 into subsets (by the probe; "
+                         "--x1-protocol ours only)")
+    ap.add_argument("--x1-protocol", choices=X1_PROTOCOLS, default="ours",
+                    help="x1 pairing: ours (session-1 class templates vs session-2 probes, same eye label; the "
+                         "default) or alonso2025 (Alonso-Fernandez et al. 2025: single frontal images, session 1 vs "
+                         "session 2 within and across distances, both eyes one identity, 'L' crops flipped)")
+    ap.add_argument("--x1-frontal", choices=("closest", "strict"), default="closest",
+                    help="alonso2025: the frontal image per eye, session and distance: closest (smallest |pose| + "
+                         "|gaze|) or strict (annotated pose 0 and gaze 0 only)")
     ap.add_argument("--max-subjects", type=int, default=None,
                     help="smoke run: keep the first N subjects of each mode (x1: the first N persons)")
     ap.add_argument("--batch-size", type=int, default=64)
@@ -637,7 +804,10 @@ def main():
         if mode == "x1":
             print(f"  x1: {args.external_name} from {external_root}: {df.person.nunique()} persons, subjects are "
                   f"classes (one eye each); {getattr(args, 'external_unusable', 0)} unusable images left out")
-        for note in caveats(mode, train_phases, args.external_name):
+        if mode == "x1" and args.x1_protocol == "alonso2025":
+            print(f"  x1 protocol: alonso2025 (frontal rule {args.x1_frontal}): {len(df)} images, "
+                  f"{int(df.flip.sum())} flipped ('L'); --external-subsets is not used")
+        for note in caveats(mode, train_phases, args.external_name, args.x1_protocol):
             print(f"  NOTE ({mode}): {note}")
 
     timing, t = {}, time.time()
@@ -660,7 +830,8 @@ def main():
         print(f"embedding {len(ext_relpaths)} {args.external_name} images (batch {args.batch_size}) from "
               f"{external_root}", flush=True)
         t = time.time()
-        emb_x = embed_images(model, ext_relpaths, external_root, args.batch_size, args.workers, region_of)
+        flips = selected["x1"].flip.to_numpy() if args.x1_protocol == "alonso2025" else None
+        emb_x = embed_images(model, ext_relpaths, external_root, args.batch_size, args.workers, region_of, flips)
         timing["embedding_x1_s"] = round(time.time() - t, 1)
         selected["x1"]["row"] = np.arange(len(ext_relpaths))
 
@@ -669,23 +840,25 @@ def main():
         t = time.time()
         if mode == "p1":
             rows, c, sample, extra = evaluate_pairs(selected[mode], emb, args)
+        elif mode == "x1" and args.x1_protocol == "alonso2025":
+            rows, c, sample, extra = evaluate_alonso2025(selected[mode], emb_x, args, mode)
         elif mode == "x1":
             rows, c, sample, extra = evaluate_templates(selected[mode], emb_x, args, mode, external=True)
         else:
             rows, c, sample, extra = evaluate_templates(selected[mode], emb, args, mode)
         timing[f"{mode}_s"] = round(time.time() - t, 1)
-        notes = caveats(mode, train_phases, args.external_name)
+        notes = caveats(mode, train_phases, args.external_name, args.x1_protocol)
         overall = rows[0]
         for target in FARS:
             key = far_key(target)
             if overall[f"far_achieved_{key}"] * overall["n_impostor"] < 30:
                 notes.append(f"TAR at FAR {key} rests on fewer than 30 accepted impostor comparisons (rule of 30)")
         for row in rows:
-            row.update({"mode": mode, "protocol": PROTOCOLS[mode], "caveat": "; ".join(notes)})
+            row.update({"mode": mode, "protocol": protocol_text(mode, args), "caveat": "; ".join(notes)})
         all_rows += rows
         curves[mode] = c
         samples.append(sample)
-        per_mode[mode] = {"protocol": PROTOCOLS[mode], "caveats": notes, "n_images": len(selected[mode]),
+        per_mode[mode] = {"protocol": protocol_text(mode, args), "caveats": notes, "n_images": len(selected[mode]),
                           **{k: overall[k] for k in overall if k not in ("mode", "protocol", "caveat", "subset")},
                           **extra, "seconds": timing[f"{mode}_s"]}
 
@@ -705,7 +878,7 @@ def main():
               ("verification_summary", "json"), ("embeddings", "npz"))}
     pd.DataFrame(all_rows).reindex(columns=columns).to_csv(paths["verification_metrics"], index=False)
     pd.concat(samples).to_csv(paths["verification_scores"], index=False)
-    labels = {m: f"{m.upper()} {'(inflated) ' if m == 'p1' else ''}{PROTOCOLS[m].split(':')[0]}: "
+    labels = {m: f"{m.upper()} {'(inflated) ' if m == 'p1' else ''}{protocol_text(m, args).split(':')[0]}: "
                  f"EER {100 * per_mode[m]['eer']:.2f}%, TAR@FAR=0.1% {100 * per_mode[m]['tar_at_far_1e-3']:.1f}%, "
                  f"rank-1 {100 * per_mode[m]['rank1']:.1f}%" for m in modes}
     if "x1" in labels:
@@ -715,7 +888,7 @@ def main():
         np.savez_compressed(paths["embeddings"], embeddings=emb.astype(np.float16), relpaths=np.array(relpaths))
     if args.save_embeddings and emb_x is not None:
         np.savez_compressed(os.path.join(args.out_dir, f"embeddings_{args.external_name}_{args.tag}.npz"),
-                            embeddings=emb_x.astype(np.float16), relpaths=selected["x1"].relpath.to_numpy())
+                            embeddings=emb_x.astype(np.float16), relpaths=np.array(selected["x1"].relpath.tolist()))
 
     timing["total_minutes"] = round((time.time() - t0) / 60, 1)
     summary = {"tag": args.tag, "ckpt": args.ckpt, "git_commit": git_commit(), "modes": modes,
@@ -734,10 +907,28 @@ def main():
                                "genuine": "probe and template of the same class (one eye of one person)",
                                "impostor": "template of another person, same eye label; a probe's comparisons with "
                                            "other classes of its own person are left out"}
+        if args.x1_protocol == "alonso2025":  # ours keeps exactly the keys and values above
+            summary["external"].update({
+                "protocol": "alonso2025", "frontal_rule": args.x1_frontal, "subsets": ["intra", "cross", "Di-Dj"],
+                "reference": "Alonso-Fernandez et al. 2025, arXiv 2510.26282, Sect. III-IV",
+                "identity": "person (both eyes); crops with eye 'L' (nose on the crop's right) flipped left-right",
+                "genuine": "single images of the same person: session 1 at Di vs session 2 at Di, or vs both sessions "
+                           "at Dj (i < j; D1 = 8 m ... D5 = 4 m)",
+                "impostor": "session 1 at Di vs session 2 at Dj (i <= j) of every other person",
+                "crops": "20_prepare_ubipr.py's corner-based VISOB-like crops, not the paper's 7.6 Rs squares "
+                         "around the sclera centre (UBIPr's annotation holds no sclera boundary)",
+                "pair_counts": per_mode["x1"]["pair_counts"]})
     with open(paths["verification_summary"], "w") as f:
         json.dump(summary, f, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
     for m in modes:
         r = per_mode[m]
+        if m == "x1" and args.x1_protocol == "alonso2025":
+            c = r["pair_counts"]
+            print(f"X1 alonso2025 comparisons: {c['genuine']} genuine / {c['impostor']} impostor of {c['persons']} "
+                  f"persons, {c['images']} images | paper: {c['paper']['genuine']} / {c['paper']['impostor']} of "
+                  f"{c['paper']['persons']} persons, {c['paper']['images']} images | nominal for {c['persons']} "
+                  f"complete persons: {c['nominal_for_these_persons']['genuine']} / "
+                  f"{c['nominal_for_these_persons']['impostor']}")
         print(f"{m.upper()}: EER {r['eer']:.4f} [{r['eer_ci_low']:.4f}, {r['eer_ci_high']:.4f}] | "
               f"TAR@FAR=1e-2 {r['tar_at_far_1e-2']:.4f} | TAR@FAR=1e-3 {r['tar_at_far_1e-3']:.4f} | "
               f"rank-1 {r['rank1']:.4f} | {r['n_subjects']} subjects, {r['n_genuine']} genuine / "
