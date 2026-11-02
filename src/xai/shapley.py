@@ -416,6 +416,14 @@ def _forward(model, images, output, batch_size):
     return np.concatenate(parts) if parts else np.zeros((0, net.n_classes), np.float32)
 
 
+def model_outputs(model, images, output="logits", batch_size=64):
+    """Margin-free logits (``output="logits"``, (N, C)) or L2-normalised embeddings
+    (``"embedding"``, (N, D)) of a batch of images, *batch_size* images per forward pass."""
+    if output not in ("logits", "embedding"):
+        raise ValueError(f"output must be 'logits' or 'embedding', got {output!r}")
+    return _forward(model, images, output, batch_size)
+
+
 def output_kind(score):
     """What a score needs from the model: "logits" or "embedding"."""
     if score not in SCORES:
