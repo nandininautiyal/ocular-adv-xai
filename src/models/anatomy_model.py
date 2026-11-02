@@ -134,16 +134,25 @@ class AttentionPool(tf.keras.layers.Layer):
     z_k = sum over cells of a_k * F. With a zero-initialised output bias every map
     starts close to uniform, i.e. close to global average pooling.
 
+    ``temperature`` (a fixed number, not a weight; default 1) divides the MLP output
+    before the softmax. It is never trained: it exists for the gradient-masking check
+    (src/attacks/masking.py), where a larger temperature flattens a saturated softmax.
+    At 1 the layer computes exactly what it did before the setting existed, and its
+    config leaves the key out, so models saved with or without it have the same file.
+
     Input F (N, H, W, C). Returns [z (N, K, C), maps (N, H, W, K)].
     """
 
-    def __init__(self, hidden=256, n_maps=1, map_names=None, **kwargs):
+    def __init__(self, hidden=256, n_maps=1, map_names=None, temperature=1.0, **kwargs):
         super().__init__(**kwargs)
         self.hidden = int(hidden)
         self.n_maps = int(n_maps)
         self.map_names = list(map_names) if map_names is not None else [f"map{k}" for k in range(self.n_maps)]
         if len(self.map_names) != self.n_maps:
             raise ValueError(f"{len(self.map_names)} map names for {self.n_maps} maps")
+        self.temperature = float(temperature)
+        if not (np.isfinite(self.temperature) and self.temperature > 0):
+            raise ValueError(f"temperature must be a positive number, got {temperature!r}")
 
     def build(self, input_shape):
         channels = int(input_shape[-1])
@@ -158,6 +167,8 @@ class AttentionPool(tf.keras.layers.Layer):
         n, h, w, c = shape[0], shape[1], shape[2], shape[3]
         hidden = tf.nn.relu(tf.einsum("nhwc,cd->nhwd", features, self.w1) + self.b1)
         logits = tf.einsum("nhwd,dk->nhwk", hidden, self.w2) + self.b2
+        if self.temperature != 1.0:                # at 1 the graph is the one trained models were saved with
+            logits = logits / self.temperature
         flat = tf.nn.softmax(tf.reshape(logits, (n, h * w, self.n_maps)), axis=1)
         pooled = tf.einsum("nsk,nsc->nkc", flat, tf.reshape(features, (n, h * w, c)))
         return [pooled, tf.reshape(flat, (n, h, w, self.n_maps))]
@@ -169,7 +180,23 @@ class AttentionPool(tf.keras.layers.Layer):
     def get_config(self):
         config = super().get_config()
         config.update({"hidden": self.hidden, "n_maps": self.n_maps, "map_names": self.map_names})
+        if self.temperature != 1.0:                # absent at 1: the saved config of every trained model
+            config["temperature"] = self.temperature
         return config
+
+    def shared_copy(self, temperature, name=None):
+        """A new AttentionPool on the same variables (no copies) with another temperature.
+
+        This layer must be built (the copy takes its weights); a model that uses the copy
+        shares every attention weight with the models that use this layer.
+        """
+        if not self.built:
+            raise ValueError(f"layer {self.name!r} is not built yet")
+        copy = AttentionPool(self.hidden, self.n_maps, self.map_names, temperature=temperature,
+                             name=name or self.name)
+        copy.w1, copy.b1, copy.w2, copy.b2 = self.w1, self.b1, self.w2, self.b2
+        copy.built = True
+        return copy
 
 
 @tf.keras.utils.register_keras_serializable(package="anatomy")
