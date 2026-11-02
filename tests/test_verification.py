@@ -16,9 +16,9 @@ from scipy.stats import norm
 
 from conftest import REPO, make_images
 from src.eval.verification import (N_BINS, THRESHOLDS, bootstrap_metrics, bootstrap_picks, build_templates,
-                                   cmc, embed, eer, error_rates, error_rates_from_counts, far_key,
-                                   metrics_from_counts, pair_counts, rank1, rank1_ci, ranks, roc, score_bins,
-                                   tar_at_far, template_counts, template_scores)
+                                   cmc, embed, eer, error_rates, error_rates_from_counts, exclude_same_person,
+                                   far_key, metrics_from_counts, pair_counts, rank1, rank1_ci, ranks, roc,
+                                   score_bins, tar_at_far, template_counts, template_scores)
 from src.models.arcface_inference import find_arcface_layer, predict_logits
 
 
@@ -189,6 +189,56 @@ def test_templates_scores_and_ranks():
     np.testing.assert_array_equal(counts["subjects"], [100])
     np.testing.assert_array_equal(counts["genuine"][0], _counts(scores[own]))
     np.testing.assert_array_equal(counts["impostor"][0], _counts(scores[~own & ~np.isnan(scores)]))
+
+
+def test_exclude_same_person_leaves_out_other_classes_of_the_probe_person():
+    # templates: classes 1, 2 (person 1), 3 (person 3), 5 (person 3: enrolled twice); probes of classes 1, 3, 5
+    scores = np.array([[0.9, 0.8, 0.1, np.nan], [0.2, 0.3, 0.7, 0.6], [0.4, 0.1, 0.95, 0.5]], np.float32)
+    own = np.array([[1, 0, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]], bool)
+    out, n = exclude_same_person(scores, own, probe_persons=[1, 3, 3], template_persons=[1, 1, 3, 3])
+    assert n == 3 and out.dtype == np.float32                       # (0, 1), (1, 3), (2, 2); NaN stays NaN
+    expected = scores.copy()
+    expected[0, 1] = expected[1, 3] = expected[2, 2] = np.nan
+    np.testing.assert_array_equal(out, expected)
+    np.testing.assert_array_equal(scores[0], np.float32([0.9, 0.8, 0.1, np.nan]))   # input untouched
+    # probe 2's best other template (class 3, 0.95) is the same person: left out, so its own template ranks first
+    np.testing.assert_array_equal(ranks(scores, own), [1, 1, 2])
+    np.testing.assert_array_equal(ranks(out, own), [1, 1, 1])
+    counts = template_counts(out, own, [1, 3, 3])
+    assert counts["genuine"].sum() == 3 and counts["impostor"].sum() == 5
+    same, n_same = exclude_same_person(scores, own, [1, 3, 5], [1, 2, 3, 5])   # classes as persons: no change
+    assert n_same == 0
+    np.testing.assert_array_equal(same, scores)
+
+
+def test_external_manifest_selection(tmp_path):
+    script = _eval_script()
+    rows = [(f"crops/C{c}_S{s}_I{i}.png", c, (c + 1) // 2, "L" if c % 2 else "R", s, int(not (c == 3 and i == 2)),
+             4 if i == 1 else 8, "No") for c in (1, 2, 3, 4, 5) for s in (1, 2) for i in (1, 2)]
+    df = pd.DataFrame(rows, columns=["relpath", "class_id", "person_id", "eye", "session", "usable", "cam_distance",
+                                     "glasses"])
+    df.sample(frac=1, random_state=0).to_csv(tmp_path / "ubipr_manifest.csv", index=False)
+    args = argparse.Namespace(external_manifest=str(tmp_path / "ubipr_manifest.csv"), max_subjects=None,
+                              external_subsets="cam_distance,glasses")
+    table = script.select_images(["x1"], args, None)["x1"]
+    assert args.external_unusable == 2 and len(table) == 18 and table.relpath.is_monotonic_increasing
+    assert list(table.columns) == ["relpath", "subject", "person", "phase", "eye", "cam_distance", "glasses"]
+    assert set(zip(table.subject, table.person)) == {(1, 1), (2, 1), (3, 2), (4, 2), (5, 3)}
+    assert (table.phase == np.where(table.relpath.str.contains("_S1_"), "enrollment", "verification")).all()
+    args.max_subjects = 2                                               # smoke run: the first 2 persons, both eyes
+    assert sorted(script.select_images(["x1"], args, None)["x1"].subject.unique()) == [1, 2, 3, 4]
+    assert script.caveats("x1", None, "ubipr")[0].startswith("zero-shot cross-dataset")
+    assert [name for name, _ in script.subsets(table, ("cam_distance", "glasses"))] == [
+        "all", "cam_distance=4", "cam_distance=8", "glasses=No"]
+    df.drop(columns="person_id").assign(usable=1).to_csv(tmp_path / "no_person.csv", index=False)
+    no_person, unusable = script.external_table(tmp_path / "no_person.csv")
+    assert unusable == 0 and (no_person.person == no_person.subject).all()    # classes as persons
+    df.drop(columns="glasses").to_csv(tmp_path / "no_glasses.csv", index=False)
+    with pytest.raises(SystemExit, match="glasses"):
+        script.external_table(tmp_path / "no_glasses.csv", ("cam_distance", "glasses"))
+    df.assign(session=3).to_csv(tmp_path / "session3.csv", index=False)
+    with pytest.raises(SystemExit, match="sessions"):
+        script.external_table(tmp_path / "session3.csv")
 
 
 # ------------------------------------------------------- confidence intervals
