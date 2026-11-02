@@ -19,15 +19,76 @@ exactly the ones flow_from_directory picks by default. The run stops if a class 
 training images and warns if one has no validation or test images. The subject -> index
 map is saved as class_index_<tag>.json next to the checkpoint.
 
+Training recipe (all optional; without them a run trains exactly as before):
+  --cfg          configs/baseline.yml (default: the base paper's 10 epochs, with EarlyStopping
+                 and ReduceLROnPlateau settings that never act) or configs/cross_session.yml
+                 (a real schedule: up to 30 epochs, early stopping with the best weights
+                 restored, learning-rate drops; the file's comments say why)
+  --seed         seed of tf.keras.utils.set_random_seed (default 42, the seed of every earlier
+                 run); recorded in run_<tag>.json
+  --resume       back up the training state after every epoch (tf.keras BackupAndRestore in
+                 <out-dir>/backup_<tag>), so that a run Kaggle stops at its 12-hour limit
+                 continues from the last finished epoch when the SAME command is run again
+                 with the same --out-dir and --tag (copy backup_<tag>/, log_<tag>.csv and the
+                 checkpoint back into --out-dir first). BackupAndRestore keeps the model, the
+                 optimizer (incl. the learning rate) and the epoch; the state of EarlyStopping,
+                 ReduceLROnPlateau and ModelCheckpoint (best val_loss, waits, best epoch) is
+                 kept next to it in backup_<tag>/callback_state.json, and EarlyStopping's best
+                 weights are reloaded from the checkpoint. The checkpoint is written to
+                 <name>.partial.keras and then renamed, so a stop while it is saved leaves the
+                 old best intact. log_<tag>.csv is appended; an epoch that was logged but not
+                 backed up before the stop keeps only the row of its second run. The backup is
+                 removed right after run_<tag>.json is written; running the same command again
+                 after that trains nothing (the record says finished, with the same arguments)
+                 instead of starting from scratch over the checkpoint, and a run that early
+                 stopping had ended trains no further epoch. Without --resume a left-over backup
+                 is ignored, with a warning. A resumed run is not bit-identical to an
+                 uninterrupted one: the random streams (augmentation, batch order) restart
+                 from the seed.
+  --reshuffle    draw new training batches after every epoch. Keras calls on_epoch_end of the
+                 training Sequence after each epoch, but the vendored CustomDataGen does not
+                 pass it on to its DirectoryIterator, so without this flag every epoch reuses
+                 the batches drawn at the start of the run (fit only shuffles their order).
+  --save-weights also write Xception_ArcFace_<tag>.weights.h5: the best checkpoint's weights
+                 without the optimizer state (smaller; load them with model.load_weights into
+                 a model built from the same cfg)
+
+Writes to --out-dir:
+  Xception_ArcFace_<tag>.keras       best checkpoint (lowest val_loss)
+  class_index_<tag>.json             subject -> class index
+  log_<tag>.csv                      CSVLogger, one row per epoch (all sessions with --resume)
+  history_<tag>.csv                  per-epoch metrics (all sessions with --resume)
+  results_<tag>.json                 test accuracies, margin-free and with labels
+  run_<tag>.json                     run record, written right after training (before the test
+                                     evaluation): git commit and dirty flag, argv and parsed
+                                     args, the effective cfg, package versions, split dir,
+                                     images per split and per phase, sha256 of the sorted class
+                                     list (UTF-8, names joined with "\n"), epochs run (all
+                                     sessions), best epoch (1-based) and its val_loss, training
+                                     minutes (this session and all sessions), resumed yes/no,
+                                     checkpoint path and sha256, and the weights file with
+                                     --save-weights
+  Xception_ArcFace_<tag>.weights.h5  with --save-weights
+  backup_<tag>/                      with --resume, while training is unfinished
+
 Usage:
   python scripts/03_train_baseline.py --split-dir /tmp/ocular_small --n-classes 30 --epochs 2 --tag small
   python scripts/03_train_baseline.py --split-dir /tmp/ocular_recognition --n-classes 300 --epochs 10 --tag full
   python scripts/03_train_baseline.py --split-dir /tmp/ocular_cross_session --n-classes 300 --epochs 10 --tag cs
+Cross-session model with the real schedule, resumable over Kaggle sessions (run the same
+command again in the next session):
+  python scripts/03_train_baseline.py --split-dir /tmp/ocular_cross_session --n-classes 300 \
+      --cfg configs/cross_session.yml --reshuffle --resume --save-weights --tag cs
 """
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; must be set before importing tensorflow
 import argparse
+import hashlib
+import importlib.metadata
 import json
+import platform
+import shutil
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -35,7 +96,8 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-from tensorflow.keras.callbacks import CSVLogger, EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.callbacks import (BackupAndRestore, Callback, CSVLogger, EarlyStopping, ModelCheckpoint,
+                                        ReduceLROnPlateau)
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -58,12 +120,22 @@ def accuracies(model, gen, n_classes):
 
 
 class ClassListDataGen(CustomDataGen):
-    """The vendored CustomDataGen with an explicit class list (the vendored one takes none)."""
+    """The vendored CustomDataGen with an explicit class list (the vendored one takes none).
+
+    reshuffle : pass Keras' on_epoch_end on to the DirectoryIterator, which then draws a new
+                image order, so that every epoch has new batches. The vendored class drops the
+                call, and its batches keep the composition drawn at the start of the run.
+    """
 
     def __init__(self, directory, datagen, classes, batch_size=32, target_size=(256, 256),
-                 class_mode="categorical"):
+                 class_mode="categorical", reshuffle=False):
         self.generator = datagen.flow_from_directory(directory, target_size=target_size, batch_size=batch_size,
                                                      class_mode=class_mode, classes=classes)
+        self.reshuffle = reshuffle
+
+    def on_epoch_end(self):
+        if self.reshuffle:
+            self.generator.on_epoch_end()
 
 
 def class_list(split_dir, splits=("train", "validation", "test")):
@@ -101,6 +173,269 @@ def images_by_phase(filenames):
     return dict(sorted(phases.items()))
 
 
+def class_list_sha256(classes):
+    """sha256 of the sorted class list: UTF-8, the names joined with "\\n"."""
+    return hashlib.sha256("\n".join(classes).encode("utf-8")).hexdigest()
+
+
+def file_sha256(path, chunk_size=1 << 20):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_state():
+    """(commit, has uncommitted changes) of the repository this script runs from; (None, None) without git."""
+    def git(*cmd):
+        return subprocess.run(["git", "--no-optional-locks", *cmd], cwd=REPO, capture_output=True, text=True,
+                              timeout=30, check=True).stdout.strip()
+    try:
+        return git("rev-parse", "HEAD") or None, bool(git("status", "--porcelain"))
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+
+
+def package_versions():
+    out = {"python": platform.python_version(), "numpy": np.__version__, "tensorflow": tf.__version__}
+    try:
+        out["tf_keras"] = importlib.metadata.version("tf-keras")
+    except importlib.metadata.PackageNotFoundError:
+        out["tf_keras"] = None
+    return out
+
+
+def backup_exists(backup_dir):
+    """True if BackupAndRestore left a training state in *backup_dir* (it writes to <backup_dir>/chief)."""
+    return tf.train.latest_checkpoint(os.path.join(backup_dir, "chief")) is not None
+
+
+def backup_epoch(backup_dir):
+    """Last epoch (0-based) held by the backup in *backup_dir*; None without a backup or if it cannot be read."""
+    try:
+        latest = tf.train.latest_checkpoint(os.path.join(backup_dir, "chief"))
+        return int(tf.train.load_checkpoint(latest).get_tensor("ckpt_saved_epoch/.ATTRIBUTES/VARIABLE_VALUE"))
+    except Exception:
+        return None
+
+
+class ResumeState(Callback):
+    """What BackupAndRestore does not back up: the state of EarlyStopping, ReduceLROnPlateau and
+    ModelCheckpoint, and the training minutes of earlier sessions.
+
+    Without it a resumed run restarts those callbacks from scratch: ModelCheckpoint overwrites
+    the best checkpoint with the first resumed epoch, EarlyStopping and ReduceLROnPlateau forget
+    how long val_loss has not improved, and EarlyStopping with restore_best_weights "restores"
+    the weights of the first resumed epoch.
+
+    The state after every epoch is kept by epoch in *path* (JSON, replaced atomically). It is
+    written before BackupAndRestore backs up the same epoch (this callback comes first in the
+    list), so the state of the epoch a backup holds is always there; on resume, the first
+    on_epoch_begin restores the state of the epoch before it. A session with no epoch left to
+    train (stopped after the last backup, before the run record) restores the state of the last
+    epoch at on_train_end instead, so that the run record still covers every session.
+    """
+
+    def __init__(self, path, early_stop, reduce_lr, checkpoint, ckpt_path):
+        super().__init__()
+        self.path, self.ckpt_path = path, ckpt_path
+        self.early_stop, self.reduce_lr, self.checkpoint = early_stop, reduce_lr, checkpoint
+        self.epochs = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                self.epochs = json.load(f)["epochs"]
+        self.initial_epoch = None
+        self.minutes_before = 0.0
+        self.t0 = time.time()
+
+    def on_train_begin(self, logs=None):
+        self.t0 = time.time()
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if self.initial_epoch is not None:
+            return
+        self.initial_epoch = epoch
+        if epoch > 0:
+            self.restore(epoch - 1)
+
+    def on_train_end(self, logs=None):
+        if self.initial_epoch is None and self.epochs:
+            self.restore(max(map(int, self.epochs)), resuming=False)
+
+    def early_stopped_at(self):
+        """Last epoch (0-based) at which EarlyStopping had stopped the run in the saved state, else None."""
+        stopped = [int(e) for e, s in self.epochs.items() if s["early_stopping"]["stopped_epoch"] > 0]
+        return max(stopped) if stopped else None
+
+    def restore(self, epoch, resuming=True):
+        """Put back the callback state saved after *epoch*; *resuming*: also EarlyStopping's best weights."""
+        state = self.epochs.get(str(epoch))
+        if state is None:
+            print(f"WARNING: no callback state for epoch {epoch + 1} in {self.path}; EarlyStopping, "
+                  "ReduceLROnPlateau and ModelCheckpoint start afresh")
+            return
+        es, rlr = state["early_stopping"], state["reduce_lr"]
+        self.early_stop.wait, self.early_stop.best = es["wait"], es["best"]
+        self.early_stop.best_epoch, self.early_stop.stopped_epoch = es["best_epoch"], es["stopped_epoch"]
+        self.reduce_lr.wait, self.reduce_lr.best = rlr["wait"], rlr["best"]
+        self.reduce_lr.cooldown_counter = rlr["cooldown_counter"]
+        self.minutes_before = state["minutes"]
+        if os.path.exists(self.ckpt_path):
+            self.checkpoint.best = state["checkpoint"]["best"]
+        else:   # without the old best checkpoint, the next epoch must write one whatever its val_loss
+            print(f"WARNING: {self.ckpt_path} not found (copy it back into --out-dir before resuming); the next "
+                  "epoch writes a new checkpoint, and the best epoch of the run record may not be the one saved")
+        if resuming and self.early_stop.restore_best_weights and os.path.exists(self.ckpt_path):
+            # the best epoch's weights are the ones ModelCheckpoint saved (same monitor, same comparison);
+            # loaded on the CPU so that the GPU does not hold a second copy of the model
+            try:
+                with tf.device("/cpu:0"):
+                    best = tf.keras.models.load_model(self.ckpt_path, custom_objects={"ArcFace": ArcFace},
+                                                      compile=False)
+                self.early_stop.best_weights = best.get_weights()
+                del best
+            except Exception as e:
+                print(f"WARNING: could not read {self.ckpt_path}, EarlyStopping cannot restore the best weights:",
+                      repr(e)[:200])
+        lr = float(tf.keras.backend.get_value(self.model.optimizer.lr))   # restored by BackupAndRestore
+        if not np.isclose(lr, state["lr"], rtol=1e-6):
+            print(f"WARNING: learning rate after the restore {lr:g} differs from the saved {state['lr']:g}")
+        where = f"resuming at epoch {epoch + 2}" if resuming else f"no epoch left to train after epoch {epoch + 1}"
+        print(f"{where}: best val_loss {es['best']:.4f} (epoch {es['best_epoch'] + 1}), lr {lr:g}, "
+              f"{self.minutes_before:.1f} min trained before")
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.epochs[str(epoch)] = {
+            "minutes": self.minutes(),
+            "lr": float(tf.keras.backend.get_value(self.model.optimizer.lr)),
+            "early_stopping": {"wait": int(self.early_stop.wait), "best": float(self.early_stop.best),
+                               "best_epoch": int(self.early_stop.best_epoch),
+                               "stopped_epoch": int(self.early_stop.stopped_epoch)},
+            "reduce_lr": {"wait": int(self.reduce_lr.wait), "best": float(self.reduce_lr.best),
+                          "cooldown_counter": int(self.reduce_lr.cooldown_counter)},
+            "checkpoint": {"best": float(self.checkpoint.best)},
+        }
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path + ".tmp", "w") as f:
+            json.dump({"epochs": self.epochs}, f, indent=1)
+        os.replace(self.path + ".tmp", self.path)
+
+    def minutes(self):
+        """Training minutes of the epochs kept: earlier sessions up to the restored epoch, plus this session."""
+        return self.minutes_before + (time.time() - self.t0) / 60
+
+
+class AtomicModelCheckpoint(ModelCheckpoint):
+    """ModelCheckpoint that writes the new best model to <name>.partial.keras and then renames it.
+
+    Keras writes the .keras zip in place, so a process killed while saving (Kaggle's time limit)
+    would leave a broken best checkpoint, the file a resumed run reloads its best weights from.
+    """
+
+    def _save_handler(self, filepath):
+        root, ext = os.path.splitext(filepath)
+        partial = f"{root}.partial{ext}"
+        super()._save_handler(partial)
+        os.replace(partial, filepath)
+
+
+def make_callbacks(t, ckpt, log_path, backup_dir=None, resumed=False):
+    """Callbacks for cfg["training"] *t*; with *backup_dir*, the training state is backed up after every epoch.
+
+    The order matters: ReduceLROnPlateau adds "lr" to the logs before CSVLogger writes them, and
+    BackupAndRestore comes last, so a backed-up epoch has its checkpoint, log row and callback
+    state written. CSVLogger appends only when *resumed* (a fresh start replaces an old log).
+    With *backup_dir* the checkpoint is written atomically, and BackupAndRestore keeps its backup
+    when training ends: main() removes it after the run record, so that a session stopped in
+    between resumes with nothing left to train instead of training again from scratch.
+    """
+    checkpoint = AtomicModelCheckpoint if backup_dir else ModelCheckpoint
+    callbacks = [
+        EarlyStopping(monitor="val_loss", patience=t["early_stop_patience"],
+                      restore_best_weights=bool(t.get("early_stop_restore_best", False))),
+        ReduceLROnPlateau(monitor="val_loss", factor=t["reduce_lr_factor"],
+                          patience=t["reduce_lr_patience"], min_lr=t["min_lr"]),
+        checkpoint(ckpt, save_best_only=True, monitor="val_loss"),
+        CSVLogger(log_path, append=resumed),
+    ]
+    if backup_dir:
+        callbacks += [ResumeState(os.path.join(backup_dir, "callback_state.json"), *callbacks[:3], ckpt),
+                      BackupAndRestore(backup_dir, delete_checkpoint=False)]
+    return callbacks
+
+
+def merged_log(path):
+    """Rows of a CSVLogger file written over several sessions, one per epoch: the last row of each
+    epoch (an epoch logged but not backed up before a stop is run and logged again)."""
+    log = pd.read_csv(path)
+    return log.drop_duplicates("epoch", keep="last").sort_values("epoch").reset_index(drop=True)
+
+
+def best_epoch(log):
+    """(1-based epoch with the lowest val_loss, that val_loss) of a CSVLogger table; (None, None) without val_loss."""
+    if "val_loss" not in log or not log.val_loss.notna().any():
+        return None, None
+    row = log.loc[log.val_loss.idxmin()]
+    return int(row.epoch) + 1, float(row.val_loss)
+
+
+def save_best_weights(ckpt, path, fallback_model):
+    """Weights-only copy of the best checkpoint, loaded without its optimizer (save_weights of a compiled
+    model also writes the Adam slots); the in-memory weights if the checkpoint cannot be read.
+
+    Returns where the weights came from: "best_checkpoint" or "in_memory_weights".
+    """
+    try:
+        with tf.device("/cpu:0"):       # no second copy of the model on the GPU
+            best = tf.keras.models.load_model(ckpt, custom_objects={"ArcFace": ArcFace}, compile=False)
+        source = "best_checkpoint"
+    except Exception as e:
+        print("could not reload checkpoint, saving the in-memory weights:", repr(e)[:200])
+        best, source = fallback_model, "in_memory_weights"
+    best.save_weights(path)
+    print("weights written to:", path)
+    return source
+
+
+def write_json(path, obj):
+    """Write obj as JSON atomically (a stop mid-write leaves the old file)."""
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+    os.replace(path + ".tmp", path)
+
+
+def finish_run(args, record, run_path, ckpt, model, test_gen, epochs_run, minutes, class_index, phases):
+    """After training: evaluate the best checkpoint, write the weights-only copy (--save-weights) and
+    results_<tag>.json. Also run by a --resume re-run whose earlier session stopped after the run record
+    but before these files (model is then None and the checkpoint must load)."""
+    try:
+        model = tf.keras.models.load_model(ckpt, custom_objects={"ArcFace": ArcFace})
+        print("evaluating the best checkpoint")
+    except Exception as e:
+        if model is None:
+            raise
+        print("could not reload checkpoint, evaluating last-epoch weights:", repr(e)[:200])
+
+    if args.save_weights:
+        weights_path = os.path.join(args.out_dir, f"Xception_ArcFace_{args.tag}.weights.h5")
+        record["weights_source"] = save_best_weights(ckpt, weights_path, model)
+        record["weights"], record["weights_sha256"] = weights_path, file_sha256(weights_path)
+        write_json(run_path, record)
+
+    acc_free, acc_lab = accuracies(model, test_gen, args.n_classes)
+    print(f"TEST accuracy, margin-free (real inference): {acc_free:.4f}")
+    print(f"TEST accuracy, with labels (model.evaluate-style): {acc_lab:.4f}")
+
+    res = {"tag": args.tag, "n_classes": args.n_classes, "epochs_run": epochs_run,
+           "minutes": round(minutes, 1), "test_acc_margin_free": acc_free, "test_acc_with_labels": acc_lab,
+           "checkpoint": ckpt, "class_index": class_index, "split_dir": args.split_dir,
+           "images_by_phase": phases}
+    with open(os.path.join(args.out_dir, f"results_{args.tag}.json"), "w") as f:
+        json.dump(res, f, indent=2)
+    print(json.dumps(res, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--split-dir", required=True)
@@ -111,6 +446,14 @@ def main():
     ap.add_argument("--tag", default="run")
     ap.add_argument("--out-dir", default="/kaggle/working/trained_models")
     ap.add_argument("--cfg", default=os.path.join(REPO, "configs", "baseline.yml"))
+    ap.add_argument("--seed", type=int, default=42, help="seed of tf.keras.utils.set_random_seed (default 42)")
+    ap.add_argument("--resume", action="store_true",
+                    help="back up the training state after every epoch in <out-dir>/backup_<tag>, and continue "
+                         "from it when the same command is run again")
+    ap.add_argument("--reshuffle", action="store_true",
+                    help="new training batches every epoch (the vendored generator keeps those of the first)")
+    ap.add_argument("--save-weights", action="store_true",
+                    help="also write Xception_ArcFace_<tag>.weights.h5 (best weights, no optimizer state)")
     args = ap.parse_args()
 
     gpus = tf.config.list_physical_devices("GPU")
@@ -136,7 +479,7 @@ def main():
         cfg["training"]["epochs"] = args.epochs
     if args.batch_size:
         cfg["training"]["batch_size"] = args.batch_size
-    tf.keras.utils.set_random_seed(42)
+    tf.keras.utils.set_random_seed(args.seed)
 
     bs = cfg["training"]["batch_size"]
     size = tuple(cfg["data"]["target_size"])
@@ -148,7 +491,7 @@ def main():
             raise SystemExit(f"{os.path.join(args.split_dir, split)} not found; build it with 02_make_splits.py")
     classes = class_list(args.split_dir)          # one index per subject, the same in every split
     train_gen = ClassListDataGen(os.path.join(args.split_dir, "train"), aug, classes, batch_size=bs,
-                                 target_size=size)
+                                 target_size=size, reshuffle=args.reshuffle)
     val_gen = ClassListDataGen(os.path.join(args.split_dir, "validation"), plain, classes, batch_size=bs,
                                target_size=size)
     test_gen = ClassListDataGen(os.path.join(args.split_dir, "test"), plain, classes, batch_size=bs,
@@ -164,48 +507,110 @@ def main():
     phases = {s: images_by_phase(g.generator.filenames) for s, g in gens.items()}
     print("images per phase:", phases)
 
+    os.makedirs(args.out_dir, exist_ok=True)
+    ckpt = os.path.join(args.out_dir, f"Xception_ArcFace_{args.tag}.keras")
+    log_path = os.path.join(args.out_dir, f"log_{args.tag}.csv")
+    run_path = os.path.join(args.out_dir, f"run_{args.tag}.json")
+    backup_dir = os.path.join(args.out_dir, f"backup_{args.tag}")
+    if args.resume and os.path.exists(run_path) and os.path.exists(ckpt):
+        try:
+            with open(run_path) as f:
+                previous = json.load(f)
+        except ValueError:
+            previous = {}
+        if previous.get("finished") and previous.get("args") == vars(args):
+            # the same command has trained to the end; a backup still there was left by a session that
+            # stopped between the run record and the removal of the backup
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            weights = os.path.join(args.out_dir, f"Xception_ArcFace_{args.tag}.weights.h5")
+            done = os.path.exists(os.path.join(args.out_dir, f"results_{args.tag}.json")) and (
+                not args.save_weights or (os.path.exists(weights) and previous.get("weights_sha256")))
+            if done:
+                print(f"{run_path} says this command has finished run '{args.tag}': nothing to resume "
+                      "(use another --tag or --out-dir to train again)")
+            else:                              # stopped after the run record, before the evaluation
+                print(f"{run_path} says training finished; writing the missing weights / test results")
+                finish_run(args, previous, run_path, ckpt, None, test_gen, previous.get("epochs_run"),
+                           previous.get("minutes_all_sessions") or 0.0,
+                           os.path.join(args.out_dir, f"class_index_{args.tag}.json"), phases)
+            return
+    resumed = args.resume and backup_exists(backup_dir)
+    if not args.resume and backup_exists(backup_dir):
+        print(f"WARNING: {backup_dir} holds the backup of an unfinished run; without --resume it is ignored "
+              "and this run starts from scratch")
+    stale_state = os.path.join(backup_dir, "callback_state.json")
+    if args.resume and not resumed and os.path.exists(stale_state):
+        os.remove(stale_state)                 # left by an attempt killed before its first backup
+    partial = ckpt[:-len(".keras")] + ".partial.keras"
+    if args.resume and os.path.exists(partial):
+        os.remove(partial)                     # a checkpoint save cut off by a stop; the old best is intact
+    if args.resume:
+        print("resume:", f"continuing from the backup in {backup_dir}" if resumed else
+              f"no backup yet, starting from scratch; backups go to {backup_dir}")
+
     model = build_model(cfg)
     print("model parameters:", f"{model.count_params():,}")
 
-    os.makedirs(args.out_dir, exist_ok=True)
     class_index = os.path.join(args.out_dir, f"class_index_{args.tag}.json")
     with open(class_index, "w") as f:
         json.dump(train_gen.generator.class_indices, f, indent=1)
     print("class index written to:", class_index)
-    ckpt = os.path.join(args.out_dir, f"Xception_ArcFace_{args.tag}.keras")
     t = cfg["training"]
-    callbacks = [
-        EarlyStopping(monitor="val_loss", patience=t["early_stop_patience"]),
-        ReduceLROnPlateau(monitor="val_loss", factor=t["reduce_lr_factor"],
-                          patience=t["reduce_lr_patience"], min_lr=t["min_lr"]),
-        ModelCheckpoint(ckpt, save_best_only=True, monitor="val_loss"),
-        CSVLogger(os.path.join(args.out_dir, f"log_{args.tag}.csv")),
-    ]
+    callbacks = make_callbacks(t, ckpt, log_path, backup_dir if args.resume else None, resumed)
+    state = next((c for c in callbacks if isinstance(c, ResumeState)), None)
+    epochs = t["epochs"]
+    stopped = state.early_stopped_at() if resumed else None
+    saved = backup_epoch(backup_dir) if stopped is not None else None
+    if saved is not None and stopped <= saved:  # EarlyStopping had ended the run and that epoch is backed up;
+        epochs = min(epochs, stopped + 1)      # the session stopped before the run record: train no further
+        print(f"EarlyStopping had stopped the run after epoch {stopped + 1}")
 
     t0 = time.time()
-    hist = model.fit(train_gen, validation_data=val_gen, epochs=t["epochs"], callbacks=callbacks,
+    hist = model.fit(train_gen, validation_data=val_gen, epochs=epochs, callbacks=callbacks,
                     verbose=args.verbose)
     minutes = (time.time() - t0) / 60
-    pd.DataFrame(hist.history).to_csv(os.path.join(args.out_dir, f"history_{args.tag}.csv"), index=False)
-    print(f"training took {minutes:.1f} min for {len(hist.history['loss'])} epochs")
+    epochs_session = len(hist.history.get("loss", []))
+    if args.resume:
+        log = merged_log(log_path)             # every session's epochs, one row each
+        log.to_csv(log_path, index=False)
+        history = log.drop(columns="epoch")
+        history = history[[k for k in hist.history if k in history]] if hist.history else history
+    else:
+        log = pd.read_csv(log_path)
+        history = pd.DataFrame(hist.history)
+    history.to_csv(os.path.join(args.out_dir, f"history_{args.tag}.csv"), index=False)
+    epochs_run = len(log)
+    print(f"training took {minutes:.1f} min for {epochs_session} epochs"
+          + (f" ({epochs_run} over all sessions)" if args.resume else ""))
 
-    try:
-        model = tf.keras.models.load_model(ckpt, custom_objects={"ArcFace": ArcFace})
-        print("evaluating the best checkpoint")
-    except Exception as e:
-        print("could not reload checkpoint, evaluating last-epoch weights:", repr(e)[:200])
+    # the run record goes out first, and with --resume the backup is removed only after it: a session
+    # stopped in between resumes with nothing left to train, or finds the record and trains nothing
+    commit, dirty = git_state()
+    best, best_val_loss = best_epoch(log)
+    record = {
+        "tag": args.tag, "finished": True, "git_commit": commit, "git_dirty": dirty,
+        "argv": sys.argv, "args": vars(args), "seed": args.seed, "cfg": cfg, "versions": package_versions(),
+        "split_dir": args.split_dir,
+        "images_per_split": {s: int(g.generator.samples) for s, g in gens.items()},
+        "images_by_phase": phases,
+        "n_classes": len(classes), "class_list_sha256": class_list_sha256(classes),
+        "epochs_run": epochs_run, "epochs_this_session": epochs_session,
+        "best_epoch": best, "best_val_loss": best_val_loss,
+        "stopped_early": bool(callbacks[0].stopped_epoch > 0),
+        "minutes": round(minutes, 2), "minutes_all_sessions": round(state.minutes() if state else minutes, 2),
+        "resumed": bool(resumed),
+        "resumed_at_epoch": state.initial_epoch + 1 if resumed and state.initial_epoch is not None else None,
+        "checkpoint": ckpt, "checkpoint_sha256": file_sha256(ckpt) if os.path.exists(ckpt) else None,
+        "weights": None, "weights_source": None, "weights_sha256": None,
+        "class_index": class_index, "log": log_path,
+    }
 
-    acc_free, acc_lab = accuracies(model, test_gen, args.n_classes)
-    print(f"TEST accuracy, margin-free (real inference): {acc_free:.4f}")
-    print(f"TEST accuracy, with labels (model.evaluate-style): {acc_lab:.4f}")
+    write_json(run_path, record)
+    print("run record written to:", run_path)
+    if args.resume:
+        shutil.rmtree(backup_dir, ignore_errors=True)   # training has ended: backup and callback state
 
-    res = {"tag": args.tag, "n_classes": args.n_classes, "epochs_run": len(hist.history["loss"]),
-           "minutes": round(minutes, 1), "test_acc_margin_free": acc_free, "test_acc_with_labels": acc_lab,
-           "checkpoint": ckpt, "class_index": class_index, "split_dir": args.split_dir,
-           "images_by_phase": phases}
-    with open(os.path.join(args.out_dir, f"results_{args.tag}.json"), "w") as f:
-        json.dump(res, f, indent=2)
-    print(json.dumps(res, indent=2))
+    finish_run(args, record, run_path, ckpt, model, test_gen, epochs_run, minutes, class_index, phases)
 
 
 if __name__ == "__main__":
