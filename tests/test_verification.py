@@ -349,6 +349,47 @@ def test_eval_verification_end_to_end(tmp_path, model):
     assert embeddings["embeddings"].shape == (6 * 24, 32) and len(embeddings["relpaths"]) == 6 * 24   # p2 within p1
 
 
+def test_eval_verification_skips_corrupt_images_and_late_frames(tmp_path, model):
+    spec = importlib.util.spec_from_file_location("manifest01", os.path.join(REPO, "scripts", "01_build_manifest.py"))
+    manifest_script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(manifest_script)
+    root = _fake_visob(tmp_path / "VISOB_Augmented_Recent")
+    manifest, _ = manifest_script.build(str(root))
+    manifest.to_csv(tmp_path / "manifest_raw.csv", index=False)
+    corrupt = "iphone_day_light_short/verification_right_eye/4000/4000_1001_r_c.png"
+    # like the corrupt Kaggle file: the PNG opens, then decoding fails (OSError inside load_img's resize)
+    data = bytearray((root / corrupt).read_bytes())
+    at = data.find(b"IDAT")
+    length = int.from_bytes(data[at - 4:at], "big")
+    data[at + 6:at + 4 + length] = bytes(length - 2)                         # keep the 2-byte zlib header
+    (root / corrupt).write_bytes(bytes(data))
+    with Image.open(root / corrupt) as im, pytest.raises(OSError):
+        im.load()
+    ckpt = tmp_path / "Xception_ArcFace_tiny.keras"
+    model.save(ckpt)
+
+    def run(*extra):
+        cmd = [sys.executable, os.path.join(REPO, "scripts", "15_eval_verification.py"), "--ckpt", str(ckpt),
+               "--modes", "p3", "--manifest", str(tmp_path / "manifest_raw.csv"), "--data-root", str(root),
+               "--n-boot", "0", "--batch-size", "16", "--workers", "2", "--sample-scores", "10",
+               "--out-dir", str(tmp_path / "out"), "--tag", "t", *extra]
+        return subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True, timeout=600)
+
+    result = run("--max-unreadable", "0")                      # one bad file over a limit of 0 stops the run
+    assert result.returncode != 0 and corrupt in result.stderr
+
+    result = run("--max-frame", "1002")
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert "skipped unreadable image" in result.stdout
+    summary = json.loads((tmp_path / "out" / "verification_summary_t.json").read_text())
+    assert list(summary["unreadable_images"]) == [corrupt] and summary["max_frame"] == 1002
+    # p3: 3 unseen subjects x 2 conditions x 2 eyes, frame 1003 dropped in both phases
+    assert summary["frames_dropped_above_max_frame"] == {"p3": {"enrollment": 12, "verification": 12}}
+    assert summary["n_images_embedded"] == 3 * 2 * 2 * 2 * 2 - 1                # 48 selected, 1 unreadable
+    p3 = summary["per_mode"]["p3"]
+    assert p3["n_enrollment_images"] == 24 and p3["n_probes"] == 24 - 1       # the corrupt probe is left out
+
+
 def _eval_script():
     spec = importlib.util.spec_from_file_location("eval15", os.path.join(REPO, "scripts", "15_eval_verification.py"))
     script = importlib.util.module_from_spec(spec)
@@ -382,10 +423,11 @@ def test_image_selection_keeps_p3_open_set(tmp_path):
     pd.DataFrame({"relpath": relpaths}).to_csv(tmp_path / "manifest.csv", index=False)
     pd.DataFrame({"relpath": relpaths[:4]}).to_csv(tmp_path / "test.csv", index=False)    # 1141 and 1143
     args = argparse.Namespace(test_list=str(tmp_path / "test.csv"), manifest=str(tmp_path / "manifest.csv"),
-                              p3_list=None, max_subjects=None)
+                              p3_list=None, max_subjects=None, max_frame=None)
 
     def subjects(selected, mode):
-        return sorted(selected[mode].subject.unique())
+        assert selected[1] == {}                                                # nothing dropped without --max-frame
+        return sorted(selected[0][mode].subject.unique())
 
     selected = script.select_images(["p1", "p2", "p3"], args, {1141})         # a model trained on 1141 only
     assert subjects(selected, "p1") == [1141, 1143] and subjects(selected, "p2") == [1141]
@@ -394,6 +436,10 @@ def test_image_selection_keeps_p3_open_set(tmp_path):
     assert subjects(script.select_images(["p3"], args, {1141, 1000}), "p3") == [4000, 5000]   # 1000 trained on
     args.max_subjects = 2                                                        # smoke run: first N subjects
     assert subjects(script.select_images(["p3"], args, {1141}), "p3") == [1000, 4000]
-    args.max_subjects, args.p3_list = None, str(tmp_path / "manifest.csv")       # a list with training subjects
+    args.max_subjects, args.max_frame = None, 1000                               # every frame here is 1001
+    selected, dropped = script.select_images(["p2", "p3"], args, {1141})
+    assert all(df.empty for df in selected.values())
+    assert dropped == {"p2": {"enrollment": 1, "verification": 1}, "p3": {"enrollment": 3, "verification": 3}}
+    args.max_frame, args.p3_list = None, str(tmp_path / "manifest.csv")          # a list with training subjects
     with pytest.raises(SystemExit, match="training subjects"):
         script.select_images(["p3"], args, {1141})
