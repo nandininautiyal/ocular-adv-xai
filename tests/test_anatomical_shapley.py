@@ -463,6 +463,66 @@ def test_templates_prefer_the_other_phase(script, pair_inputs):
         script.choose_templates(sampled, pool.drop(index=5), seed=1)
 
 
+def _two_eye_pool(n_classes=6, per=3, eye_column=True):
+    """A correct-image pool with both eyes and both phases of every class (relpaths as in 01)."""
+    rows = []
+    for c in range(n_classes):
+        for eye in ("left", "right"):
+            for phase in ("enrollment", "verification"):
+                for k in range(per):
+                    name = f"{1000 + c}_{k}_{eye[0]}_c.png"
+                    rows.append({"link_path": f"/split/{1000 + c}/{phase}_{eye}_{name}",
+                                 "relpath": f"test_office/{phase}_{eye}_eye/{1000 + c}/{name}",
+                                 "true_idx": c, "eye": eye, "phase": phase})
+    frame = pd.DataFrame(rows)
+    return frame if eye_column else frame.drop(columns="eye")
+
+
+@pytest.mark.parametrize("eye_column", [True, False])
+def test_templates_have_the_probes_eye(script, eye_column):
+    """Left probes get left templates and right probes right ones (the eye column, else the relpath)."""
+    pool = _two_eye_pool(eye_column=eye_column)
+    eyes = script.image_eyes(pool)
+    assert eyes.tolist() == [r.split("/")[1].split("_")[1] for r in pool.relpath]
+    sampled = pool.iloc[::5].reset_index().rename(columns={"index": "image_id"})
+    assert set(eyes[sampled.image_id]) == {"left", "right"}
+    for seed in range(5):
+        templates = script.choose_templates(sampled, pool, seed=seed)
+        for kind, t in templates.items():
+            assert (eyes[t.template_image_id].to_numpy() == eyes[sampled.image_id].to_numpy()).all(), kind
+            assert t.same_eye.all() and t.other_phase.all()
+        assert (templates["genuine"].class_idx == sampled.true_idx).all()
+        assert (templates["impostor"].class_idx != sampled.true_idx).all()
+        assert (templates["genuine"].template_image_id != sampled.image_id).all()
+    again = script.choose_templates(sampled, pool, seed=4)
+    assert all(again[k].equals(templates[k]) for k in templates)                         # seeded
+
+
+def test_templates_fall_back_to_any_eye(script, capsys):
+    """Without a same-eye candidate the template is of the other eye, flagged and warned about once; the
+    impostor class is drawn among the classes that have the probe's eye."""
+    pool = _two_eye_pool(n_classes=4, per=1)
+    eyes = script.image_eyes(pool)
+    probe = pool.index[(pool.true_idx == 0) & (eyes == "right") & (pool.phase == "enrollment")][0]
+    # class 0 keeps only this right image; classes 1 and 2 lose theirs, so only class 3 has a right eye
+    drop = pool.index[(eyes == "right") & (pool.index != probe) & pool.true_idx.isin([0, 1, 2])]
+    reduced = pool.drop(index=drop)
+    sampled = reduced.loc[[probe]].reset_index().rename(columns={"index": "image_id"})
+    for seed in range(5):
+        capsys.readouterr()
+        templates = script.choose_templates(sampled, reduced, seed=seed)
+        genuine, impostor = templates["genuine"].iloc[0], templates["impostor"].iloc[0]
+        assert not genuine.same_eye and eyes[genuine.template_image_id] == "left" and genuine.class_idx == 0
+        assert impostor.same_eye and impostor.class_idx == 3 and eyes[impostor.template_image_id] == "right"
+        out = capsys.readouterr().out
+        assert out.count("WARNING") == 1 and "1 verification templates" in out and "genuine 1" in out
+    # no other class has the probe's eye: the impostor falls back too
+    alone = reduced.drop(index=reduced.index[(eyes[reduced.index] == "right") & (reduced.true_idx == 3)])
+    templates = script.choose_templates(sampled, alone, seed=0)
+    assert not templates["impostor"].same_eye.any() and not templates["genuine"].same_eye.any()
+    assert "impostor 1" in capsys.readouterr().out
+
+
 def test_verification_rows(fu_run, model, pair_inputs):
     """--verif-pairs: genuine and impostor rows on clean, noise and attack, with the cosine of the probe's
     embedding and the clean template's as v_full (efficiency holds as for every game)."""
@@ -495,6 +555,7 @@ def test_verification_rows(fu_run, model, pair_inputs):
     assert verif[[c for c in verif.columns if c.startswith("mass_")]].isna().all().all()
     assert summary["verification"]["enabled"] and summary["verification"]["other_phase"] == {"genuine": 4,
                                                                                             "impostor": 4}
+    assert summary["verification"]["same_eye"] == {"genuine": 4, "impostor": 4}
     assert summary["rows_per_target_kind"] == {k: int(v) for k, v in rows.target_kind.value_counts().items()}
     assert summary["forward_passes_by_method"]["templates"] == 8
     assert summary["forward_passes_by_method"]["asa_verif"] == verif[verif.target == "genuine"].groupby(
@@ -549,17 +610,43 @@ def test_runtime_and_js_columns(fu_run):
     assert ((finite >= 0) & (finite <= 1)).all()
     assert true.js_asa__layercam.notna().mean() > 0.5
     assert rows[rows.target.isin(["genuine", "impostor"])][js].isna().all().all()
-    # recompute one divergence from the row's own part values
+    # every game with v_full != v_empty has a positive oriented phi (efficiency), so its ASA map exists and
+    # js_asa__layercam is finite wherever LayerCAM has mass, also where the attack won (v_full < v_empty)
+    cls = rows[rows.target.isin(["true", "pred"])]
+    cam_mass = cls.js_layercam__eigencam.notna() & (cls.v_full != cls.v_empty)
+    assert cls.js_asa__layercam[cam_mass].notna().all()
+    # recompute one divergence from the row's own part values, oriented as 23's faithfulness orients phi
+    from src.xai.shapley import oriented_phi
     row = true[(true.condition == "clean") & (true.baseline == "mean")].iloc[0]
     masks = group_masks(eye_labels(5)[int(row.image_id) % 5], CLASSES, normalise_groups(DEFAULT_GROUPS))
     player_map = player_map_from_masks(masks)
-    maps = {s: player_value_map(row[[f"{p}_{g}" for g in GROUPS]].to_numpy(float), player_map)
+    maps = {s: player_value_map(oriented_phi(row[[f"{p}_{g}" for g in GROUPS]].to_numpy(float), row.v_full,
+                                             row.v_empty), player_map)
             for s, p in (("a", "phi"), ("b", "lime_parts"))}
     if np.isfinite(row.js_asa__lime_parts):
         assert row.js_asa__lime_parts == pytest.approx(pairwise_js(maps)[("a", "b")], abs=1e-9)
     hardware = fu_run["summary"]["runtime"]["hardware"]
     assert hardware["cpu_threads"] and "gpus" in hardware
     assert fu_run["summary"]["runtime"]["warmup_seconds"] > 0
+
+
+def test_agreement_map_of_a_won_attack(script):
+    """Where the attack won (v_full < v_empty, every phi <= 0) the ASA map uses phi oriented as 23's
+    faithfulness orients it: it has mass, so its divergence from a CAM is finite rather than NaN."""
+    from src.xai.part_baselines import js_divergence, player_value_map
+    player_map = np.repeat(np.repeat(np.arange(4).reshape(2, 2), 8, axis=0), 8, axis=1)    # 4 quadrants
+    phi = np.array([-3.0, -1.0, -0.5, 0.0])
+    v_full, v_empty = -4.5, 0.0                                                            # efficiency holds
+    cam_on = {p: (player_map == p).astype(float) + 0.01 for p in range(4)}
+    assert player_value_map(phi, player_map).sum() == 0                     # the unoriented map: no mass
+    assert np.isnan(js_divergence(player_value_map(phi, player_map), cam_on[0]))
+    oriented = script.game_map(phi, v_full, v_empty, player_map)
+    np.testing.assert_allclose(oriented, player_value_map(-phi, player_map))
+    js = {p: js_divergence(oriented, cam) for p, cam in cam_on.items()}
+    assert all(np.isfinite(v) for v in js.values())
+    assert js[0] < js[1] < js[3]               # the most negative phi is the part that explains the gap most
+    up = np.array([3.0, 1.0, 0.5, 0.0])                                     # v_full >= v_empty: unchanged
+    np.testing.assert_array_equal(script.game_map(up, 4.5, 0.0, player_map), player_value_map(up, player_map))
 
 
 def test_fu_analysis_end_to_end(fu_run, analyse):
