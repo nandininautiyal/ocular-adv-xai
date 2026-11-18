@@ -541,10 +541,15 @@ def test_04_and_15_feed_the_region_input(split_tree, tmp_path, monkeypatch, caps
         os.makedirs(root / os.path.dirname(r), exist_ok=True)
         Image.open(link).save(root / r)
     region_of = verif.region_lookup(model, str(masks), relpaths)
-    emb = verif.embed_images(model, relpaths, str(root), 2, 1, region_of)
+    emb, bad = verif.embed_images(model, relpaths, str(root), 2, 1, region_of)
+    assert bad == {}
     want = am.embed_regions(model, np.stack([verif.load_image(str(root / r)) for r in relpaths]),
                             mg.regions_for_rows(table, table.rows_for_relpaths(relpaths), am.region_classes(model)))
     np.testing.assert_allclose(emb, want, atol=1e-6)
+    (root / relpaths[0]).write_bytes(b"not a png")                            # unreadable: skipped, regions stay aligned
+    emb2, bad2 = verif.embed_images(model, relpaths, str(root), 2, 1, region_of)
+    assert list(bad2) == [relpaths[0]] and not emb2[0].any()
+    np.testing.assert_allclose(emb2[1:], want[1:], atol=1e-6)
     with pytest.raises(SystemExit, match="region-masks"):
         verif.region_lookup(model, None, relpaths)
     with pytest.raises(SystemExit, match="no mask"):
