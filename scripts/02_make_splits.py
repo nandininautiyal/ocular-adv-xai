@@ -42,6 +42,8 @@ Usage:
   python scripts/02_make_splits.py --protocol cross_session --write-split-csvs /kaggle/working/splits
          # tree /tmp/ocular_cross_session, manifest /kaggle/working/manifest_split_cross_session.csv
   python scripts/02_make_splits.py --protocol open_set --write-split-csvs /kaggle/working/splits
+  add --max-frame 1009 to cross_session / open_set to leave out the frames numbered 1010 and up
+  (16 found the enrollment ones synthetic); pass the same value to 15 --max-frame
 """
 import argparse
 import os
@@ -136,6 +138,23 @@ def assign_cross_session(m, seed=42, val_frac=0.25):
     return m
 
 
+def drop_late_frames(m, max_frame):
+    """(manifest without the frames numbered above *max_frame*, {phase: images dropped}).
+
+    16_check_dataset.py found the enrollment frames numbered 1010 and up of the Kaggle VISOB copy
+    synthetic; --max-frame 1009 keeps only the original frames (the few verification frames >= 1010,
+    about 3 %, were never tested and go too). Uses 01's idx column, else parses the file name.
+    """
+    idx = m["idx"] if "idx" in m.columns else m.relpath.astype(str).str.extract(
+        r"_(\d+)_[lrLR]_c\.png$", expand=False).astype(float)
+    if idx.isna().any():
+        raise SystemExit(f"--max-frame: no frame number for {int(idx.isna().sum())} images, e.g. "
+                         f"{m.relpath[idx.isna()].iloc[0]!r}")
+    late = (idx > max_frame).to_numpy()
+    dropped = {p: int((late & (m.phase == p).to_numpy()).sum()) for p in sorted(m.phase.unique())}
+    return m[~late].copy(), dropped
+
+
 def select_open_set(m):
     """Every image of the subjects outside the 300 classes (both phases), sorted, with split 'test'."""
     m = m[~in_paper_classes(m.subject)].sort_values("relpath").reset_index(drop=True)
@@ -183,7 +202,14 @@ def main():
     ap.add_argument("--write-split-csvs", default=None, metavar="DIR",
                     help="also write DIR/<protocol>_{train,validation,test}.csv (relpath, subject), e.g. "
                          "into splits/ to commit them")
+    ap.add_argument("--max-frame", type=int, default=None,
+                    help="cross_session / open_set: leave out the images whose frame number is above this; 1009 "
+                         "drops the frames numbered 1010 and up (synthetic in the enrollment folders, see 16). "
+                         "Default: keep all. Not for random, whose pinned test list includes such frames")
     args = ap.parse_args()
+    if args.max_frame is not None and args.protocol == "random":
+        ap.error("--max-frame is for cross_session and open_set: the random protocol reproduces the existing "
+                 "checkpoint with its pinned test list, which includes frames numbered 1010 and up")
     if not 0 < args.val_frac < 1:                # e.g. 25 meant as a percentage would leave one train bucket
         ap.error(f"--val-frac must be a fraction between 0 and 1, got {args.val_frac}")
     out_dir = args.out_dir or OUTPUTS[args.protocol][0]
@@ -191,6 +217,10 @@ def main():
 
     root = args.root or find_root()
     m = pd.read_csv(args.manifest)
+    if args.max_frame is not None:
+        m, dropped = drop_late_frames(m, args.max_frame)
+        print(f"--max-frame {args.max_frame}: left out " + ", ".join(f"{n} {p}" for p, n in dropped.items())
+              + f" images numbered above {args.max_frame}")
 
     if args.protocol == "open_set":
         m = select_open_set(m)
