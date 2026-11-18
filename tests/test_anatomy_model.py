@@ -443,6 +443,27 @@ def test_03_trains_every_arch_and_resumes(split_tree, tmp_path, monkeypatch, cap
     assert "nothing to resume" in capsys.readouterr().out
 
 
+def test_03_resume_with_another_mask_loss_weight_stops(split_tree, tmp_path, monkeypatch):
+    tree, masks, cfg_path = split_tree
+    kill = [True]
+
+    def callbacks(*args, f=train_script.make_callbacks, **kwargs):
+        cbs = f(*args, **kwargs)
+        return cbs[:-1] + [StopAfterLogging()] + cbs[-1:] if kill[0] else cbs
+
+    monkeypatch.setattr(train_script, "make_callbacks", callbacks)
+    out = tmp_path / "models"
+    args = ["--cfg", cfg_path, "--arch", "attn_mask", "--masks", masks, "--resume"]
+    with pytest.raises(Killed):
+        _train(monkeypatch, tree, out, *args, "--mask-loss-weight", "0.5")
+    kill[0] = False
+    log = (out / "log_t.csv").read_text()
+    with pytest.raises(SystemExit, match=r"cfg\.anatomy\.mask_loss_weight: 0\.5 -> 0\.7"):
+        _train(monkeypatch, tree, out, *args, "--mask-loss-weight", "0.7")
+    assert train_script.backup_exists(str(out / "backup_t")) and (out / "log_t.csv").read_text() == log
+    assert not (out / "run_t.json").exists()
+
+
 def test_03_baseline_record_and_flags_are_unchanged(split_tree, tmp_path, monkeypatch, capsys):
     tree, masks, _ = split_tree
     monkeypatch.setattr(train_script, "build_model", lambda cfg: _tiny_baseline(cfg))
@@ -541,10 +562,15 @@ def test_04_and_15_feed_the_region_input(split_tree, tmp_path, monkeypatch, caps
         os.makedirs(root / os.path.dirname(r), exist_ok=True)
         Image.open(link).save(root / r)
     region_of = verif.region_lookup(model, str(masks), relpaths)
-    emb = verif.embed_images(model, relpaths, str(root), 2, 1, region_of)
+    emb, bad = verif.embed_images(model, relpaths, str(root), 2, 1, region_of)
+    assert bad == {}
     want = am.embed_regions(model, np.stack([verif.load_image(str(root / r)) for r in relpaths]),
                             mg.regions_for_rows(table, table.rows_for_relpaths(relpaths), am.region_classes(model)))
     np.testing.assert_allclose(emb, want, atol=1e-6)
+    (root / relpaths[0]).write_bytes(b"not a png")                            # unreadable: skipped, regions stay aligned
+    emb2, bad2 = verif.embed_images(model, relpaths, str(root), 2, 1, region_of)
+    assert list(bad2) == [relpaths[0]] and not emb2[0].any()
+    np.testing.assert_allclose(emb2[1:], want[1:], atol=1e-6)
     with pytest.raises(SystemExit, match="region-masks"):
         verif.region_lookup(model, None, relpaths)
     with pytest.raises(SystemExit, match="no mask"):

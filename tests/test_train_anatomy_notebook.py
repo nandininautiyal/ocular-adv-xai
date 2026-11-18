@@ -157,7 +157,11 @@ def test_commands_follow_the_protocol(settings):
     if settings.get("BASELINE_CKPT"):
         a = _args(cmd["04_base_ext"])
         assert a["--ckpt"] == settings["BASELINE_CKPT"] and a["--class-index"].endswith("/class_index_cs_s1.json")
-    assert ns["ASA_MASK_ARCH"] == settings.get("ASA_ARCH", "parts")
+    default_asa = "parts" if "parts" in ns["ARCHS"] else "attn_mask"         # ASA_ARCH = 'auto' before cell 13
+    assert ns["ASA_MASK_ARCH"] == settings.get("ASA_ARCH", default_asa)
+    mf = f"--max-frame {ns['MAX_FRAME']}"                                    # the synthetic frames stay out
+    assert ns["MAX_FRAME"] == 1009 and all(mf in cmd[k] for k in ("02_cross_session", "02_open_set", "02_small"))
+    assert all(mf in c for k, c in cmd.items() if k.startswith("15_"))
     # every step a step needs is a step of the session
     for name, needs in ns["NEEDS"].items():
         assert all(n in cmd for n in needs), name
@@ -366,7 +370,7 @@ def test_masking_check_and_the_asa_flags(settings):
         assert ("--verif-pairs" in a) == ns["ASA_VERIF_PAIRS"]
     defaults = _namespace()
     assert "aas_pgd" in defaults["ASA_ATTACKS"].split(",") and defaults["ASA_VERIF_PAIRS"] is True
-    assert set(defaults["MASK_CHECK"]) == {"attn_mask", "parts", "gap"}
+    assert set(defaults["MASK_CHECK"]) == {"attn_mask", "gap"}                 # the minimum set (no parts yet)
     # the masking check is one of a model's steps: planned and estimated with it, skipped once its summary exists
     assert "MODEL_STEPS" in _cell(11) and "EST['24_h']" in _cell(11)
     assert "'24': f'{MASKING}/summary_masking_{t}.json'" in _cell(12)

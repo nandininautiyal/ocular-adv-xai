@@ -208,6 +208,7 @@ def test_faithfulness(analyse):
     clean = table[(table.condition == "clean") & (table.baseline == "blur") & (table.target == "true")]
     cam = clean.set_index("source").loc["layercam"]
     assert cam.rank_agreement_median == pytest.approx(1.0)      # image 0 (two groups) is NaN, not counted
+    assert cam.n == N and cam.n_rank_finite == N - 1               # ... and n_rank_finite says so
     assert cam.deletion_auc_median == pytest.approx(0.35 + 0.01 * np.median(np.arange(N)))
     assert cam.auc_minus_random == pytest.approx(np.mean([0.35 + 0.01 * i - 0.5 - 0.02 * (-1) ** i for i in range(N)]))
     assert cam.auc_minus_asa == pytest.approx(0.05)

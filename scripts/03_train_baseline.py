@@ -39,9 +39,13 @@ Training recipe (all optional; without them a run trains exactly as before):
                  old best intact. log_<tag>.csv is appended; an epoch that was logged but not
                  backed up before the stop keeps only the row of its second run. The backup is
                  removed right after run_<tag>.json is written; running the same command again
-                 after that trains nothing (the record says finished, with the same arguments)
+                 after that trains nothing (the record says finished, with the same settings)
                  instead of starting from scratch over the checkpoint, and a run that early
-                 stopping had ended trains no further epoch. Without --resume a left-over backup
+                 stopping had ended trains no further epoch. A --resume re-run whose settings
+                 differ from those of the finished run (run_<tag>.json) or of the unfinished one
+                 (backup_<tag>/settings.json) stops with the differences: effective cfg (content,
+                 not path), seed, arch, reshuffle, allow-missing-masks, masks sha256, class list
+                 and images per split (result_settings()). Without --resume a left-over backup
                  is ignored, with a warning. A resumed run is not bit-identical to an
                  uninterrupted one: the random streams (augmentation, batch order) restart
                  from the seed.
@@ -507,14 +511,61 @@ def finish_run(args, record, run_path, ckpt, model, test_gen, epochs_run, minute
 
 
 def run_args(args):
-    """The arguments a run record keeps (and a --resume re-run compares). A baseline run keeps exactly the
-    arguments of the records written before --arch existed, so that a run started with the older script
-    is recognised as finished (or resumed) by this one."""
+    """The arguments a run record keeps. A baseline run keeps exactly the arguments of the records written
+    before --arch existed. A --resume re-run compares result_settings(), not these."""
     recorded = dict(vars(args))
     if args.arch == "baseline" and not args.masks and args.mask_loss_weight is None and not args.allow_missing_masks:
         for key in ANATOMY_ARGS:
             recorded.pop(key, None)
     return recorded
+
+
+def jsonable(obj):
+    """*obj* as it reads back from a JSON file written by write_json (tuples become lists, numpy scalars numbers)."""
+    return json.loads(json.dumps(obj, default=lambda o: o.item() if hasattr(o, "item") else str(o)))
+
+
+def result_settings(args, cfg, classes, images_per_split, masks_sha256):
+    """The settings the trained model depends on, which a --resume re-run must share with the run it continues
+    or finds finished.
+
+    cfg is the effective config (the --cfg file's content with --epochs, --batch-size, --n-classes and, for the
+    anatomy archs, the anatomy settings incl. --mask-loss-weight applied), so the path of --cfg does not matter,
+    only what it sets. The split is identified by its class list and images per split, the masks by their
+    sha256, not by their paths, so that the same data under another directory (another Kaggle mount) counts as
+    the same. Not compared: --verbose, --tag, --out-dir, --resume, --save-weights (the weights-only copy is
+    written from the best checkpoint at the end) and the git commit (a resumed session may run fixed code).
+    """
+    return jsonable({"cfg": cfg, "seed": args.seed, "arch": args.arch, "reshuffle": bool(args.reshuffle),
+                     "allow_missing_masks": bool(args.allow_missing_masks), "masks_sha256": masks_sha256,
+                     "class_list_sha256": class_list_sha256(classes), "images_per_split": images_per_split})
+
+
+def recorded_settings(record):
+    """result_settings() of the run behind *record* (run_<tag>.json). A baseline record has no arch, masks_sha256
+    or anatomy args (the fields of the records before --arch), which then take their baseline values; cfg, the
+    class list and the images per split are compared only when the record has them."""
+    args = record.get("args") or {}
+    settings = {"seed": record.get("seed", args.get("seed", 42)),
+                "arch": record.get("arch", args.get("arch", "baseline")),
+                "reshuffle": bool(args.get("reshuffle", False)),
+                "allow_missing_masks": bool(args.get("allow_missing_masks", False)),
+                "masks_sha256": record.get("masks_sha256")}
+    settings.update({k: record[k] for k in ("cfg", "class_list_sha256", "images_per_split") if k in record})
+    return settings
+
+
+def settings_differences(saved, current, prefix=""):
+    """'<setting>: <saved> -> <current>' for every setting of *saved* that *current* differs in (cfg key by key)."""
+    out = []
+    for key in saved:
+        old, new = saved[key], current.get(key) if isinstance(current, dict) else None
+        if isinstance(old, dict) and isinstance(new, dict):
+            out += settings_differences(old, new, f"{prefix}{key}.")
+            out += [f"{prefix}{key}.{k}: (none) -> {new[k]!r}" for k in new if k not in old]
+        elif old != new:
+            out.append(f"{prefix}{key}: {old!r} -> {new!r}")
+    return out
 
 
 def check_anatomy_args(ap, args):
@@ -645,19 +696,29 @@ def main():
         print(warning)
     phases = {s: images_by_phase(g.generator.filenames) for s, g in gens.items()}
     print("images per phase:", phases)
+    images_per_split = {s: int(g.generator.samples) for s, g in gens.items()}
+    masks_sha256 = file_sha256(args.masks) if args.masks else None
 
     os.makedirs(args.out_dir, exist_ok=True)
     ckpt = os.path.join(args.out_dir, f"Xception_ArcFace_{args.tag}.keras")
     log_path = os.path.join(args.out_dir, f"log_{args.tag}.csv")
     run_path = os.path.join(args.out_dir, f"run_{args.tag}.json")
     backup_dir = os.path.join(args.out_dir, f"backup_{args.tag}")
+    settings_path = os.path.join(backup_dir, "settings.json")
+    current = result_settings(args, cfg, classes, images_per_split, masks_sha256)
     if args.resume and os.path.exists(run_path) and os.path.exists(ckpt):
         try:
             with open(run_path) as f:
                 previous = json.load(f)
         except ValueError:
             previous = {}
-        if previous.get("finished") and previous.get("args") == run_args(args):
+        changed = settings_differences(recorded_settings(previous), current) if previous.get("finished") else []
+        if changed:
+            # training again would start from scratch and overwrite the finished run's checkpoint
+            raise SystemExit(f"{run_path} records a finished run '{args.tag}' with other settings than this command "
+                             f"({'; '.join(changed)}). Nothing was trained: use another --tag or --out-dir to train "
+                             "with these settings, or run the recorded command to complete the finished run.")
+        if previous.get("finished"):
             # the same command has trained to the end; a backup still there was left by a session that
             # stopped between the run record and the removal of the backup
             shutil.rmtree(backup_dir, ignore_errors=True)
@@ -677,9 +738,22 @@ def main():
     if not args.resume and backup_exists(backup_dir):
         print(f"WARNING: {backup_dir} holds the backup of an unfinished run; without --resume it is ignored "
               "and this run starts from scratch")
+    if resumed and os.path.exists(settings_path):
+        with open(settings_path) as f:
+            changed = settings_differences(json.load(f), current)
+        if changed:                            # continuing would mix two settings in one model and one record
+            raise SystemExit(f"{backup_dir} holds an unfinished run '{args.tag}' with other settings than this "
+                             f"command ({'; '.join(changed)}). Nothing was trained: run the original command again "
+                             "to continue it, or use another --tag or --out-dir (or remove the backup) to start anew.")
+    elif resumed:
+        print(f"WARNING: {backup_dir} has no settings.json (written by an older 03), so this command's settings "
+              "cannot be checked against those of the run it continues; they are recorded for the next sessions")
     stale_state = os.path.join(backup_dir, "callback_state.json")
     if args.resume and not resumed and os.path.exists(stale_state):
         os.remove(stale_state)                 # left by an attempt killed before its first backup
+    if args.resume and not (resumed and os.path.exists(settings_path)):
+        os.makedirs(backup_dir, exist_ok=True)  # the settings the backups of this run are made with
+        write_json(settings_path, current)
     partial = ckpt[:-len(".keras")] + ".partial.keras"
     if args.resume and os.path.exists(partial):
         os.remove(partial)                     # a checkpoint save cut off by a stop; the old best is intact
@@ -743,7 +817,7 @@ def main():
         "tag": args.tag, "finished": True, "git_commit": commit, "git_dirty": dirty,
         "argv": sys.argv, "args": run_args(args), "seed": args.seed, "cfg": cfg, "versions": package_versions(),
         "split_dir": args.split_dir,
-        "images_per_split": {s: int(g.generator.samples) for s, g in gens.items()},
+        "images_per_split": images_per_split,
         "images_by_phase": phases,
         "n_classes": len(classes), "class_list_sha256": class_list_sha256(classes),
         "epochs_run": epochs_run, "epochs_this_session": epochs_session,
@@ -761,7 +835,7 @@ def main():
                         if best is not None and monitor in log else None)
         record.update({"arch": args.arch, "monitor": monitor, "best_monitor": best_monitor, "anatomy": settings,
                        "masks": os.path.abspath(args.masks) if args.masks else None,
-                       "masks_sha256": file_sha256(args.masks) if args.masks else None,
+                       "masks_sha256": masks_sha256,
                        "mask_classes": table.class_names if table else None,
                        "mask_coverage": {s: g.coverage() for s, g in gens.items()} if table else None})
         if args.arch in MASK_LOSS_ARCHS:

@@ -61,6 +61,9 @@ Usage (Kaggle, checkpoint dataset and VISOB attached, 01 already run):
       --ckpt /kaggle/input/<checkpoint-dataset>/Xception_ArcFace_full.keras \
       --manifest /kaggle/working/manifest_raw.csv --modes p1,p3 --tag full
   smoke run (2-3 min): add --max-subjects 10 --n-boot 100 --tag smoke
+  without the extra frames: add --max-frame 1009 (drops the VISOB frames numbered 1010 and up from
+  templates and probes; 16 found the enrollment ones synthetic, the verification ones were not tested;
+  x1 images have no frame numbers and are never dropped)
 Cross-dataset (VISOB not needed; 20_prepare_ubipr.py already run):
   python scripts/15_eval_verification.py --ckpt <checkpoint>.keras --modes x1 \
       --external-manifest /kaggle/working/ubipr/ubipr_manifest.csv --tag ubipr
@@ -71,6 +74,10 @@ Any arch of 03 --arch loads. The attnet_gate model needs the eye masks at test t
 attnet_gate runs p1, p2 and p3 only: the masks are keyed by VISOB relpaths (condition / phase_eye /
 file), and nothing makes masks for the external images of x1, so --modes x1 with --region-masks
 stops before the model loads (and an attnet_gate checkpoint with x1 stops right after it loads).
+
+Images that cannot be decoded (e.g. the corrupt iphone_day_light_short/verification_right_eye/3320/
+3320_1003_r_c.png of the Kaggle copy) are skipped with a warning and listed in the summary; more than
+--max-unreadable (20, VISOB and x1 together) stops the run.
 """
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"   # reference code targets Keras 2; set before importing tensorflow
@@ -99,7 +106,8 @@ from src.models.anatomy_model import embed_regions, feature_grid, model_arch, re
 
 DEFAULT_TEST_LIST = os.path.join(REPO, "splits", "visob_test.csv")
 RELPATH_RE = re.compile(r"^(?P<condition>[^/]+)/(?P<phase>enrollment|verification)_(?P<eye>left|right)_eye/"
-                        r"[^/]+/(?P<subject>\d+)_\d+_[lr]_c\.png$", re.IGNORECASE)
+                        r"[^/]+/(?P<subject>\d+)_(?P<idx>\d+)_[lr]_c\.png$", re.IGNORECASE)
+MAX_UNREADABLE = 20     # more unreadable images than this means a broken data mount, not one bad file
 PROTOCOLS = {
     "p1": "closed-set verification: all same-eye pairs of the pinned random-split test set",
     "p2": "closed-set cross-session verification: enrollment templates vs verification probes, training subjects",
@@ -146,7 +154,7 @@ def parse_condition(folder):
 
 
 def image_table(relpaths):
-    """Subject, phase, eye, device, lighting and condition of each relpath (01's layout), sorted."""
+    """Subject, frame index, phase, eye, device, lighting and condition of each relpath (01's layout), sorted."""
     rows = []
     for rel in sorted({str(r).replace("\\", "/") for r in relpaths}):
         m = RELPATH_RE.match(rel)
@@ -154,10 +162,11 @@ def image_table(relpaths):
             raise ValueError(f"unexpected relpath {rel!r}: expected "
                              "<condition>/<phase>_<eye>_eye/<subject>/<subject>_<idx>_<l|r>_c.png")
         device, lighting = parse_condition(m["condition"])
-        rows.append({"relpath": rel, "subject": int(m["subject"]), "phase": m["phase"].lower(),
-                     "eye": m["eye"].lower(), "device": device, "lighting": lighting,
-                     "condition": m["condition"]})
-    return pd.DataFrame(rows, columns=["relpath", "subject", "phase", "eye", "device", "lighting", "condition"])
+        rows.append({"relpath": rel, "subject": int(m["subject"]), "idx": int(m["idx"]),
+                     "phase": m["phase"].lower(), "eye": m["eye"].lower(), "device": device,
+                     "lighting": lighting, "condition": m["condition"]})
+    return pd.DataFrame(rows, columns=["relpath", "subject", "idx", "phase", "eye", "device", "lighting",
+                                       "condition"])
 
 
 def external_table(manifest, subset_cols=()):
@@ -200,6 +209,14 @@ def load_image(path, flip=False):
     img = tf.keras.utils.load_img(path, target_size=(256, 256))
     img = np.asarray(img, dtype=np.float32) / 255.0
     return np.ascontiguousarray(img[:, ::-1]) if flip else img
+
+
+def try_load_image(path, flip=False):
+    """(image, None), or (None, error text) for a file that cannot be read or decoded."""
+    try:
+        return load_image(path, flip), None
+    except Exception as e:      # PIL raises OSError / UnidentifiedImageError / SyntaxError on corrupt PNGs
+        return None, f"{type(e).__name__}: {e}"
 
 
 def git_commit():
@@ -316,12 +333,17 @@ def select_images(modes, args, seen):
     elif "x1" in modes:                   # the external dataset: its own manifest and root
         selected["x1"], args.external_unusable = external_table(args.external_manifest,
                                                                 external_subset_cols(args))
+    dropped = {}
     for mode, df in selected.items():
+        if getattr(args, "max_frame", None) is not None and mode in VISOB_MODES:   # x1 has no frame numbers
+            late = df.idx > args.max_frame
+            dropped[mode] = {p: int((late & (df.phase == p)).sum()) for p in ("enrollment", "verification")}
+            df = df[~late]
         if args.max_subjects:
             col = "person" if mode == "x1" else "subject"     # x1: keep both eyes of each person
             df = df[df[col].isin(sorted(df[col].unique())[:args.max_subjects])]
         selected[mode] = df.reset_index(drop=True)
-    return selected
+    return selected, dropped
 
 
 def external_subset_cols(args):
@@ -329,34 +351,62 @@ def external_subset_cols(args):
     return tuple(c.strip() for c in (getattr(args, "external_subsets", None) or "").split(",") if c.strip())
 
 
-def embed_images(model, relpaths, root, batch_size, workers, region_of=None, flips=None):
-    """Embeddings (N, D) of root/<relpath>, in order, with progress and a time estimate.
+def check_unreadable(bad, limit, already=0):
+    """Stop when more than `limit` images (`already` of them found in an earlier pass) could not be read
+    (a broken data mount, not one bad file)."""
+    if len(bad) + already > limit:
+        shown = "\n  ".join(f"{r}  ({e})" for r, e in list(bad.items())[:10])
+        raise SystemExit(f"more than {limit} images could not be read (raise --max-unreadable only if these files "
+                         f"are really corrupt):\n  {shown}")
+
+
+def drop_unreadable(selected, bad, limit):
+    """Remove unreadable relpaths from every mode, with a warning for each; stop when there are too many."""
+    check_unreadable(bad, limit)
+    for rel, err in bad.items():
+        print(f"  WARNING: skipped unreadable image {rel} ({err})", flush=True)
+    return {mode: df[~df.relpath.isin(bad)].reset_index(drop=True) for mode, df in selected.items()}
+
+
+def embed_images(model, relpaths, root, batch_size, workers, region_of=None, flips=None,
+                 max_unreadable=MAX_UNREADABLE, already_bad=0):
+    """(embeddings (N, D) of root/<relpath> in order, {relpath: error} of unreadable images), with progress
+    and a time estimate. Rows of unreadable images stay zero; drop those images before scoring. Stops as
+    soon as more than `max_unreadable` images fail (counting `already_bad` from an earlier pass), instead
+    of after the whole pass.
 
     region_of: for a model with a region input (attnet_gate), a function relpaths -> (n, 8, 8, 1) regions.
     flips: optional (N,) bool, True for the images to mirror left-right before embedding.
     """
-    emb, t0 = None, time.time()
+    emb, bad, t0 = None, {}, time.time()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for start in range(0, len(relpaths), batch_size):
-            batch = relpaths[start:start + batch_size]
-            paths = [os.path.join(root, r) for r in batch]
+            chunk = relpaths[start:start + batch_size]
+            paths = [os.path.join(root, r) for r in chunk]
             if flips is None:
-                images = np.stack(list(pool.map(load_image, paths)))
+                loaded = list(pool.map(try_load_image, paths))
             else:
-                images = np.stack(list(pool.map(load_image, paths, flips[start:start + batch_size])))
-            if region_of is None:
-                e = embed(model, images, batch_size=batch_size)
-            else:
-                e = embed_regions(model, images, region_of(batch), batch_size=batch_size)
-            if emb is None:
-                emb = np.zeros((len(relpaths), e.shape[1]), np.float32)
-            emb[start:start + len(e)] = e
-            done = start + len(e)
+                loaded = list(pool.map(try_load_image, paths, flips[start:start + batch_size]))
+            good = [i for i, (img, _) in enumerate(loaded) if img is not None]
+            bad.update({chunk[i]: err for i, (img, err) in enumerate(loaded) if img is None})
+            check_unreadable(bad, max_unreadable, already_bad)
+            if good:
+                images = np.stack([loaded[i][0] for i in good])
+                if region_of is None:
+                    e = embed(model, images, batch_size=batch_size)
+                else:
+                    e = embed_regions(model, images, region_of([chunk[i] for i in good]), batch_size=batch_size)
+                if emb is None:
+                    emb = np.zeros((len(relpaths), e.shape[1]), np.float32)
+                emb[[start + i for i in good]] = e
+            done = start + len(chunk)
             if (start // batch_size) % 50 == 0 or done == len(relpaths):
                 rate = done / max(time.time() - t0, 1e-9)
                 print(f"  embedded {done}/{len(relpaths)} images | {(time.time() - t0) / 60:.1f} min | "
                       f"about {(len(relpaths) - done) / rate / 60:.1f} min left", flush=True)
-    return emb
+    if emb is None:
+        raise SystemExit(f"none of the {len(relpaths)} images could be read (check --data-root)")
+    return emb, bad
 
 
 X1_NO_REGION = ("x1 is not available for attnet_gate: its region input needs eye masks, and the masks of 17 / 21 "
@@ -750,6 +800,14 @@ def main():
                          "|gaze|) or strict (annotated pose 0 and gaze 0 only)")
     ap.add_argument("--max-subjects", type=int, default=None,
                     help="smoke run: keep the first N subjects of each mode (x1: the first N persons)")
+    ap.add_argument("--max-frame", type=int, default=None,
+                    help="drop VISOB images whose frame number is above this, in p1/p2/p3 and both phases (templates "
+                         "and probes); 1009 removes the frames numbered 1010 and up. 16 tested only the enrollment "
+                         "ones (found synthetic); the few verification ones (about 3 %%) are dropped too but were "
+                         "never tested. x1 images are never dropped (default: keep all)")
+    ap.add_argument("--max-unreadable", type=int, default=MAX_UNREADABLE,
+                    help="skip up to this many images that cannot be read, VISOB and x1 together (listed in the "
+                         "summary); stop if more")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--workers", type=int, default=8, help="threads that read images")
     ap.add_argument("--n-boot", type=int, default=1000, help="bootstrap resamples for the CIs (0: no CIs)")
@@ -793,11 +851,15 @@ def main():
           f"{described}")
     visob = [m for m in modes if m in VISOB_MODES]
     root = (args.data_root or find_root()) if visob else args.data_root      # x1 alone needs no VISOB
-    selected = select_images(modes, args, seen)
+    selected, dropped_frames = select_images(modes, args, seen)
     for mode, df in selected.items():
         if df.empty:
-            raise SystemExit(f"{mode}: no images selected (check --manifest, --test-list, --p3-list"
+            raise SystemExit(f"{mode}: no images selected (check --manifest, --test-list, --p3-list, --max-frame"
                              f"{', --external-manifest' if mode == 'x1' else ''})")
+        if mode in dropped_frames:
+            d = dropped_frames[mode]
+            print(f"{mode}: dropped frames above {args.max_frame}: {d['enrollment']} enrollment, "
+                  f"{d['verification']} verification")
         print(f"{mode}: {len(df)} images of {df.subject.nunique()} subjects "
               f"({int((df.phase == 'enrollment').sum())} enrollment, {int((df.phase == 'verification').sum())} "
               f"verification){' | smoke run' if args.max_subjects else ''}")
@@ -817,11 +879,14 @@ def main():
     relpaths = sorted(set().union(*(set(selected[m].relpath) for m in visob)))
     region_of = region_lookup(model, args.region_masks, relpaths, external="x1" in selected)
     emb = emb_x = None
+    unreadable, unreadable_x = {}, {}
     if relpaths:
         print(f"embedding {len(relpaths)} images (batch {args.batch_size}) from {root}", flush=True)
         t = time.time()
-        emb = embed_images(model, relpaths, root, args.batch_size, args.workers, region_of)
+        emb, unreadable = embed_images(model, relpaths, root, args.batch_size, args.workers, region_of,
+                                       max_unreadable=args.max_unreadable)
         timing["embedding_s"] = round(time.time() - t, 1)
+        selected.update(drop_unreadable({m: selected[m] for m in visob}, unreadable, args.max_unreadable))
         row_of = {r: i for i, r in enumerate(relpaths)}
         for mode in visob:
             selected[mode]["row"] = selected[mode].relpath.map(row_of).to_numpy()
@@ -831,9 +896,14 @@ def main():
               f"{external_root}", flush=True)
         t = time.time()
         flips = selected["x1"].flip.to_numpy() if args.x1_protocol == "alonso2025" else None
-        emb_x = embed_images(model, ext_relpaths, external_root, args.batch_size, args.workers, region_of, flips)
+        emb_x, unreadable_x = embed_images(model, ext_relpaths, external_root, args.batch_size, args.workers,
+                                           region_of, flips, max_unreadable=args.max_unreadable,
+                                           already_bad=len(unreadable))
         timing["embedding_x1_s"] = round(time.time() - t, 1)
-        selected["x1"]["row"] = np.arange(len(ext_relpaths))
+        selected.update(drop_unreadable({"x1": selected["x1"]}, unreadable_x,
+                                        args.max_unreadable - len(unreadable)))
+        row_of_x = {r: i for i, r in enumerate(ext_relpaths)}
+        selected["x1"]["row"] = selected["x1"].relpath.map(row_of_x).to_numpy()
 
     all_rows, curves, samples, per_mode = [], {}, [], {}
     for mode in modes:
@@ -884,19 +954,27 @@ def main():
     if "x1" in labels:
         labels["x1"] = labels["x1"].replace("X1 ", f"X1 ({args.external_name}) ", 1)
     plot_curves(curves, labels, paths["verification_roc_det"])
-    if args.save_embeddings and emb is not None:
-        np.savez_compressed(paths["embeddings"], embeddings=emb.astype(np.float16), relpaths=np.array(relpaths))
+    if args.save_embeddings and emb is not None:      # unreadable images (zero rows) are left out
+        readable = np.array([r not in unreadable for r in relpaths], bool)
+        np.savez_compressed(paths["embeddings"], embeddings=emb[readable].astype(np.float16),
+                            relpaths=np.array(relpaths)[readable])
     if args.save_embeddings and emb_x is not None:
+        readable_x = np.array([r not in unreadable_x for r in ext_relpaths], bool)
         np.savez_compressed(os.path.join(args.out_dir, f"embeddings_{args.external_name}_{args.tag}.npz"),
-                            embeddings=emb_x.astype(np.float16), relpaths=np.array(selected["x1"].relpath.tolist()))
+                            embeddings=emb_x[readable_x].astype(np.float16),
+                            relpaths=np.array(ext_relpaths)[readable_x])
 
     timing["total_minutes"] = round((time.time() - t0) / 60, 1)
     summary = {"tag": args.tag, "ckpt": args.ckpt, "git_commit": git_commit(), "modes": modes,
                "data_root": root, "manifest": args.manifest, "test_list": args.test_list, "p3_list": args.p3_list,
                "training_subjects": seen_source, "training_images_by_phase": train_phases,
-               "max_subjects": args.max_subjects, "n_boot": args.n_boot, "seed": args.seed,
+               "max_subjects": args.max_subjects, "max_frame": args.max_frame,
+               "frames_dropped_above_max_frame": dropped_frames,
+               "unreadable_images": {**unreadable, **unreadable_x},
+               "n_boot": args.n_boot, "seed": args.seed,
                "batch_size": args.batch_size, "score_grid_step": 1.0 / BINS_PER_UNIT,
-               "n_images_embedded": len(relpaths), "embedding_dim": int((emb if emb is not None else emb_x).shape[1]),
+               "n_images_embedded": len(relpaths) - len(unreadable),
+               "embedding_dim": int((emb if emb is not None else emb_x).shape[1]),
                "comparisons": "same eye only; FAR = false match rate, FRR = false non-match rate",
                "per_mode": per_mode, "timing": timing}
     if "x1" in modes:                     # only with x1, so that p1 / p2 / p3 summaries keep their keys

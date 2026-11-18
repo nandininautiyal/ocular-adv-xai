@@ -195,6 +195,27 @@ def test_cross_session_and_open_set_cli(tmp_path, monkeypatch, capsys):
     assert pd.read_csv(tmp_path / "open.csv").link_path.str.startswith(str(tmp_path / "data")).all()
 
 
+def test_max_frame_leaves_out_late_frames(tmp_path, monkeypatch, capsys):
+    m = _bucket_manifest()
+    m.to_csv(tmp_path / "manifest_raw.csv", index=False)
+    common = ["--manifest", tmp_path / "manifest_raw.csv", "--root", tmp_path / "data", "--max-frame", 1002]
+    _run(monkeypatch, *common, "--protocol", "cross_session", "--out-dir", tmp_path / "cs",
+         "--out-manifest", tmp_path / "cs.csv")
+    cs = pd.read_csv(tmp_path / "cs.csv")
+    paper = m[split_script.in_paper_classes(m.subject)]
+    assert cs.idx.max() == 1002 and len(cs) == int((paper.idx <= 1002).sum())
+    assert set(cs.split) == {"train", "validation", "test"}
+    late = m[m.idx > 1002]                                # counted on the whole manifest, before the classes
+    assert (f"left out {int((late.phase == 'enrollment').sum())} enrollment, "
+            f"{int((late.phase == 'verification').sum())} verification") in capsys.readouterr().out
+    _run(monkeypatch, *common, "--protocol", "open_set", "--out-manifest", tmp_path / "open.csv")
+    assert pd.read_csv(tmp_path / "open.csv").idx.max() == 1002
+    with pytest.raises(SystemExit):                       # the pinned random test list holds late frames
+        _run(monkeypatch, *common, "--protocol", "random", "--out-dir", tmp_path / "r")
+    kept, dropped = split_script.drop_late_frames(m.drop(columns="idx"), 1002)   # no idx column: parsed
+    assert len(kept) == int((m.idx <= 1002).sum()) and sum(dropped.values()) == int((m.idx > 1002).sum())
+
+
 def test_val_frac_must_be_a_fraction(tmp_path, monkeypatch):
     _bucket_manifest().to_csv(tmp_path / "manifest_raw.csv", index=False)
     with pytest.raises(SystemExit):                        # 25 meant as 25 %: all but one bucket would validate

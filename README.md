@@ -161,7 +161,8 @@ files are gitignored; the checkpoint is 1.7 GB). The current pipeline uses VISOB
   licence fields conflict; the official route is a signed VISOB Data Sharing Agreement, to be
   requested through the supervisor. `scripts/01_build_manifest.py` documents the expected layout.
   Never redistribute the images.
-- Checkpoint `Xception_ArcFace_full.keras`: a private Kaggle Dataset shared by Nandini;
+- Checkpoint `Xception_ArcFace_full.keras`: a Kaggle Dataset of Nandini's, meant to be private
+  (it was still public on 18 Nov 2026; the owner is to make it private);
   ask her to share it with your Kaggle account.
 
 ## Where results live

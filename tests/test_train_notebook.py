@@ -152,6 +152,9 @@ def test_commands_follow_the_protocol():
     cmd = ns["CMD"]
     assert "--protocol cross_session" in cmd["02_cross_session"] and "--write-split-csvs" in cmd["02_cross_session"]
     assert "--max-classes" in cmd["02_small"] and "--out-manifest" in cmd["02_small"]
+    assert ns["MAX_FRAME"] == 1009 and all("--max-frame 1009" in cmd[k] for k in ("02_cross_session", "02_open_set",
+                                                                                "02_small"))
+    assert all("--max-frame 1009" in c for k, c in cmd.items() if k.startswith("15_"))
     for seed in ns["SEEDS"]:
         t = f"cs_s{seed}"
         assert f"--seed {seed} " in cmd[f"03_{t}"] and f"--tag {t}" in cmd[f"03_{t}"]
