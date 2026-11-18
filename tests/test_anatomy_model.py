@@ -443,6 +443,27 @@ def test_03_trains_every_arch_and_resumes(split_tree, tmp_path, monkeypatch, cap
     assert "nothing to resume" in capsys.readouterr().out
 
 
+def test_03_resume_with_another_mask_loss_weight_stops(split_tree, tmp_path, monkeypatch):
+    tree, masks, cfg_path = split_tree
+    kill = [True]
+
+    def callbacks(*args, f=train_script.make_callbacks, **kwargs):
+        cbs = f(*args, **kwargs)
+        return cbs[:-1] + [StopAfterLogging()] + cbs[-1:] if kill[0] else cbs
+
+    monkeypatch.setattr(train_script, "make_callbacks", callbacks)
+    out = tmp_path / "models"
+    args = ["--cfg", cfg_path, "--arch", "attn_mask", "--masks", masks, "--resume"]
+    with pytest.raises(Killed):
+        _train(monkeypatch, tree, out, *args, "--mask-loss-weight", "0.5")
+    kill[0] = False
+    log = (out / "log_t.csv").read_text()
+    with pytest.raises(SystemExit, match=r"cfg\.anatomy\.mask_loss_weight: 0\.5 -> 0\.7"):
+        _train(monkeypatch, tree, out, *args, "--mask-loss-weight", "0.7")
+    assert train_script.backup_exists(str(out / "backup_t")) and (out / "log_t.csv").read_text() == log
+    assert not (out / "run_t.json").exists()
+
+
 def test_03_baseline_record_and_flags_are_unchanged(split_tree, tmp_path, monkeypatch, capsys):
     tree, masks, _ = split_tree
     monkeypatch.setattr(train_script, "build_model", lambda cfg: _tiny_baseline(cfg))

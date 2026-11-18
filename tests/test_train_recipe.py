@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -206,8 +207,36 @@ def test_resume_continues_after_an_interruption(tree, tmp_path, monkeypatch, cap
     assert "nothing to resume" in capsys.readouterr().out
     assert (out / "run_t.json").read_text() == before and len(pd.read_csv(out / "log_t.csv")) == 3
 
-    run = _train(monkeypatch, tree, out, "--epochs", "2", "--cfg", CROSS_SESSION, "--resume")   # another command
-    assert not run["resumed"] and run["epochs_run"] == 2 and run["args"]["epochs"] == 2
+    ckpt = _sha256(out / "Xception_ArcFace_t.keras")         # another epochs cap: stops, the finished run is kept
+    with pytest.raises(SystemExit, match=r"cfg\.training\.epochs: 3 -> 2"):
+        _train(monkeypatch, tree, out, "--epochs", "2", "--cfg", CROSS_SESSION, "--resume")
+    assert (out / "run_t.json").read_text() == before and _sha256(out / "Xception_ArcFace_t.keras") == ckpt
+
+
+def test_a_finished_run_is_recognised_under_other_paths_and_verbosity(tree, tmp_path, monkeypatch, capsys):
+    # the same data, config and models copied elsewhere (another Kaggle mount): only paths and --verbose differ
+    out = tmp_path / "models"
+    _train(monkeypatch, tree, out, "--epochs", "1", "--resume")
+    tree2, out2, cfg2 = tmp_path / "tree_copy", tmp_path / "models_copy", tmp_path / "copy_of_baseline.yml"
+    shutil.copytree(tree, tree2)
+    shutil.copytree(out, out2)
+    shutil.copy(BASELINE, cfg2)
+    before, log = (out2 / "run_t.json").read_text(), (out2 / "log_t.csv").read_text()
+    capsys.readouterr()
+    _train(monkeypatch, tree, out2, "--epochs", "1", "--resume", "--verbose", "2", "--split-dir", tree2,
+           "--cfg", cfg2)
+    assert "nothing to resume" in capsys.readouterr().out
+    assert (out2 / "run_t.json").read_text() == before and (out2 / "log_t.csv").read_text() == log
+
+
+def test_a_finished_run_with_another_seed_is_not_trained_over(tree, tmp_path, monkeypatch):
+    out = tmp_path / "models"
+    _train(monkeypatch, tree, out, "--epochs", "1", "--resume")
+    before, ckpt = (out / "run_t.json").read_text(), _sha256(out / "Xception_ArcFace_t.keras")
+    with pytest.raises(SystemExit, match="seed: 42 -> 7") as stop:
+        _train(monkeypatch, tree, out, "--epochs", "1", "--resume", "--seed", "7")
+    assert "another --tag or --out-dir" in str(stop.value)
+    assert (out / "run_t.json").read_text() == before and _sha256(out / "Xception_ArcFace_t.keras") == ckpt
 
 
 class StopAfterBackup(tf.keras.callbacks.Callback):
