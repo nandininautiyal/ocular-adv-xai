@@ -23,7 +23,12 @@ with right), in one of two ways:
 - all pairs within one set (pair_counts), e.g. the pinned test set;
 - enrolment templates against probes (build_templates, template_scores): a
   template is the mean of one subject's enrolment embeddings of one eye,
-  renormalised.
+  renormalised. Where classes are not persons (cross-dataset UBIPr, one class
+  per eye), exclude_same_person drops a probe's comparisons with the other
+  classes of its person;
+- an explicit list of single-image comparisons (pair_list_counts), e.g. the
+  UBIPr protocol of Alonso-Fernandez et al. 2025 (alonso2025_select picks its
+  images, alonso2025_pairs its genuine and impostor comparisons).
 
 Large score sets
 ----------------
@@ -192,6 +197,24 @@ def template_scores(templates, template_subjects, probes, probe_subjects, templa
     return scores, own
 
 
+def exclude_same_person(scores, own, probe_persons, template_persons):
+    """Leave out the comparisons of a probe with another class of its own person.
+
+    For datasets whose classes are not persons (UBIPr: one class per eye, and a few persons under
+    two IDs), a probe scored against a template of another class of its person is neither a
+    genuine nor an impostor comparison. Those scores become NaN, which template_counts, ranks and
+    the score samples skip.
+
+    Returns
+    -------
+    (scores with those entries NaN (float32), number of comparisons left out)
+    """
+    scores = np.asarray(scores, np.float32)
+    other = ((np.asarray(probe_persons)[:, None] == np.asarray(template_persons)[None, :])
+             & ~np.asarray(own, bool) & ~np.isnan(scores))
+    return np.where(other, np.nan, scores).astype(np.float32), int(other.sum())
+
+
 def template_counts(scores, own, subjects, max_block=1 << 24):
     """Genuine and impostor score counts of a probe x template matrix, per probe subject.
 
@@ -218,6 +241,133 @@ def template_counts(scores, own, subjects, max_block=1 << 24):
         impostor += np.bincount(key[valid & ~is_own], minlength=size)
     return {"subjects": ids, "genuine": genuine.reshape(len(ids), N_BINS),
             "impostor": impostor.reshape(len(ids), N_BINS)}
+
+
+def pair_list_counts(scores, genuine, clusters):
+    """Genuine and impostor score counts of an explicit list of comparisons, per cluster.
+
+    Parameters
+    ----------
+    scores : (n_pairs,) score of each comparison (NaN is skipped)
+    genuine : (n_pairs,) bool, True for a genuine comparison
+    clusters : (n_pairs,) bootstrap cluster of each comparison (e.g. the person of its first image)
+
+    Returns
+    -------
+    dict with ``subjects`` (sorted unique clusters, the rows) and int64 counts ``genuine``,
+    ``impostor`` (n_clusters, N_BINS), as template_counts returns them
+    """
+    scores, genuine = np.asarray(scores, np.float64), np.asarray(genuine, bool)
+    ids, cidx = np.unique(np.asarray(clusters), return_inverse=True)
+    size = len(ids) * N_BINS
+    valid = ~np.isnan(scores)
+    key = cidx * N_BINS + score_bins(np.where(valid, scores, 0.0))
+    return {"subjects": ids,
+            "genuine": np.bincount(key[valid & genuine], minlength=size).reshape(len(ids), N_BINS),
+            "impostor": np.bincount(key[valid & ~genuine], minlength=size).reshape(len(ids), N_BINS)}
+
+
+# ------------------------------------------- UBIPr protocol of Alonso-Fernandez et al. 2025
+
+# Alonso-Fernandez et al. 2025 (arXiv 2510.26282, Sect. III-IV) on UBIPr: one frontal image per eye, session and
+# distance of 86 persons with two sessions (1,718 images), both eyes one identity (left-eye crops flipped), distance
+# index D1 = 8 m ... D5 = 4 m, and the score counts they report.
+ALONSO2025_DISTANCES = (8, 7, 6, 5, 4)
+ALONSO2025_PAPER = {"persons": 86, "images": 1718, "genuine": 8600, "impostor": 438600,
+                    "genuine_per_person_intra": 4, "genuine_per_person_cross": 8, "impostor_per_person_pair": 4,
+                    "distance_combinations": 15}
+
+
+def alonso2025_select(class_ids, persons, sessions, distances, poses, gazes, image_idx, rule="closest"):
+    """Images of the protocol of Alonso-Fernandez et al. 2025: one frontal image per class, session and distance.
+
+    The paper selects "frontal images ... one image per eye/session/distance" of the persons with two sessions,
+    without saying how. UBIPr captures three images per session and distance (frontal, then two gaze or pose
+    variations) and annotates every image's pose and gaze angles.
+
+    rule : 'closest' takes the image whose annotated angles are closest to frontal (smallest |pose| + |gaze|);
+           'strict' takes only images annotated pose 0 and gaze 0. Ties: the lowest image index (the first capture
+           at that distance).
+    Then only persons with a selected image in both sessions are kept.
+
+    Returns
+    -------
+    bool (n,): True for the selected images
+    """
+    if rule not in ("closest", "strict"):
+        raise ValueError(f"unknown frontal rule {rule!r}: use 'closest' or 'strict'")
+    class_ids, persons, sessions = np.asarray(class_ids), np.asarray(persons), np.asarray(sessions)
+    distances, image_idx = np.asarray(distances), np.asarray(image_idx)
+    poses, gazes = np.asarray(poses, np.float64), np.asarray(gazes, np.float64)
+    deviation = np.abs(poses) + np.abs(gazes)
+    candidate = np.isin(sessions, (1, 2)) & np.isfinite(deviation)
+    if rule == "strict":
+        candidate &= deviation == 0
+    rows = np.flatnonzero(candidate)
+    order = rows[np.lexsort((image_idx[rows], deviation[rows], distances[rows], sessions[rows], class_ids[rows]))]
+    keys = np.stack([class_ids[order], sessions[order], distances[order]], axis=1)
+    first = np.ones(len(order), bool)
+    first[1:] = (keys[1:] != keys[:-1]).any(axis=1)
+    chosen = np.zeros(len(class_ids), bool)
+    chosen[order[first]] = True
+    with_s1 = set(persons[chosen & (sessions == 1)].tolist())
+    with_s2 = set(persons[chosen & (sessions == 2)].tolist())
+    return chosen & np.isin(persons, sorted(with_s1 & with_s2))
+
+
+def alonso2025_pairs(persons, sessions, distance_index):
+    """The comparisons of the UBIPr protocol of Alonso-Fernandez et al. 2025 (identities = persons).
+
+    For every distance combination (Di, Dj), i <= j (D1 = 8 m ... D5 = 4 m; 5 intra- and 10 cross-distance):
+    - genuine, intra-distance (i = j): each session-1 image at Di against each session-2 image at Di of the same
+      person (both eyes: 4 comparisons per person);
+    - genuine, cross-distance (i < j): each session-1 image at Di against each image of both sessions at Dj of the
+      same person (8 per person);
+    - impostor: each session-1 image at Di against each session-2 image at Dj of every other person (4 per pair
+      of persons).
+    The paper does not say which distance of a cross-distance pair gives the session-1 image; its figure labels
+    the pairs Di-Dj with i < j, so Di (the farther one) does here.
+
+    Parameters
+    ----------
+    persons, sessions : (n,) identity and session (1 or 2) of each image
+    distance_index : (n,) i of Di
+
+    Returns
+    -------
+    dict of (n_pairs,) arrays: ``first`` (index of the session-1 image), ``second``, ``genuine`` (bool),
+    ``di``, ``dj``; ordered by combination (i, then j), then first, then second
+    """
+    persons, sessions, d = np.asarray(persons), np.asarray(sessions), np.asarray(distance_index)
+    out = {k: [] for k in ("first", "second", "genuine", "di", "dj")}
+    levels = np.unique(d)
+    for k, i in enumerate(levels):
+        first = np.flatnonzero((sessions == 1) & (d == i))
+        for j in levels[k:]:
+            second_s2 = np.flatnonzero((sessions == 2) & (d == j))
+            pool = second_s2 if i == j else np.flatnonzero(d == j)
+            a, b = np.meshgrid(first, np.union1d(pool, second_s2), indexing="ij")
+            a, b = a.ravel(), b.ravel()
+            same = persons[a] == persons[b]
+            genuine = same & np.isin(b, pool)
+            impostor = ~same & np.isin(b, second_s2)
+            keep = genuine | impostor
+            out["first"].append(a[keep])
+            out["second"].append(b[keep])
+            out["genuine"].append(genuine[keep])
+            out["di"].append(np.full(int(keep.sum()), i))
+            out["dj"].append(np.full(int(keep.sum()), j))
+    if not out["first"]:
+        return {"first": np.zeros(0, np.int64), "second": np.zeros(0, np.int64), "genuine": np.zeros(0, bool),
+                "di": np.zeros(0, np.int64), "dj": np.zeros(0, np.int64)}
+    return {k: np.concatenate(v) for k, v in out.items()}
+
+
+def alonso2025_nominal_counts(n_persons, n_distances=len(ALONSO2025_DISTANCES)):
+    """(genuine, impostor) counts of the protocol when every person has every image (86 persons: 8600, 438600)."""
+    n, d = int(n_persons), int(n_distances)
+    combos_cross = d * (d - 1) // 2
+    return 4 * n * d + 8 * n * combos_cross, 4 * n * (n - 1) * (d + combos_cross)
 
 
 def ranks(scores, own):

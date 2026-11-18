@@ -27,7 +27,8 @@ import tensorflow as tf
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
-from src.models.recognition_model import ArcFace  # noqa: E402  (also puts third_party/ABRobOcular on sys.path)
+from src.models.recognition_model import ArcFace  # noqa: E402,F401  (also puts third_party/ABRobOcular on sys.path)
+from src.models.anatomy_model import CUSTOM_OBJECTS  # noqa: E402  (ArcFace and the anatomy-head layers)
 from AB_Rob_Ocular.AB_Rob_Ocular_Tensor import OcularAdversarialAttacks as OAA  # noqa: E402
 
 
@@ -53,7 +54,7 @@ def main():
         except Exception as e:
             print("memory growth:", e)
 
-    model = tf.keras.models.load_model(args.ckpt, custom_objects={"ArcFace": ArcFace})
+    model = tf.keras.models.load_model(args.ckpt, custom_objects=CUSTOM_OBJECTS)
     zeros = np.zeros((1, args.n_classes), dtype="float32")   # margin-free inference, as in the reference
 
     def predict(xb):

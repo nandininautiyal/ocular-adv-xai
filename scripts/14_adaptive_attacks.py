@@ -20,7 +20,13 @@ For each image x budget x defence D (JPEG at --jpeg-quality, bit depth at --bits
   tr_pgd    transform-robust: maximises the margin loss on the image and on
             D(image) together, so it has to fool the model with and without D
             (the attack a detector comparing x with D(x) would face).
-The three attacks use the same steps, step size and random start (seed + batch
+  aas_pgd   optional (--attacks ...,aas_pgd), non-adaptive like pgd: PGD whose
+            steps follow the attention-temperature-scaled model that helps most
+            (--taus; src/attacks/masking.py, in the style of Adaptive Attention
+            Scaling). It checks that a saturated attention softmax does not mask
+            the gradient of the attention models; on a model without attention
+            it is pgd.
+The attacks use the same steps, step size and random start (seed + batch
 start), so they differ only in what they optimise. Every attacked image is an
 8-bit image within whole 8-bit levels of the budget (default 1, 2 and 4 of 255).
 
@@ -69,13 +75,15 @@ import tensorflow as tf
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, REPO)
 from src.attacks.adaptive import bpda_pgd, identity, transform_robust_pgd  # noqa: E402
+from src.attacks.masking import DEFAULT_TAUS, aas_pgd, check_taus  # noqa: E402
 from src.attacks.whitebox import pgd  # noqa: E402
 from src.compare.divergence import spearman, top_k_intersection  # noqa: E402
 from src.defences.inference import bit_depth_reduction, jpeg_compress  # noqa: E402
 from src.models.arcface_inference import load_checkpoint, predict_logits  # noqa: E402
 from src.xai.attribution import XAI_REGISTRY  # noqa: E402
 
-ATTACKS = ("pgd", "bpda_pgd", "tr_pgd")
+ATTACKS = ("pgd", "bpda_pgd", "tr_pgd", "aas_pgd")
+NON_ADAPTIVE = ("pgd", "aas_pgd")       # computed on the undefended model; the same image meets every defence
 BASE_COLS = ["image_id", "link_path", "relpath", "true_idx", "true_subject", "eye", "device", "lighting",
              "phase"]
 
@@ -210,9 +218,9 @@ def score(model, clean, labels, adv, defence, reference, xai_names, base_rows, i
     return rows
 
 
-def run_batch(model, clean, labels, base_rows, epsilons, defences, attacks=ATTACKS,
+def run_batch(model, clean, labels, base_rows, epsilons, defences, attacks=ATTACKS[:3],
               xai_names=("layercam", "eigencam"), steps=20, step_size=None, seed=0, quantised=True,
-              timings=None):
+              timings=None, taus=DEFAULT_TAUS):
     """Every attack x budget x defence on one batch of clean images.
 
     Parameters
@@ -226,9 +234,10 @@ def run_batch(model, clean, labels, base_rows, epsilons, defences, attacks=ATTAC
     attacks : subset of ATTACKS
     xai_names : names in XAI_REGISTRY; the maps explain the true class
     steps, step_size : for every attack (step_size None = 2.5 * epsilon / steps)
-    seed : random-start seed, shared by the three attacks
+    seed : random-start seed, shared by the attacks
     quantised : 8-bit attacked images (default) or float
     timings : dict that collects seconds per attack and for scoring ("evaluate")
+    taus : attention temperatures of aas_pgd
 
     Returns
     -------
@@ -254,6 +263,12 @@ def run_batch(model, clean, labels, base_rows, epsilons, defences, attacks=ATTAC
             adv = quantise(adv, clean, eps) if quantised else adv
             _elapsed(timings, "pgd", start)
             adversarial.update({("pgd", name): adv for name in defences})
+        if "aas_pgd" in attacks:
+            start = time.perf_counter()
+            adv = aas_pgd(clean, model, eps, taus=taus, **common)
+            adv = quantise(adv, clean, eps) if quantised else adv
+            _elapsed(timings, "aas_pgd", start)
+            adversarial.update({("aas_pgd", name): adv for name in defences})
         for name, (defence, _) in defences.items():
             if "bpda_pgd" in attacks:
                 start = time.perf_counter()
@@ -269,7 +284,7 @@ def run_batch(model, clean, labels, base_rows, epsilons, defences, attacks=ATTAC
         start = time.perf_counter()
         for (attack, name), adv in adversarial.items():
             defence, param = defences[name]
-            info = {"attack": attack, "adaptive": attack != "pgd", "epsilon": eps,
+            info = {"attack": attack, "adaptive": attack not in NON_ADAPTIVE, "epsilon": eps,
                     "budget_levels": budget_levels(eps) if quantised else round(eps * 255.0, 3),
                     "defence": name, "defence_param": param, "steps": steps}
             rows += score(model, clean, labels, adv, defence, reference[name], xai_names, base_rows, info)
@@ -348,7 +363,10 @@ def main(argv=None):
     ap.add_argument("--jpeg-quality", type=int, default=75, help="JPEG quality of the jpeg defence")
     ap.add_argument("--bits", type=int, default=4, help="bit depth of the bit_depth defence")
     ap.add_argument("--attacks", default="pgd,bpda_pgd,tr_pgd",
-                    help="pgd (non-adaptive), bpda_pgd (adaptive), tr_pgd (transform-robust)")
+                    help="pgd (non-adaptive), bpda_pgd (adaptive), tr_pgd (transform-robust), aas_pgd "
+                         "(non-adaptive, attention-temperature scaling; add it for the attention models)")
+    ap.add_argument("--taus", default=",".join(f"{t:g}" for t in DEFAULT_TAUS),
+                    help="attention temperatures aas_pgd tries at every step")
     ap.add_argument("--steps", type=int, default=20, help="gradient steps of every attack")
     ap.add_argument("--step-size", type=float, default=None, help="default: 2.5 * epsilon / steps")
     ap.add_argument("--xai", default="layercam,eigencam", help="maps to compare; 'none' skips them")
@@ -372,6 +390,10 @@ def main(argv=None):
             raise SystemExit(f"unknown XAI method {name}; choose from {list(XAI_REGISTRY)}")
     if not attacks or not defence_names:
         raise SystemExit("need at least one attack and one defence")
+    try:
+        taus = check_taus([float(t) for t in args.taus.split(",") if t.strip()])
+    except ValueError as e:
+        raise SystemExit(f"--taus: {e}")
     if not 1 <= args.jpeg_quality <= 100 or not 1 <= args.bits <= 8:
         raise SystemExit("--jpeg-quality must be in [1, 100] and --bits in [1, 8]")
     if min(args.steps, args.batch_size, args.per_class) < 1:
@@ -426,7 +448,7 @@ def main(argv=None):
             print(f"  WARNING: {(pred != labels).sum()} 'correct' images are misclassified now")
         all_rows += run_batch(model, clean, labels, batch[base_cols].to_dict("records"), epsilons, defences,
                               attacks, xai_names, args.steps, args.step_size, args.seed + start, quantised,
-                              timings)
+                              timings, taus)
         done = start + len(batch)
         minutes = (time.time() - t0) / 60
         print(f"  {done}/{len(df)} images | {minutes:.1f} min | ETA {minutes / done * (len(df) - done):.1f} min",
@@ -435,7 +457,7 @@ def main(argv=None):
     rows = pd.DataFrame(all_rows)
     n = len(df)
     runs_per_image = {"pgd": len(epsilons), "bpda_pgd": len(epsilons) * len(defences),
-                      "tr_pgd": len(epsilons) * len(defences)}
+                      "tr_pgd": len(epsilons) * len(defences), "aas_pgd": len(epsilons)}
     per_run = {a: timings[a] / (n * runs_per_image[a]) for a in attacks}
     summary = {"tag": args.tag, "ckpt": args.ckpt, "git_commit": git_commit(), "n_images": int(n),
                "n_classes": int(df.true_idx.nunique()), "per_class": args.per_class,
@@ -448,6 +470,8 @@ def main(argv=None):
                "random_start": "uniform in the epsilon ball, seed + first index of the batch",
                "attack_loss": "margin (best other logit - true logit, margin-free logits)",
                "quantised_8bit": quantised, "xai": xai_names, "maps_explain": "true class",
+               **({"aas_taus": list(taus), "aas_tau_selection": "per step and image, the proposal after which "
+                   "the unscaled model's margin loss is largest"} if "aas_pgd" in attacks else {}),
                **summarise(rows),
                "seconds": {k: round(v, 1) for k, v in timings.items()},
                "seconds_per_image_per_run": {a: round(v, 3) for a, v in per_run.items()},
