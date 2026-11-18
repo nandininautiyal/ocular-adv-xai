@@ -463,6 +463,66 @@ def test_templates_prefer_the_other_phase(script, pair_inputs):
         script.choose_templates(sampled, pool.drop(index=5), seed=1)
 
 
+def _two_eye_pool(n_classes=6, per=3, eye_column=True):
+    """A correct-image pool with both eyes and both phases of every class (relpaths as in 01)."""
+    rows = []
+    for c in range(n_classes):
+        for eye in ("left", "right"):
+            for phase in ("enrollment", "verification"):
+                for k in range(per):
+                    name = f"{1000 + c}_{k}_{eye[0]}_c.png"
+                    rows.append({"link_path": f"/split/{1000 + c}/{phase}_{eye}_{name}",
+                                 "relpath": f"test_office/{phase}_{eye}_eye/{1000 + c}/{name}",
+                                 "true_idx": c, "eye": eye, "phase": phase})
+    frame = pd.DataFrame(rows)
+    return frame if eye_column else frame.drop(columns="eye")
+
+
+@pytest.mark.parametrize("eye_column", [True, False])
+def test_templates_have_the_probes_eye(script, eye_column):
+    """Left probes get left templates and right probes right ones (the eye column, else the relpath)."""
+    pool = _two_eye_pool(eye_column=eye_column)
+    eyes = script.image_eyes(pool)
+    assert eyes.tolist() == [r.split("/")[1].split("_")[1] for r in pool.relpath]
+    sampled = pool.iloc[::5].reset_index().rename(columns={"index": "image_id"})
+    assert set(eyes[sampled.image_id]) == {"left", "right"}
+    for seed in range(5):
+        templates = script.choose_templates(sampled, pool, seed=seed)
+        for kind, t in templates.items():
+            assert (eyes[t.template_image_id].to_numpy() == eyes[sampled.image_id].to_numpy()).all(), kind
+            assert t.same_eye.all() and t.other_phase.all()
+        assert (templates["genuine"].class_idx == sampled.true_idx).all()
+        assert (templates["impostor"].class_idx != sampled.true_idx).all()
+        assert (templates["genuine"].template_image_id != sampled.image_id).all()
+    again = script.choose_templates(sampled, pool, seed=4)
+    assert all(again[k].equals(templates[k]) for k in templates)                         # seeded
+
+
+def test_templates_fall_back_to_any_eye(script, capsys):
+    """Without a same-eye candidate the template is of the other eye, flagged and warned about once; the
+    impostor class is drawn among the classes that have the probe's eye."""
+    pool = _two_eye_pool(n_classes=4, per=1)
+    eyes = script.image_eyes(pool)
+    probe = pool.index[(pool.true_idx == 0) & (eyes == "right") & (pool.phase == "enrollment")][0]
+    # class 0 keeps only this right image; classes 1 and 2 lose theirs, so only class 3 has a right eye
+    drop = pool.index[(eyes == "right") & (pool.index != probe) & pool.true_idx.isin([0, 1, 2])]
+    reduced = pool.drop(index=drop)
+    sampled = reduced.loc[[probe]].reset_index().rename(columns={"index": "image_id"})
+    for seed in range(5):
+        capsys.readouterr()
+        templates = script.choose_templates(sampled, reduced, seed=seed)
+        genuine, impostor = templates["genuine"].iloc[0], templates["impostor"].iloc[0]
+        assert not genuine.same_eye and eyes[genuine.template_image_id] == "left" and genuine.class_idx == 0
+        assert impostor.same_eye and impostor.class_idx == 3 and eyes[impostor.template_image_id] == "right"
+        out = capsys.readouterr().out
+        assert out.count("WARNING") == 1 and "1 verification templates" in out and "genuine 1" in out
+    # no other class has the probe's eye: the impostor falls back too
+    alone = reduced.drop(index=reduced.index[(eyes[reduced.index] == "right") & (reduced.true_idx == 3)])
+    templates = script.choose_templates(sampled, alone, seed=0)
+    assert not templates["impostor"].same_eye.any() and not templates["genuine"].same_eye.any()
+    assert "impostor 1" in capsys.readouterr().out
+
+
 def test_verification_rows(fu_run, model, pair_inputs):
     """--verif-pairs: genuine and impostor rows on clean, noise and attack, with the cosine of the probe's
     embedding and the clean template's as v_full (efficiency holds as for every game)."""
@@ -495,6 +555,7 @@ def test_verification_rows(fu_run, model, pair_inputs):
     assert verif[[c for c in verif.columns if c.startswith("mass_")]].isna().all().all()
     assert summary["verification"]["enabled"] and summary["verification"]["other_phase"] == {"genuine": 4,
                                                                                             "impostor": 4}
+    assert summary["verification"]["same_eye"] == {"genuine": 4, "impostor": 4}
     assert summary["rows_per_target_kind"] == {k: int(v) for k, v in rows.target_kind.value_counts().items()}
     assert summary["forward_passes_by_method"]["templates"] == 8
     assert summary["forward_passes_by_method"]["asa_verif"] == verif[verif.target == "genuine"].groupby(

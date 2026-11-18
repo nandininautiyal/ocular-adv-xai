@@ -102,9 +102,11 @@ attack; noise is the same-budget control of the shifts) are also explained with 
 the cosine of the probe's embedding (the condition image) with a clean template embedding: a
 GENUINE template (another correct image of the same class from --correct-csv, preferring the other
 phase, i.e. the other session) and an IMPOSTOR template (an image of a class drawn with
-default_rng([--seed, image_id, 6]), also preferring the other phase). The coalition images are the
-same as for the classification score (built once, embedded separately). An image without another
-correct image of its class stops the run before the model loads.
+default_rng([--seed, image_id, 6]), also preferring the other phase). As in 15, both are of the
+probe's eye (left with left, right with right; a class holds both eyes of a subject); where no
+same-eye image exists any eye is used, with a warning and the count in the summary (same_eye). The
+coalition images are the same as for the classification score (built once, embedded separately). An
+image without another correct image of its class stops the run before the model loads.
 
 Run times: per image, condition and method, the wall time in seconds (time_<method>) and the forward
 passes (nfwd_<method>) of exact ASA (per hiding baseline: building the coalition images and their
@@ -232,6 +234,7 @@ import importlib.util
 import inspect
 import itertools
 import json
+import re
 import shutil
 import sys
 import time
@@ -890,25 +893,51 @@ def write_state(path, state):
     os.replace(path + ".tmp", path)
 
 
+EYE_RE = re.compile(r"(?:^|[/\\])(?:enrollment|verification)_(left|right)_eye(?:[/\\]|$)")
+
+
+def image_eyes(frame):
+    """The eye ('left' / 'right', None where unknown) of every row of *frame*: its eye column where that
+    holds left / right, else the <phase>_<eye>_eye folder of its relpath or link_path."""
+    out = pd.Series([None] * len(frame), index=frame.index, dtype=object)
+    if "eye" in frame.columns:
+        eye = frame["eye"].map(lambda e: str(e).strip().lower() if isinstance(e, str) else None)
+        out = eye.where(eye.isin(["left", "right"]), None).astype(object)
+    for column in ("relpath", "link_path"):
+        if column in frame.columns and out.isna().any():
+            found = frame[column].map(lambda p: (m.group(1) if isinstance(p, str) and (m := EYE_RE.search(p))
+                                                 else None))
+            out = out.where(out.notna(), found)
+    return out
+
+
 def choose_templates(sampled, pool, seed):
     """Verification templates of every sampled image, from the correct-image list *pool* (its index is
     the image_id): a GENUINE template (another image of the same class) and an IMPOSTOR template (an
-    image of another class, the class drawn with numpy default_rng([seed, image_id, 6])). Both prefer
-    an image of the other phase (enrollment / verification, i.e. the other session) when the class has
-    one; the image is drawn with default_rng([seed, image_id, 5 or 6]).
+    image of another class, the class drawn with numpy default_rng([seed, image_id, 6])). As in 15, a probe
+    is compared only with the same eye (a VISOB class holds both eyes of a subject): the genuine template is
+    an image of the probe's eye, and the impostor class is drawn among the other classes with an image of
+    the probe's eye, its template one of those images. Where no same-eye image exists (or the eye is unknown)
+    any image of the class is used, counted in one warning. Within those candidates both prefer an image of
+    the other phase (enrollment / verification, i.e. the other session); the image is drawn with
+    default_rng([seed, image_id, 5 or 6]). The eye comes from the eye column, else the relpath / link_path.
 
     Returns
     -------
     dict kind -> DataFrame aligned with *sampled*: template_image_id, relpath, link_path, class_idx,
-    other_phase (True where the template is from the other phase)
+    other_phase (True where the template is from the other phase), same_eye (True where the template is
+    of the probe's eye)
     Raises ValueError if an image's class has no other correct image.
     """
     has_phase = "phase" in pool.columns
+    pool = pool.assign(eye_=image_eyes(pool))
+    probe_eyes = image_eyes(sampled).tolist()
     by_class = {c: g for c, g in pool.groupby("true_idx", sort=True)}
     classes = np.array(sorted(by_class))
+    eyes_of = {c: set(g["eye_"].dropna()) for c, g in by_class.items()}
     out = {kind: [] for kind in VERIF_TARGETS}
-    missing = []
-    for row in sampled.itertuples():
+    missing, fallback = [], {kind: 0 for kind in VERIF_TARGETS}
+    for row, eye in zip(sampled.itertuples(), probe_eyes):
         image_id, label = int(row.image_id), int(row.true_idx)
         phase = getattr(row, "phase", None) if has_phase else None
         for kind in VERIF_TARGETS:
@@ -919,19 +948,29 @@ def choose_templates(sampled, pool, seed):
                 others = classes[classes != label]
                 if not len(others):
                     raise ValueError("an impostor template needs a second class in --correct-csv")
+                same = others[[eye in eyes_of[c] for c in others]] if eye is not None else others[:0]
+                others = same if len(same) else others
                 candidates = by_class[int(others[rng.integers(len(others))])]
             if not len(candidates):
                 missing.append(str(row.link_path))
                 continue
+            same_eye = candidates[candidates["eye_"] == eye] if eye is not None else candidates[:0]
+            if len(same_eye):
+                candidates = same_eye
+            else:
+                fallback[kind] += 1
             other = candidates[candidates.phase != phase] if has_phase and isinstance(phase, str) else candidates[:0]
             pick = other if len(other) else candidates
             chosen = pick.iloc[int(rng.integers(len(pick)))]
             out[kind].append({"template_image_id": int(chosen.name), "relpath": chosen.get("relpath"),
                               "link_path": chosen.link_path, "class_idx": int(chosen.true_idx),
-                              "other_phase": bool(len(other))})
+                              "other_phase": bool(len(other)), "same_eye": bool(len(same_eye))})
     if missing:
         raise ValueError(f"{len(missing)} sampled images have no other correct image of their class for a genuine "
                          f"template:\n  " + "\n  ".join(missing[:20]))
+    if any(fallback.values()):
+        print(f"WARNING: {sum(fallback.values())} verification templates have no candidate of the probe's eye (or "
+              f"the eye is unknown) and use any eye: " + ", ".join(f"{k} {n}" for k, n in fallback.items()))
     return {kind: pd.DataFrame(rows) for kind, rows in out.items()}
 
 
@@ -1021,8 +1060,8 @@ def main(argv=None):
                          "first of --baselines)")
     ap.add_argument("--verif-pairs", action="store_true",
                     help="also explain the verification score (cosine with a template embedding) against a "
-                         "genuine template (another correct image of the subject, preferably of the other phase) "
-                         "and a seeded impostor template; the probe is the condition image, templates stay clean")
+                         "genuine template (another correct image of the subject and eye, preferably of the other "
+                         "phase) and a seeded same-eye impostor template; the probe is the condition image, templates stay clean")
     ap.add_argument("--verif-conditions", default="clean,noise,attack",
                     help="conditions explained with --verif-pairs (noise: the same-budget control of the shifts)")
     ap.add_argument("--batch-size", type=int, default=16, help="images attacked together")
@@ -1144,7 +1183,8 @@ def main(argv=None):
         except ValueError as err:
             raise SystemExit(f"--verif-pairs: {err}")
         print("verification templates: " + ", ".join(
-            f"{kind} {int(t.other_phase.sum())} of {len(t)} from the other phase" for kind, t in templates.items()))
+            f"{kind} {int(t.other_phase.sum())} of {len(t)} from the other phase, {int(t.same_eye.sum())} of the "
+            f"probe's eye" for kind, t in templates.items()))
 
     # --- resume: the same settings and images as the stopped run, checked before the model loads ---------
     identity = {"args": {k: v for k, v in vars(args).items() if k not in RESUME_FREE},
@@ -1336,11 +1376,15 @@ def main(argv=None):
                    "seed": "default_rng([seed, image_id, 3 (kernelshap) | 4 (lime)])"},
                "verification": {
                    "enabled": bool(args.verif_pairs), "conditions": verif_conditions if args.verif_pairs else [],
-                   "templates": "genuine: another correct image of the class; impostor: an image of a class drawn "
-                                "with default_rng([seed, image_id, 6]); both prefer the other phase; the probe "
-                                "is the condition image, the template stays clean",
+                   "templates": "genuine: another correct image of the class and the probe's eye; impostor: an "
+                                "image of the probe's eye of a class drawn with default_rng([seed, image_id, 6]) "
+                                "among the classes with one (any eye where none exists, counted in same_eye); "
+                                "both prefer the other phase; the probe is the condition image, the template "
+                                "stays clean",
                    "other_phase": ({k: int(t.other_phase.sum()) for k, t in templates.items()}
-                                   if templates else None)},
+                                   if templates else None),
+                   "same_eye": ({k: int(t.same_eye.sum()) for k, t in templates.items()}
+                                if templates else None)},
                "agreement": {"sources": agreement_sources(part_estimators, pixel_estimators, cams, capabilities),
                              "maps": "256 x 256, non-negative: positive part (or patch) values spread uniformly "
                                      "over its pixels; CAMs and attention upsampled bilinearly and clipped at 0",
