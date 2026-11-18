@@ -610,17 +610,43 @@ def test_runtime_and_js_columns(fu_run):
     assert ((finite >= 0) & (finite <= 1)).all()
     assert true.js_asa__layercam.notna().mean() > 0.5
     assert rows[rows.target.isin(["genuine", "impostor"])][js].isna().all().all()
-    # recompute one divergence from the row's own part values
+    # every game with v_full != v_empty has a positive oriented phi (efficiency), so its ASA map exists and
+    # js_asa__layercam is finite wherever LayerCAM has mass, also where the attack won (v_full < v_empty)
+    cls = rows[rows.target.isin(["true", "pred"])]
+    cam_mass = cls.js_layercam__eigencam.notna() & (cls.v_full != cls.v_empty)
+    assert cls.js_asa__layercam[cam_mass].notna().all()
+    # recompute one divergence from the row's own part values, oriented as 23's faithfulness orients phi
+    from src.xai.shapley import oriented_phi
     row = true[(true.condition == "clean") & (true.baseline == "mean")].iloc[0]
     masks = group_masks(eye_labels(5)[int(row.image_id) % 5], CLASSES, normalise_groups(DEFAULT_GROUPS))
     player_map = player_map_from_masks(masks)
-    maps = {s: player_value_map(row[[f"{p}_{g}" for g in GROUPS]].to_numpy(float), player_map)
+    maps = {s: player_value_map(oriented_phi(row[[f"{p}_{g}" for g in GROUPS]].to_numpy(float), row.v_full,
+                                             row.v_empty), player_map)
             for s, p in (("a", "phi"), ("b", "lime_parts"))}
     if np.isfinite(row.js_asa__lime_parts):
         assert row.js_asa__lime_parts == pytest.approx(pairwise_js(maps)[("a", "b")], abs=1e-9)
     hardware = fu_run["summary"]["runtime"]["hardware"]
     assert hardware["cpu_threads"] and "gpus" in hardware
     assert fu_run["summary"]["runtime"]["warmup_seconds"] > 0
+
+
+def test_agreement_map_of_a_won_attack(script):
+    """Where the attack won (v_full < v_empty, every phi <= 0) the ASA map uses phi oriented as 23's
+    faithfulness orients it: it has mass, so its divergence from a CAM is finite rather than NaN."""
+    from src.xai.part_baselines import js_divergence, player_value_map
+    player_map = np.repeat(np.repeat(np.arange(4).reshape(2, 2), 8, axis=0), 8, axis=1)    # 4 quadrants
+    phi = np.array([-3.0, -1.0, -0.5, 0.0])
+    v_full, v_empty = -4.5, 0.0                                                            # efficiency holds
+    cam_on = {p: (player_map == p).astype(float) + 0.01 for p in range(4)}
+    assert player_value_map(phi, player_map).sum() == 0                     # the unoriented map: no mass
+    assert np.isnan(js_divergence(player_value_map(phi, player_map), cam_on[0]))
+    oriented = script.game_map(phi, v_full, v_empty, player_map)
+    np.testing.assert_allclose(oriented, player_value_map(-phi, player_map))
+    js = {p: js_divergence(oriented, cam) for p, cam in cam_on.items()}
+    assert all(np.isfinite(v) for v in js.values())
+    assert js[0] < js[1] < js[3]               # the most negative phi is the part that explains the gap most
+    up = np.array([3.0, 1.0, 0.5, 0.0])                                     # v_full >= v_empty: unchanged
+    np.testing.assert_array_equal(script.game_map(up, 4.5, 0.0, player_map), player_value_map(up, player_map))
 
 
 def test_fu_analysis_end_to_end(fu_run, analyse):

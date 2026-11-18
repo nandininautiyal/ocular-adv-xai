@@ -51,7 +51,8 @@ Tables (CSV in --out-dir):
                           clean and attacked images: rank agreement with phi (median, CI; phi is
                           oriented as the ASA deletion order orients it, i.e. sign-flipped where
                           v_full < v_empty, so a source that ranks the parts in that order
-                          agrees with +1, and both columns use one convention) and
+                          agrees with +1, and both columns use one convention; n_rank_finite =
+                          the rows with a finite rank correlation, n = all rows) and
                           deletion AUC (median, CI) with the paired difference from the random
                           order and from the ASA order (Wilcoxon p, Holm). The ASA order is
                           deleted on its own game, which favours it: compare the other sources
@@ -78,7 +79,10 @@ Tables (CSV in --out-dir):
                           sensitive to one-time costs in runs of 22 without a warm-up, so the report
                           quotes the median and IQR
   agreement.csv           pairwise Jensen-Shannon divergence (base 2) of the 256 x 256 attribution maps:
-                          median with CI per pair, condition, hiding baseline and target
+                          median with CI per pair, condition, hiding baseline and target; 22 builds
+                          the ASA and sampling-baseline maps from phi oriented as faithfulness.csv
+                          orients it (sign-flipped where v_full < v_empty), so rows where the
+                          attack won still have a map
 Figures: fig_phi_shift.png, fig_deletion.png. Report: report_asa.md.
 
 Usage:
@@ -510,7 +514,8 @@ def faithfulness(r, n_boot):
                 other = g[cols].to_numpy(np.float64)
                 rho = np.array([rank_agreement(a, b, p) for a, b, p in zip(phi, other, present)])
                 est, lo, hi = _median_ci(rho, subjects, n_boot)
-                row.update({"rank_agreement_median": est, "rank_ci_low": lo, "rank_ci_high": hi})
+                row.update({"n_rank_finite": int(np.isfinite(rho).sum()), "rank_agreement_median": est,
+                            "rank_ci_low": lo, "rank_ci_high": hi})
             auc = g[f"del_auc_{source}"].to_numpy(np.float64)
             est, lo, hi = _median_ci(auc, subjects, n_boot)
             row.update({"deletion_auc_median": est, "auc_ci_low": lo, "auc_ci_high": hi})
@@ -710,7 +715,9 @@ def runtime(r):
 def agreement(r, n_boot):
     """Pairwise Jensen-Shannon divergence (base 2) of the 256 x 256 attribution maps: median with its
     subject-cluster CI per pair, condition, hiding baseline and target (classification rows), and pooled
-    over the conditions."""
+    over the conditions. The js_ columns come from 22, whose ASA (and part / pixel baseline) maps use phi
+    oriented as in :func:`faithfulness` (oriented_phi: sign-flipped where v_full < v_empty), so a row where
+    the attack won (every phi <= 0) has a map and counts in n instead of dropping out as NaN."""
     columns = [c for c in r.columns if c.startswith("js_")]
     sub = r[r.target.isin(CLASS_TARGETS)]
     if not columns or not len(sub):
@@ -983,8 +990,9 @@ def _report_fu(tables, summary, args):
         lines += [f"## Agreement between attributions (true class, baseline {baseline})", "",
                   "Jensen-Shannon divergence (base 2) of the 256 x 256 maps as distributions (0 = the same, 1 = "
                   "disjoint; median and subject-cluster CI). ASA, the part baselines and the receipt spread their "
-                  "positive part values over the part's pixels, the pixel baselines their positive patch values; "
-                  "CAMs and attention are upsampled. Deletion curves stay the main faithfulness test.", ""]
+                  "positive part values over the part's pixels, the pixel baselines their positive patch values "
+                  "(ASA and the baselines oriented as in the faithfulness table: sign-flipped where v_full < "
+                  "v_empty); CAMs and attention are upsampled. Deletion curves stay the main faithfulness test.", ""]
         body = []
         for (a, b), g in t.groupby(["source_a", "source_b"], sort=False):
             v = g.set_index("condition")

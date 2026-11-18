@@ -122,7 +122,10 @@ Agreement: every attribution of a row becomes one 256 x 256 non-negative map (AS
 baselines and the receipt: positive part values spread uniformly over the part's pixels; pixel
 baselines: positive patch values over the patch's pixels; CAMs and attention: the native map upsampled
 bilinearly, clipped at 0), normalised to a distribution, and js_<a>__<b> is the Jensen-Shannon
-divergence (base 2) of every pair. Deletion curves stay the main faithfulness test.
+divergence (base 2) of every pair. The values of ASA and the part / pixel baselines are first
+oriented as asa_order and 23's faithfulness orient phi (sign-flipped where v_full < v_empty, e.g. the
+true class once the attack won), so such rows keep a map instead of dropping out as NaN. Deletion
+curves stay the main faithfulness test.
 
 Columns of rows_asa_<tag>.csv (one row per image x condition x baseline x target):
   row_id, image_id, relpath, link_path, true_idx, true_subject, eye, device, lighting, phase
@@ -262,7 +265,7 @@ from src.xai.part_baselines import (DEFAULT_PART_SAMPLES, DEFAULT_PATCH, DEFAULT
 from src.xai.shapley import (DEFAULT_GROUPS, DEFAULT_WORKERS, METHODS, asa_order, canonical_indices,  # noqa: E402
                              coalition_images, deletion_from_values, exact_shapley, format_groups, group_masks,
                              groups_from_config, model_outputs, normalise_groups, order_from_scores,
-                             parse_groups, part_masses, score_values, shapley_interactions)
+                             oriented_phi, parse_groups, part_masses, score_values, shapley_interactions)
 
 from src.models.anatomy_model import attention_maps, model_arch, part_names, part_receipt  # noqa: E402
 
@@ -585,6 +588,14 @@ def game_outputs(ctx, image, masks, method, cache, kinds):
     return outputs, present, int(len(needed)), seconds
 
 
+def game_map(phi, v_full, v_empty, player_map):
+    """Agreement map of attributions of one game (ASA, the part and pixel baselines): phi oriented as
+    asa_order and 23's faithfulness orient it (oriented_phi: sign-flipped where v_full < v_empty, e.g. the
+    true class once the attack won), then its positive values spread over the players' pixels. Without the
+    orientation a game whose phi are all <= 0 would have no map and its js_ columns would be NaN."""
+    return player_value_map(oriented_phi(phi, v_full, v_empty), player_map)
+
+
 def js_columns(ctx, maps):
     """js_<a>__<b> for every pair of the run's agreement sources (NaN where a map is missing or has no
     positive mass), from 256 x 256 maps (src/xai/part_baselines.pairwise_js)."""
@@ -690,7 +701,7 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
                         order = orders[src]
                         row[f"del_auc_{src}"] = (float("nan") if order is None
                                                  else deletion_from_values(values, order)["auc"])
-                maps = {"asa": player_value_map(phi, ctx.player_maps[i]), **native}
+                maps = {"asa": game_map(phi, values[-1], values[0], ctx.player_maps[i]), **native}
                 if "receipt" in scores:
                     maps["receipt"] = player_value_map(scores["receipt"], ctx.player_maps[i])
                 row.update({"time_asa": seconds["logits"], "nfwd_asa": n_game})
@@ -709,7 +720,7 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
                         parts, player_map = aggregate_to_parts(weights, ctx.patch_shares[i]), ctx.patches
                     row.update({f"{est}_{kind}_{g}": float(v) for g, v in zip(names, parts)})
                     row.update({f"time_{est}_{kind}": sec + time.perf_counter() - t, f"nfwd_{est}_{kind}": nf})
-                    maps[f"{est}_{kind}"] = player_value_map(weights, player_map)
+                    maps[f"{est}_{kind}"] = game_map(weights, values[-1], values[0], player_map)
                 row.update({f"value_{k}": float(v) for k, v in enumerate(values)})
                 row["n_forward"] = n_forward
                 row.update(run_times)
@@ -739,7 +750,7 @@ def condition_rows(ctx, images, info, extra=None, timings=None):
                     row.update({"time_asa": seconds["embedding"], "nfwd_asa": n_game,
                                 "template_image_id": int(template["image_id"][i]),
                                 "template_relpath": template["relpath"][i]})
-                    row.update(js_columns(ctx, {"asa": player_value_map(phi, ctx.player_maps[i])}))
+                    row.update(js_columns(ctx, {"asa": game_map(phi, values[-1], values[0], ctx.player_maps[i])}))
                     for column in ctx.optional:
                         row.setdefault(column, np.nan)
                     rows.append(row)
@@ -1061,7 +1072,8 @@ def main(argv=None):
     ap.add_argument("--verif-pairs", action="store_true",
                     help="also explain the verification score (cosine with a template embedding) against a "
                          "genuine template (another correct image of the subject and eye, preferably of the other "
-                         "phase) and a seeded same-eye impostor template; the probe is the condition image, templates stay clean")
+                         "phase) and a seeded same-eye impostor template; the probe is the condition image, "
+                         "templates stay clean")
     ap.add_argument("--verif-conditions", default="clean,noise,attack",
                     help="conditions explained with --verif-pairs (noise: the same-budget control of the shifts)")
     ap.add_argument("--batch-size", type=int, default=16, help="images attacked together")
@@ -1387,7 +1399,9 @@ def main(argv=None):
                                 if templates else None)},
                "agreement": {"sources": agreement_sources(part_estimators, pixel_estimators, cams, capabilities),
                              "maps": "256 x 256, non-negative: positive part (or patch) values spread uniformly "
-                                     "over its pixels; CAMs and attention upsampled bilinearly and clipped at 0",
+                                     "over its pixels (ASA and the part / pixel baselines: phi oriented as in "
+                                     "23's faithfulness, sign-flipped where v_full < v_empty); CAMs and "
+                                     "attention upsampled bilinearly and clipped at 0",
                              "divergence": "Jensen-Shannon, base 2, of the maps normalised to distributions"},
                "forward_passes_by_method": {k: int(v) for k, v in sorted(forwards_by.items())},
                "runtime": {"hardware": hardware(),
