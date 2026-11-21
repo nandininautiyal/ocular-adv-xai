@@ -214,7 +214,12 @@ def test_anatomy_config_is_cross_session_plus_the_anatomy_section():
         cross = yaml.safe_load(f)
     assert set(anatomy) == set(cross) | {"anatomy"}
     for section in cross:
-        assert anatomy[section] == cross[section]
+        if section == "training":         # the same recipe; only the cap is higher (the new heads start slower)
+            assert {k: v for k, v in anatomy[section].items() if k != "epochs"} == \
+                {k: v for k, v in cross[section].items() if k != "epochs"}
+            assert anatomy[section]["epochs"] == 40 and cross[section]["epochs"] == 30
+        else:
+            assert anatomy[section] == cross[section]
     assert am.anatomy_settings(anatomy) == am.anatomy_settings({})          # the file holds the defaults
 
 

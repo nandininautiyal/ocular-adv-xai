@@ -52,6 +52,24 @@ def test_kernelshap_with_every_coalition_is_exact_shapley(n):
     np.testing.assert_allclose(plan["weights"], expected / expected.sum())
 
 
+def test_part_budget_is_half_of_the_present_coalitions():
+    """The part baselines get half of the 2^P coalitions of the present parts, capped by --baseline-samples:
+    a fixed 16 would be every coalition of the 4 parts of an image without a brow, where KernelSHAP is exact
+    and its error against ASA 0 by construction."""
+    assert [pb.part_budget(n) for n in range(1, 7)] == [2, 2, 4, 8, 16, 16]
+    assert pb.part_budget(5, cap=8) == 8 and pb.part_budget(3, cap=100) == 4 and pb.part_budget(1, cap=1) == 2
+    with pytest.raises(ValueError):
+        pb.part_budget(0)
+    for n in (3, 4, 5):
+        assert pb.part_budget(n) < 1 << n                         # never every coalition from 2 players on
+        v = np.random.default_rng(n).normal(size=1 << n)          # a game with interactions
+        phi = pb.from_game("kernelshap", v, pb.part_budget(n), seed=0)
+        assert not np.allclose(phi, exact_shapley(v), atol=1e-6)  # a real estimate, not the exact answer
+        np.testing.assert_allclose(phi.sum(), v[-1] - v[0], atol=1e-10)     # efficiency still holds
+    np.testing.assert_allclose(pb.from_game("kernelshap", np.random.default_rng(0).normal(size=16), 16, 0),
+                               exact_shapley(np.random.default_rng(0).normal(size=16)), atol=1e-10)   # the old 16
+
+
 @pytest.mark.parametrize("budget", [6, 10, 16, 24, 31])
 def test_kernelshap_design_samples_without_replacement(budget):
     plan = pb.kernelshap_design(5, budget, seed=7)

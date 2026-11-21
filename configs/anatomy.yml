@@ -1,5 +1,6 @@
 # Anatomy-guided models (03_train_baseline.py --arch gap | attn | attn_mask | parts | attnet_gate):
-# configs/cross_session.yml unchanged plus the anatomy section at the end, so a difference from the
+# configs/cross_session.yml unchanged (except the epoch cap, 40 instead of 30: see training.epochs)
+# plus the anatomy section at the end, so a difference from the
 # cross-session baseline comes from the head (and its mask loss) only: same backbone, fine_tune_at,
 # ArcFace s and m, learning rate, batch size, schedule and augmentation. The selection rule is the same
 # too: early stopping, the learning-rate drops and the best checkpoint follow the validation CE for every
@@ -17,7 +18,13 @@ arcface:
 
 training:
   batch_size: 32
-  epochs: 30              # a cap, not a target: early stopping normally ends the run before it
+  epochs: 40              # a cap, not a target: early stopping ends the run (the one setting that differs from
+                          # cross_session.yml's 30). The baseline cs_s1 (21 Nov) needed it: best epoch 22,
+                          # stopped by early stopping at 27, learning rate at its floor. The new heads start
+                          # slower (22 Nov smoke run, epoch 2 on 20 classes: attn 0.23, attn_mask 0.45, gap 0.61
+                          # test accuracy), so a cap of 30 could end them before they converge, which would
+                          # compare an unfinished model with a finished baseline. 40 only costs epochs a run
+                          # actually uses; report epochs_run and stopped_early for every model
   learning_rate: 0.0001   # unchanged from baseline.yml
   early_stop_patience: 5  # stop after 5 epochs without a lower val_loss...
   early_stop_restore_best: true   # ...and go back to the weights of the best epoch (03 also reloads the

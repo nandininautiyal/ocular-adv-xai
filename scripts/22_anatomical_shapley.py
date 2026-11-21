@@ -84,8 +84,12 @@ Sampling baselines (src/xai/part_baselines.py; numpy only, no shap or lime packa
                              shap) and LIME (uniform samples, kernel sqrt(exp(-d^2 / 0.25^2)) of the
                              cosine distance to the full coalition, ridge alpha 1) on the SAME part
                              players, hiding baselines (--baseline-hiding, default all of --baselines)
-                             and score as ASA, with --baseline-samples coalitions (default 16 = half of
-                             the 32; KernelSHAP's budget includes the empty and the full coalition).
+                             and score as ASA, with half of the 2^P coalitions of the image's present
+                             parts, at most --baseline-samples (default 16 = half of the 32 when all five
+                             parts are present; src/xai/part_baselines.part_budget). A fixed 16 would be
+                             all 2^4 coalitions of the images without a brow, where KernelSHAP is exact
+                             and its error 0 by construction. KernelSHAP's budget includes the empty and
+                             the full coalition.
                              They run stand-alone (their own coalition images and forward passes), so
                              their run time is measured, and their error against exact ASA on the same
                              game is a result (23: sampling_error.csv).
@@ -260,7 +264,7 @@ from src.xai.attribution import XAI_REGISTRY  # noqa: E402
 from src.xai.seg_masks import load_mask_file  # noqa: E402
 from src.xai.part_baselines import (DEFAULT_PART_SAMPLES, DEFAULT_PATCH, DEFAULT_PIXEL_SAMPLES,  # noqa: E402
                                     ESTIMATORS, LIME_ALPHA, LIME_KERNEL_WIDTH, aggregate_to_parts, design,
-                                    evaluated, fit, pairwise_js, patch_map, patch_part_shares,
+                                    evaluated, fit, pairwise_js, part_budget, patch_map, patch_part_shares,
                                     player_map_from_masks, player_value_map, sampled_outputs, upsample_map)
 from src.xai.shapley import (DEFAULT_GROUPS, DEFAULT_WORKERS, METHODS, asa_order, canonical_indices,  # noqa: E402
                              coalition_images, deletion_from_values, exact_shapley, format_groups, group_masks,
@@ -513,7 +517,8 @@ class Context:
             for est in self.part_estimators:
                 if not len(players):
                     continue
-                plan = design(est, len(players), part_samples, [seed, int(row["image_id"]), PLAN_SEEDS[(est, "parts")]])
+                plan = design(est, len(players), part_budget(len(players), part_samples),
+                              [seed, int(row["image_id"]), PLAN_SEEDS[(est, "parts")]])
                 rows = evaluated(est, plan)
                 full = np.zeros((len(rows), len(present)), bool)
                 full[:, players] = rows
@@ -1054,7 +1059,8 @@ def main(argv=None):
                     help="hiding baselines (of --baselines) used by the part baselines (default: all of them; "
                          "each runs stand-alone, so with inpaint it adds the inpainting of its coalitions)")
     ap.add_argument("--baseline-samples", type=int, default=DEFAULT_PART_SAMPLES,
-                    help="coalitions per part baseline, image, condition and hiding baseline (KernelSHAP: the "
+                    help="cap of the coalitions per part baseline, image, condition and hiding baseline: half "
+                         "of the 2^P coalitions of the image's present parts, at most this (KernelSHAP: the "
                          "empty and the full one included; 16 = half of the 2^5 coalitions)")
     ap.add_argument("--pixel-baselines", default="kernelshap,lime",
                     help="the same estimators on square patches, aggregated to the parts by pixel share "
@@ -1371,6 +1377,10 @@ def main(argv=None):
                "rows_per_target_kind": {k: int(v) for k, v in Counter(rows.target_kind).items()},
                "part_baselines": {
                    "estimators": part_estimators, "samples": args.baseline_samples, "hiding": part_hiding,
+                   "budget": "half of the 2^P coalitions of the image's present parts, at most samples, at "
+                             "least 2 (src/xai/part_baselines.part_budget)",
+                   "budget_by_present_parts": {str(p): part_budget(p, args.baseline_samples)
+                                               for p in range(1, len(groups) + 1)},
                    "kernelshap": "Shapley kernel; sizes enumerated as in shap's KernelExplainer while the budget "
                                  "covers them, the rest sampled by kernel mass with complements, without "
                                  "replacement; efficiency enforced by eliminating one player (as shap); the "
