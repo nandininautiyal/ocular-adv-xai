@@ -241,3 +241,54 @@ def test_fields_the_notebook_reads_are_written_by_the_scripts(tmp_path):
     assert not absent("scripts/03_train_baseline.py", ["test_acc_margin_free", "images_by_phase"])
     if '"--resume"' in source("scripts/03_train_baseline.py"):
         assert not absent("scripts/03_train_baseline.py", ns["RUN_KEYS"] + ["minutes_all_sessions"])
+
+
+def _fake_raw_manifest(path):
+    """manifest_raw.csv (01's columns) of 3 paper classes and one open-set subject, with frames 1010+ in both phases."""
+    rows = []
+    for subject in (1141, 1142, 1143, 4000):
+        for condition in ("iphone_day_light_short", "oppo_dim_light_short"):
+            for eye in ("left", "right"):
+                for phase, frames in (("enrollment", (1001, 1002, 1003, 1010, 1011)),
+                                      ("verification", (1001, 1002, 1010))):
+                    for idx in frames:
+                        rows.append({"relpath": f"{condition}/{phase}_{eye}_eye/{subject}/{subject}_{idx}_{eye[0]}_c.png",
+                                     "subject": subject, "idx": idx, "eye": eye, "phase": phase,
+                                     "condition": condition})
+    import pandas as pd
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+@pytest.mark.parametrize("max_frame", [1009, None])
+def test_split_checks_accept_the_split_02_writes(tmp_path, monkeypatch, max_frame):
+    """The notebook's split checks (cell 5) pass on the split that 02 writes with the notebook's own --max-frame:
+    the images left out above MAX_FRAME must not count as missing from the split."""
+    import sys
+    spec = importlib.util.spec_from_file_location("split02", os.path.join(REPO, "scripts", "02_make_splits.py"))
+    split02 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(split02)
+    ns = _helpers(tmp_path)
+    ns.update(W=str(tmp_path), SPLITS=str(tmp_path / "splits"), CS_MANIFEST=str(tmp_path / "cs.csv"),
+              MAX_FRAME=max_frame)
+    exec(_cell(5), ns)
+    _fake_raw_manifest(tmp_path / "manifest_raw.csv")
+    monkeypatch.setattr(os, "symlink", lambda src, dst: open(dst, "w").close())
+    argv = ["02", "--manifest", str(tmp_path / "manifest_raw.csv"), "--root", str(tmp_path / "data"),
+            "--protocol", "cross_session", "--out-dir", str(tmp_path / "tree"), "--out-manifest", ns["CS_MANIFEST"],
+            "--write-split-csvs", ns["SPLITS"]] + ([] if max_frame is None else ["--max-frame", str(max_frame)])
+    monkeypatch.setattr(sys, "argv", argv)
+    split02.main()
+    if max_frame is not None:
+        import pandas as pd
+        assert pd.read_csv(ns["CS_MANIFEST"]).idx.max() <= max_frame        # 02 really left the late frames out
+    checks = ns["run_checks"]((ns["checks_split"], ns["CS_MANIFEST"], 3), (ns["checks_split_csvs"],))
+    failed = [(name, detail) for name, ok, detail, hard in checks if hard and not ok]
+    assert not failed, failed
+
+
+def test_version_checks_accept_the_kaggle_image():
+    """Kaggle's image moved to TensorFlow 2.21 (tf-keras 2.20.1 still installs and trained cs_s0 on it, 18 Nov):
+    the pre-flight and the 03 checks accept TF 2.20 and 2.21 with tf-keras 2.20.1, nothing else."""
+    for number in (5, 6):
+        src = _cell(number)
+        assert "('2.20.', '2.21.')" in src, f"cell {number} still demands TensorFlow 2.20 only"
