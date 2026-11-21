@@ -597,7 +597,9 @@ def test_runtime_and_js_columns(fu_run):
     true = rows[rows.target == "true"]
     lid = true.present_lid.astype(bool)
     assert (true.nfwd_asa[lid] == 32).all() and (true.nfwd_asa[~lid] == 16).all()
-    assert (true.nfwd_kernelshap_parts == 16).all() and (true.nfwd_lime_parts <= 16).all()
+    # half of the present parts' coalitions: 16 of 32 with five parts, 8 of 16 with four (not all 16 of them)
+    assert (true.nfwd_kernelshap_parts[lid] == 16).all() and (true.nfwd_kernelshap_parts[~lid] == 8).all()
+    assert (true.nfwd_lime_parts[lid] <= 16).all() and (true.nfwd_lime_parts[~lid] <= 8).all()
     pix = true.time_kernelshap_pixels.notna()
     assert (true.nfwd_kernelshap_pixels[pix] == 24).all() and (true.nfwd_lime_pixels[pix] <= 24).all()
     assert (true.nfwd_layercam == 1).all() and (true.nfwd_eigencam == 1).all()
