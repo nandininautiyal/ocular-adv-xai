@@ -5,6 +5,7 @@ The network is replaced by a colour classifier on drawn eyes, so the geometry
 mapping, the mask file, the metrics and the labelling helpers are all checked
 exactly. One optional test runs the real model if PyTorch and the weights exist.
 """
+import hashlib
 import importlib.util
 import json
 import os
@@ -417,6 +418,71 @@ def test_fetch_weights_reuses_only_a_matching_file(tmp_path):
     assert sm.fetch_weights(str(tmp_path), url="http://invalid.invalid/x", sha256=digest) == str(path)
     with pytest.raises(ValueError):
         sm.fetch_weights(str(tmp_path), url="http://invalid.invalid/x", sha256="0" * 64)
+
+
+def test_fetch_weights_is_safe_when_several_processes_download_at_once(tmp_path, monkeypatch):
+    """train_anatomy.ipynb starts 21 and 17 at the same moment. With one shared .part file both failed on
+    22 Nov (one found the file gone, the other a mix of two downloads). Every download now has its own
+    temporary file: the writers below all write half, wait for each other, then write the rest."""
+    import threading
+    data = bytes(range(256)) * 4096                                   # 1 MiB of "weights"
+    digest = hashlib.sha256(data).hexdigest()
+    n = 4
+    barrier = threading.Barrier(n)
+
+    def fake_download(url, filename):
+        with open(filename, "wb") as f:
+            f.write(data[:len(data) // 2])
+            f.flush()
+            barrier.wait(timeout=10)                                  # every download is half done
+            f.write(data[len(data) // 2:])
+        return filename, None
+
+    monkeypatch.setattr(sm.urllib.request, "urlretrieve", fake_download)
+    results, errors = [], []
+
+    def fetch():
+        try:
+            results.append(sm.fetch_weights(str(tmp_path), url="http://x/combine.pth", sha256=digest))
+        except Exception as err:                                      # noqa: BLE001 - collected for the assert
+            errors.append(err)
+
+    threads = [threading.Thread(target=fetch) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors and results == [str(tmp_path / "combine.pth")] * n
+    assert sm.file_sha256(tmp_path / "combine.pth") == digest
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["combine.pth"]          # no temporary file left
+
+
+def test_fetch_weights_retries_and_then_says_why(tmp_path, monkeypatch):
+    import urllib.error
+    data = b"weights"
+    digest = hashlib.sha256(data).hexdigest()
+    calls = []
+
+    def flaky(url, filename):
+        calls.append(filename)
+        if len(calls) == 1:
+            raise urllib.error.URLError("connection reset")
+        with open(filename, "wb") as f:
+            f.write(b"truncated" if len(calls) == 2 else data)
+        return filename, None
+
+    monkeypatch.setattr(sm.urllib.request, "urlretrieve", flaky)
+    path = sm.fetch_weights(str(tmp_path), url="http://x/w", sha256=digest, filename="w.pth", retry_wait=0)
+    assert path == str(tmp_path / "w.pth") and len(calls) == 3 and len(set(calls)) == 3
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["w.pth"]
+
+    def broken(url, filename):
+        raise urllib.error.URLError("no Internet")
+
+    monkeypatch.setattr(sm.urllib.request, "urlretrieve", broken)
+    with pytest.raises(ValueError, match="2 attempt"):
+        sm.fetch_weights(str(tmp_path / "other"), url="http://x/w", sha256=digest, attempts=2, retry_wait=0)
+    assert list((tmp_path / "other").iterdir()) == []
 
 
 def test_model_loading_without_torch_says_what_is_missing(monkeypatch):

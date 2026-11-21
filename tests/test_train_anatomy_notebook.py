@@ -266,6 +266,21 @@ def test_plan_puts_the_mask_models_after_the_masks(tmp_path):
     assert chains == {0: ["03_gap"], 1: []} and load == {0: 1.0, 1: 0.0}
 
 
+def test_preflight_fetches_the_eye_mask_weights_where_17_and_21_look():
+    """Pre-flight downloads combine.pth once, into the --weights-dir default of 17 and 21, so the two mask jobs
+    that start together find it instead of downloading it at the same moment (22 Nov: both failed)."""
+    [cell] = [s for s in ("".join(c["source"]) for c in _cells()) if "pre-flight ok" in s and "fetch_weights" in s]
+    default = "os.path.join(os.path.expanduser('~'), '.cache', 'periorbital')"
+    assert f"sm.fetch_weights({default})" in cell
+    for script in ("scripts/17_make_eye_masks.py", "scripts/21_make_train_masks.py"):
+        with open(os.path.join(REPO, script), encoding="utf-8") as f:
+            assert 'default=os.path.join(os.path.expanduser("~"), ".cache", "periorbital")' in f.read()
+    assert cell.index("fetch_weights") < cell.index("pre-flight ok")
+    # Xception's ImageNet weights too (Keras writes them straight into their final file)
+    assert "tf.keras.applications.Xception(include_top=False, weights='imagenet'" in cell
+    assert cell.index("applications.Xception") < cell.index("pre-flight ok")
+
+
 def test_plan_finds_the_shortest_split(tmp_path):
     """The estimates of the 22 Nov smoke run (21 1.3 h; attn 4.7, gap 7.9, attn_mask 8.7 h with 24): the greedy
     split (mask-free models first, each to the GPU that frees up first) gave 13.4 h on the longer GPU; the best
