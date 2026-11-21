@@ -14,8 +14,10 @@ module implements both estimators with numpy only (no shap, lime or skimage),
 on two kinds of players:
 
 - part players: the same anatomical groups, hiding methods and score as ASA, with
-  a budget of coalitions (``--baseline-samples`` in scripts/22, default 16 = half
-  of the 32), so their error against exact ASA measures what sampling costs;
+  a budget of half the 2^P coalitions of the image's present parts, at most
+  ``--baseline-samples`` in scripts/22 (default 16 = half of the 32 when all five
+  parts are present; :func:`part_budget`), so their error against exact ASA
+  measures what sampling costs;
 - pixel players: a square grid of patches (default 32 px, 8 x 8 = 64 players),
   the conventional pixel-level explanation, hidden with the same method and
   aggregated to parts afterwards (:func:`patch_part_shares`): the attribution of
@@ -88,9 +90,26 @@ from src.xai.shapley import DEFAULT_WORKERS, hide, make_cache, model_outputs, ou
 ESTIMATORS = ("kernelshap", "lime")
 LIME_KERNEL_WIDTH = 0.25      # lime_image's default for its default (cosine) distance
 LIME_ALPHA = 1.0              # lime's default Ridge(alpha=1)
-DEFAULT_PART_SAMPLES = 16     # half of the 2^5 = 32 coalitions of the default groups
+DEFAULT_PART_SAMPLES = 16     # cap of part_budget: half of the 2^5 = 32 coalitions of the default groups
 DEFAULT_PIXEL_SAMPLES = 500
 DEFAULT_PATCH = 32            # pixels: 8 x 8 = 64 patch players on a 256 x 256 image
+
+
+def part_budget(n_present, cap=DEFAULT_PART_SAMPLES):
+    """Coalitions of a part baseline on an image with *n_present* part players: half of their 2^n
+    coalitions, at most *cap*, and at least 2 (the empty and the full one).
+
+    A fixed budget of 16 is half of the 2^5 coalitions only when all five parts are present. Without
+    a brow (most VISOB images) four parts play, 16 is all 2^4 of their coalitions, and KernelSHAP then
+    returns the exact Shapley values (Lundberg & Lee 2017, Theorem 2): its error against ASA would be 0
+    by construction, not a measurement. Half of the present players' coalitions keeps the sampling
+    baselines at the same relative budget on every image. With one player (2 coalitions) every
+    estimator is exact anyway.
+    """
+    n = int(n_present)
+    if n < 1:
+        raise ValueError(f"need at least one present part, got {n}")
+    return max(2, min(int(cap), (1 << n) // 2))
 
 
 # ---------------------------------------------------------------------------

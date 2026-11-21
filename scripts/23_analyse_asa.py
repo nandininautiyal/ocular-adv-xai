@@ -930,9 +930,12 @@ def _report_fu(tables, summary, args):
     if len(err):
         t = err[(err.target == "true") & err.condition.isin(["clean", "attack", "all"])]
         part, pixel = summary.get("part_baselines", {}), summary.get("pixel_baselines", {})
+        budget = (f"half of the 2^P coalitions of the image's present parts, at most {part.get('samples', '?')}, "
+                  "instead of all 2^P of the exact game" if part.get("budget") else
+                  f"{part.get('samples', '?')} coalitions per explanation instead of all 2^P of the exact game; "
+                  "with 4 present parts this is all 2^4 coalitions and KernelSHAP is exact by construction")
         lines += ["## Sampling baselines against exact ASA (true class)", "",
-                  f"KernelSHAP and LIME on the same part players, hiding baselines and score "
-                  f"({part.get('samples', '?')} coalitions per explanation instead of all 2^P of the exact game), "
+                  f"KernelSHAP and LIME on the same part players, hiding baselines and score ({budget}), "
                   f"and on {pixel.get('patch_size', '?')} px patches ({pixel.get('samples', '?')} coalitions) "
                   "aggregated to the parts by pixel share. Error against exact ASA on the same game: MAE (units of "
                   "the score), relative MAE (MAE / mean |phi| of the row), rank agreement (Spearman over present "

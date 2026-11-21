@@ -566,14 +566,14 @@ def test_sampling_baseline_columns(fu_run):
     """The part baselines play the same game as ASA: their values equal the estimators run on the row's own
     coalition values (looked up), with the same seeded coalitions; the pixel baselines are on clean and attack
     rows with the blur baseline only."""
-    from src.xai.part_baselines import from_game
+    from src.xai.part_baselines import from_game, part_budget
     rows = fu_run["rows"]
     cls = rows[rows.target.isin(["true", "pred"])]
     values = cls[[f"value_{k}" for k in range(32)]].to_numpy()
     present = cls[[f"present_{g}" for g in GROUPS]].to_numpy(bool)
     for estimator, code in (("kernelshap", 1), ("lime", 2)):
         got = cls[[f"{estimator}_parts_{g}" for g in GROUPS]].to_numpy()
-        want = np.stack([from_game(estimator, v, 16, seed=[3, int(i), code], present=p)
+        want = np.stack([from_game(estimator, v, part_budget(p.sum(), 16), seed=[3, int(i), code], present=p)
                          for v, i, p in zip(values, cls.image_id, present)])
         np.testing.assert_allclose(got, want, atol=2e-3)
     ks = cls[[f"kernelshap_parts_{g}" for g in GROUPS]].to_numpy()
@@ -586,6 +586,7 @@ def test_sampling_baseline_columns(fu_run):
     assert has[(cls.baseline == "blur") & cls.condition.isin(["clean", "attack"])].all()
     summary = fu_run["summary"]
     assert summary["part_baselines"]["samples"] == 16 and summary["pixel_baselines"]["n_patches"] == 64
+    assert summary["part_baselines"]["budget_by_present_parts"] == {"1": 2, "2": 2, "3": 4, "4": 8, "5": 16}
     assert summary["pixel_baselines"]["hiding"] == ["blur"]
 
 

@@ -245,8 +245,16 @@ def test_plan_puts_the_mask_models_after_the_masks(tmp_path):
     steps = chains[0] + chains[1]
     assert sorted(steps) == sorted(["21_full"] + [s for _, names, _ in jobs for s in names])
     assert chains[0][0] == "21_full"
-    # mask-free models start right away on GPU 1; no mask model's hours are counted before the masks exist
-    assert chains[1][:3] == ["03_attn", "04_attn", "15_attn"]
+    # each GPU runs its mask-free models first; no mask model's hours are counted before the masks exist
+    hours = {a: h for a, _, h in jobs}
+    for g, names in chains.items():
+        archs = [n[3:] for n in names if n.startswith("03_")]
+        mask = [a in ns["MASK_ARCHS"] for a in archs]
+        assert mask == sorted(mask)
+        t = 2.0 if g == 0 else 0.0
+        for a in archs:
+            t = max(t, 2.0 if a in ns["MASK_ARCHS"] else 0.0) + hours[a]
+        assert load[g] == pytest.approx(t)
     total = 2.0 + sum(h for _, _, h in jobs)
     assert max(load.values()) <= total / 2 + 3.0 and min(load.values()) >= 2.0
     for g, names in chains.items():                                   # each model's steps stay in order on one GPU
@@ -256,6 +264,21 @@ def test_plan_puts_the_mask_models_after_the_masks(tmp_path):
                 assert names[i:i + 3] == model_steps
     chains, load = ns["plan_chains"]([("gap", ["03_gap"], 1.0)], [], 0.0)
     assert chains == {0: ["03_gap"], 1: []} and load == {0: 1.0, 1: 0.0}
+
+
+def test_plan_finds_the_shortest_split(tmp_path):
+    """The estimates of the 22 Nov smoke run (21 1.3 h; attn 4.7, gap 7.9, attn_mask 8.7 h with 24): the greedy
+    split (mask-free models first, each to the GPU that frees up first) gave 13.4 h on the longer GPU; the best
+    split is 21 + attn_mask on one GPU and attn + gap on the other, 12.6 h. More than 12 jobs: longest first."""
+    ns = _helpers(tmp_path, ARCHS=["attn_mask", "attn", "gap"])
+    jobs = [("attn", ["03_attn"], 4.7), ("gap", ["03_gap"], 7.9), ("attn_mask", ["03_attn_mask"], 8.7)]
+    chains, load = ns["plan_chains"](jobs, ["21_full"], 1.3)
+    assert chains == {0: ["21_full", "03_attn_mask"], 1: ["03_attn", "03_gap"]}
+    assert load[0] == pytest.approx(10.0) and load[1] == pytest.approx(12.6)
+    many = [(f"gap{i}", [f"03_gap{i}"], 1.0 + i % 3) for i in range(13)]
+    chains, load = ns["plan_chains"](many, [], 0.0)
+    assert sorted(chains[0] + chains[1]) == sorted(s for _, names, _ in many for s in names)
+    assert abs(load[0] - load[1]) <= 3.0 and sum(load.values()) == pytest.approx(sum(h for *_, h in many))
 
 
 def test_results_zip_keeps_no_checkpoint_mask_or_image(tmp_path):
@@ -329,7 +352,7 @@ def test_fields_the_notebook_reads_are_written_by_the_scripts(tmp_path):
 
 
 @pytest.mark.parametrize("settings", SETTINGS + [{"MASKING_ARCHS": ["parts"], "ASA_VERIF_PAIRS": False,
-                                                  "ASA_BASELINE_HIDING": None,
+                                                  "ASA_BASELINE_HIDING": None, "MASKING_MAX_IMAGES": None,
                                                   "ASA_ATTACKS": "fgsm,pgd,aas_pgd,bpda_pgd"}])
 def test_masking_check_and_the_asa_flags(settings):
     """24 runs on the smoke and the full model (seed SEEDS[0]) of every arch of MASKING_ARCHS that is trained, on
@@ -351,7 +374,9 @@ def test_masking_check_and_the_asa_flags(settings):
             assert a24["--tag"] == t and a24["--out-dir"] == ns["MASKING"]
             assert ns["NEEDS"][f"24_{t}"] == [f"04_{t}"]
             if full:
-                assert a24["--per-class"] == "1" and "--max-images" not in a24
+                assert a24["--per-class"] == "1"
+                assert a24.get("--max-images") == (str(ns["MASKING_MAX_IMAGES"]) if ns["MASKING_MAX_IMAGES"]
+                                                   else None)
             else:
                 assert a24["--max-images"] == str(ns["MASKING_SMOKE_IMAGES"]) and "--per-class" not in a24
             assert not [k for k in a24 if k.endswith(("-grid", "-levels", "steps", "restarts", "--taus", "--levels"))]
@@ -413,8 +438,13 @@ def test_masking_estimate_per_batch():
     import ast
     tree = ast.parse(_cell(11))
     [fn] = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "masking_hours"]
-    ns = {"N_CLASSES": 300}
+    ns = {"N_CLASSES": 300, "MASKING_MAX_IMAGES": 100}
     exec(compile(ast.Module(body=[fn], type_ignores=[]), "cell11", "exec"), ns)
+    capped = {"seconds_per_batch": 360.0, "seconds_per_image": 22.5, "n_images": 16, "batch_size": 16}
+    assert ns["masking_hours"](capped) == pytest.approx((360.0 * 7 + 300) / 3600)     # 100 images = 7 batches
+    assert ns["masking_hours"]({"seconds_per_image": 10.0, "n_images": 4}) == pytest.approx((10.0 * 100 + 300) / 3600)
+    assert _namespace()["MASKING_MAX_IMAGES"] == 100
+    ns["MASKING_MAX_IMAGES"] = None                                     # every class
     full = {"seconds_per_batch": 360.0, "seconds_per_image": 22.5, "n_images": 16, "batch_size": 16}
     assert ns["masking_hours"](full) == pytest.approx((360.0 * 19 + 300) / 3600)
     partial = dict(full, n_images=4, seconds_per_batch=300.0, seconds_per_image=75.0)
