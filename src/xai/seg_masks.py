@@ -56,6 +56,8 @@ import json
 import math
 import os
 import re
+import tempfile
+import time
 import urllib.request
 
 import cv2
@@ -320,10 +322,17 @@ def file_sha256(path, chunk_size=1 << 20):
     return digest.hexdigest()
 
 
-def fetch_weights(dest_dir, url=WEIGHTS_URL, sha256=WEIGHTS_SHA256, filename=WEIGHTS_FILE):
+def fetch_weights(dest_dir, url=WEIGHTS_URL, sha256=WEIGHTS_SHA256, filename=WEIGHTS_FILE, attempts=3,
+                  retry_wait=5.0):
     """Path to the pinned weights file, downloading it into *dest_dir* if needed.
 
-    The file is checked against *sha256* before it is used; a mismatch raises.
+    The file is checked against *sha256* before it is used; a file already in *dest_dir* with another
+    sha256 raises. Safe when several processes fetch at once (train_anatomy.ipynb starts 21 and 17 on two
+    GPUs at the same moment): each download goes to its own temporary file in *dest_dir* and is moved
+    into place atomically only after its sha256 matches, so no process reads or replaces another one's
+    half-written file. (A shared ``combine.pth.part`` made both jobs fail on 22 Nov: one found the file
+    gone, the other a mix of two downloads.) A failed download or a mismatch is tried again, *attempts*
+    times in all, *retry_wait* x attempt seconds apart, before it raises.
     """
     path = os.path.join(dest_dir, filename)
     if os.path.exists(path):
@@ -332,14 +341,27 @@ def fetch_weights(dest_dir, url=WEIGHTS_URL, sha256=WEIGHTS_SHA256, filename=WEI
         raise ValueError(f"{path} exists but its sha256 is not the pinned {sha256}; delete it or pass the "
                          f"right file")
     os.makedirs(dest_dir, exist_ok=True)
-    partial = path + ".part"
-    urllib.request.urlretrieve(url, partial)
-    digest = file_sha256(partial)
-    if digest != sha256:
-        os.remove(partial)
-        raise ValueError(f"downloaded {url} has sha256 {digest}, expected {sha256}")
-    os.replace(partial, path)
-    return path
+    error = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        fd, partial = tempfile.mkstemp(prefix=f"{filename}.", suffix=".part", dir=dest_dir)
+        os.close(fd)
+        try:
+            urllib.request.urlretrieve(url, partial)
+            digest = file_sha256(partial)
+            if digest == sha256:
+                os.replace(partial, path)
+                return path
+            error = ValueError(f"downloaded {url} has sha256 {digest}, expected {sha256}")
+        except OSError as err:                    # network errors (urllib's URLError is an OSError)
+            error = err
+        finally:
+            if os.path.exists(partial):
+                os.remove(partial)
+        if os.path.exists(path) and file_sha256(path) == sha256:     # another process finished meanwhile
+            return path
+        if attempt < attempts:
+            time.sleep(retry_wait * attempt)
+    raise ValueError(f"could not fetch {url} with sha256 {sha256} in {attempts} attempt(s): {error}") from error
 
 
 def build_periorbital_model(aux_loss=True):

@@ -14,7 +14,7 @@ from src.xai.shapley import (DEFAULT_GROUPS, METHODS, asa, asa_order, canonical_
                              coalition_outputs, deletion_curve, deletion_from_values, exact_shapley,
                              format_groups, group_masks, groups_from_config, hide, make_cache,
                              normalise_groups, order_from_scores, parse_groups, part_masses, rank_agreement,
-                             score_values, shapley_interactions)
+                             score_values, shapley_interactions, shift_part)
 
 CLASSES = ("skin", "iris", "sclera", "lid", "caruncle", "brow")
 GROUP_NAMES = ("iris", "sclera", "lid", "brow", "skin")
@@ -189,6 +189,33 @@ def test_group_masks():
         group_masks(labels, CLASSES, {"pupil": ["pupil"]})
     with pytest.raises(ValueError):
         group_masks(np.full((4, 4), 9, np.uint8), CLASSES, DEFAULT_GROUPS)
+
+
+def test_shift_part_moves_one_parts_edge():
+    """22 --shift-part: a part grows over its neighbours (they take its class) or shrinks (its edge pixels take the
+    class of the nearest other labelled pixel); unknown pixels never change; 0 changes nothing."""
+    labels = eye_labels(1)[0].copy()
+    labels[16:24] = 3                                                     # a lid band under the brow (rows 0-15)
+    below = labels[24:26].copy()
+    grown = shift_part(labels, CLASSES, DEFAULT_GROUPS, "lid", 2)
+    assert (grown[14:16] == 3).all() and (grown[16:24] == 3).all()        # the brow's last 2 rows became lid
+    np.testing.assert_array_equal(grown[24:26], np.where(below == 255, 255, 3))
+    assert (grown[:14] == labels[:14]).all() and (grown[26:] == labels[26:]).all()
+    shrunk = shift_part(labels, CLASSES, DEFAULT_GROUPS, "lid", -2)
+    assert (shrunk[16:18] == 5).all() and (shrunk[18:22] == 3).all()      # the top 2 lid rows took the brow's class
+    np.testing.assert_array_equal(shrunk[22:24], labels[[24, 24]])       # the bottom 2: the class of row 24 below
+    gone = shift_part(labels, CLASSES, DEFAULT_GROUPS, "lid", -8)         # 8 rows: every lid pixel within 4
+    assert not (gone == 3).any()
+    same = shift_part(labels, CLASSES, DEFAULT_GROUPS, "lid", 0)
+    np.testing.assert_array_equal(same, labels)
+    assert same is not labels and same.dtype == labels.dtype
+    everywhere = shift_part(labels, CLASSES, DEFAULT_GROUPS, "skin", 300)
+    np.testing.assert_array_equal(everywhere == 255, labels == 255)      # unknown pixels never change
+    sclera = shift_part(labels, CLASSES, DEFAULT_GROUPS, "sclera", 1)     # a two-class group keeps its classes
+    assert set(np.unique(sclera[sclera != labels])) <= {2, 4}
+    for bad in ("pupil", "caruncle"):                                     # groups, not mask classes
+        with pytest.raises(ValueError):
+            shift_part(labels, CLASSES, DEFAULT_GROUPS, bad, 2)
 
 
 @pytest.fixture(scope="module")
