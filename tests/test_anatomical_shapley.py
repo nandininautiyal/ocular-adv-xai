@@ -287,10 +287,29 @@ def test_inputs_are_checked_before_the_model_loads(script, inputs, tmp_path):
     with pytest.raises(SystemExit, match="pupil"):
         script.main(common(inputs, tmp_path / "x") + ["--groups", "iris=iris;pupil=pupil"])
     for bad in (["--attacks", "cw"], ["--baselines", "zero"], ["--levels", "0"], ["--levels", "1.5"],
-                ["--score", "prob"], ["--workers", "0"], ["--attacks", "bpda_pgd", "--defences", "none"]):
+                ["--score", "prob"], ["--workers", "0"], ["--attacks", "bpda_pgd", "--defences", "none"],
+                ["--shift-part", "pupil:2"], ["--shift-part", "lid"], ["--shift-part", "lid:two"]):
         with pytest.raises(SystemExit):
             script.main(common(inputs, tmp_path / "x") + bad)
     assert not (tmp_path / "x").exists()
+
+
+def test_shift_part_changes_only_the_masks(script, inputs, tmp_path):
+    """--shift-part lid:0 gives exactly the rows of a run without it; lid:-8 removes the 8-row lid band, so the lid
+    is absent everywhere; the setting is recorded in the summary (and so in the resume key)."""
+    cheap = ["--max-images", "5", "--levels", "1", "--attacks", "fgsm", "--defences", "none", "--part-baselines",
+             "none", "--pixel-baselines", "none", "--baselines", "blur", "--seed", "3", "--workers", "1"]
+    out = {}
+    for name, extra in (("plain", []), ("zero", ["--shift-part", "lid:0"]), ("gone", ["--shift-part", "lid:-8"])):
+        script.main(common(inputs, tmp_path) + cheap + ["--tag", name] + extra)
+        out[name] = (pd.read_csv(tmp_path / f"rows_asa_{name}.csv"),
+                     json.loads((tmp_path / f"summary_asa_{name}.json").read_text()))
+    plain, zero, gone = (out[k][0] for k in ("plain", "zero", "gone"))
+    phi = [c for c in plain.columns if c.startswith("phi_")]
+    assert phi and len(plain) == len(zero) == len(gone)
+    pd.testing.assert_frame_equal(plain[phi], zero[phi])
+    assert out["plain"][1]["group_presence"]["lid"] > 0 and out["gone"][1]["group_presence"]["lid"] == 0
+    assert out["gone"][1]["args"]["shift_part"] == "lid:-8" and out["plain"][1]["args"]["shift_part"] is None
 
 
 def test_groups_from_a_config_file(script, tmp_path):

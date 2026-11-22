@@ -71,7 +71,15 @@ def _args(cmd):
 
 SETTINGS = [{}, {"RUN_FULL": True, "PREVIOUS_OUTPUT": "/kaggle/input/earlier"},
             {"ARCHS": ["baseline", "gap", "parts"], "SEEDS": [1, 2], "MASK_LOSS_WEIGHT": 0.5, "ASA_MAX_IMAGES": 50},
-            {"BASELINE_CKPT": "/kaggle/input/cs/trained_models/Xception_ArcFace_cs_s1.keras", "ASA_ARCH": "attn_mask"}]
+            {"BASELINE_CKPT": "/kaggle/input/cs/trained_models/Xception_ArcFace_cs_s1.keras", "ASA_ARCH": "attn_mask"},
+            # the session after Run A: ASA on attn over the same images, 24 on the baseline, the lid-edge runs
+            {"BASELINE_CKPT": "/kaggle/input/cs/trained_models/Xception_ArcFace_cs_s1.keras", "ASA_ARCH": "attn_mask",
+             "ASA_EXTRA_ARCHS": ["attn"], "MASKING_BASELINE": True,
+             "ASA_SENSITIVITY": {"part": "lid", "pixels": 3, "max_images": 100}, "RUN_FULL": True,
+             "PREVIOUS_OUTPUT": "/kaggle/input/run-a"},
+            # training only (attnet_gate, whose three inputs 22 does not take)
+            {"ARCHS": ["attnet_gate"], "RUN_ASA": False, "MASKING_ARCHS": [], "ASA_PAIRED_ARCHS": [],
+             "RESUME_TEST_ARCH": "attnet_gate"}]
 
 
 def test_code_cells_parse():
@@ -136,8 +144,27 @@ def test_commands_follow_the_protocol(settings):
     assert a21["--csv"] == ns["MASK_LIST"] and a21["--splits"] == "train,validation,test,open_set"
     assert _args(cmd["21_smoke"])["--split-dir"] == ns["SMALL_TREE"]
     assert _args(cmd["17_pool"])["--csv"] == ns["ASA_POOL"]
-    names = ["mask"] + (["base"] if ns["BASE"] else [])
+    names = list(ns["ASA_MODELS"])
+    assert names == ["mask"] + (["base"] if ns["BASE"] else []) + settings.get("ASA_EXTRA_ARCHS", [])
     assert (ns["BASE"] is not None) == bool(settings.get("BASELINE_CKPT") or "baseline" in settings.get("ARCHS", []))
+    for a in settings.get("ASA_EXTRA_ARCHS", []):           # an extra arch: its own checkpoint, tag an_<arch>
+        assert _args(cmd[f"22_{a}"])["--ckpt"] == ns["ckpt"](ns["MODELS"], ns["tag"](a, ns["SEEDS"][0]))
+        assert _args(cmd[f"22_{a}"])["--tag"] == f"{ns['TAG']}_{a}"
+    sens = settings.get("ASA_SENSITIVITY")
+    assert any(k.startswith("22_sens_") for k in cmd) == bool(sens)
+    if sens:                                                # per model: the part shrunk, unchanged, grown
+        for n in names:
+            runs = [_args(cmd[f"22_sens_{n}_{v}"]) for v in ("minus", "zero", "plus")]
+            assert [r["--shift-part"] for r in runs] == [f"{sens['part']}:{k * sens['pixels']}" for k in (-1, 0, 1)]
+            assert len({r["--tag"] for r in runs}) == 3 and all(r["--resume"] is True for r in runs)
+            assert {tuple(r.get(k) for k in ("--ckpt", "--correct-csv", "--seed", "--per-class", "--max-images",
+                                             "--attacks", "--levels", "--defences")) for r in runs} ==                 {(_args(cmd[f"22_{n}"])["--ckpt"], ns["ASA_LIST"], "3", "1", str(sens["max_images"]), "pgd", "2",
+                  "none")}
+    assert ("24_base_ext" in cmd) == bool(settings.get("MASKING_BASELINE") and settings.get("BASELINE_CKPT"))
+    if "24_base_ext" in cmd:
+        a24 = _args(cmd["24_base_ext"])
+        assert a24["--ckpt"] == settings["BASELINE_CKPT"] and a24["--tag"] == "base_ext"
+        assert a24["--correct-csv"] == f"{_args(cmd['04_base_ext'])['--out-dir']}/correct_test_base_ext.csv"
     full22 = {n: _args(cmd[f"22_{n}"]) for n in names}
     for n, a in full22.items():
         smoke = _args(cmd[f"22_smoke_{n}"])
@@ -157,7 +184,8 @@ def test_commands_follow_the_protocol(settings):
     if settings.get("BASELINE_CKPT"):
         a = _args(cmd["04_base_ext"])
         assert a["--ckpt"] == settings["BASELINE_CKPT"] and a["--class-index"].endswith("/class_index_cs_s1.json")
-    default_asa = "parts" if "parts" in ns["ARCHS"] else "attn_mask"         # ASA_ARCH = 'auto' before cell 13
+    archs = ns["ARCHS"]                                                       # ASA_ARCH = 'auto' before cell 13
+    default_asa = "parts" if "parts" in archs else next((a for a in ("attn_mask", "parts") if a in archs), archs[0])
     assert ns["ASA_MASK_ARCH"] == settings.get("ASA_ARCH", default_asa)
     mf = f"--max-frame {ns['MAX_FRAME']}"                                    # the synthetic frames stay out
     assert ns["MAX_FRAME"] == 1009 and all(mf in cmd[k] for k in ("02_cross_session", "02_open_set", "02_small"))
@@ -397,10 +425,11 @@ def test_masking_check_and_the_asa_flags(settings):
             assert not [k for k in a24 if k.endswith(("-grid", "-levels", "steps", "restarts", "--taus", "--levels"))]
     for (arch, s), t in ns["FULL_TAGS"].items():
         assert (f"24_{t}" in cmd) == (arch in check and s == s0)
-    runs = [k for k in cmd if k.startswith("22_")]
+    runs = [k for k in cmd if k.startswith("22_") and not k.startswith("22_sens_")]   # sens: pgd at 2/255 only
     assert runs
     arch_of = {"22_smoke": ns["SMOKE_ASA_ARCH"], "22_smoke_mask": ns["ASA_MASK_ARCH"], "22_mask": ns["ASA_MASK_ARCH"],
-               "22_smoke_base": "baseline", "22_base": "baseline"}
+               "22_smoke_base": "baseline", "22_base": "baseline",
+               **{f"22{p}_{a}": a for a in ns["ASA_EXTRA_ARCHS"] for p in ("", "_smoke")}}
     for name in runs:
         a = _args(cmd[name])
         attention = arch_of[name] in ("attn", "attn_mask", "parts")
@@ -409,8 +438,10 @@ def test_masking_check_and_the_asa_flags(settings):
         assert a.get("--baseline-hiding") == ns["ASA_BASELINE_HIDING"]
         assert ("--verif-pairs" in a) == ns["ASA_VERIF_PAIRS"]
     defaults = _namespace()
-    assert "aas_pgd" in defaults["ASA_ATTACKS"].split(",") and defaults["ASA_VERIF_PAIRS"] is True
-    assert set(defaults["MASK_CHECK"]) == {"attn_mask", "gap"}                 # the minimum set (no parts yet)
+    assert {"aas_pgd", "bpda_pgd"} <= set(defaults["ASA_ATTACKS"].split(",")) and defaults["ASA_VERIF_PAIRS"] is True
+    assert set(defaults["MASK_CHECK"]) == {"attn_mask", "attn", "gap"}         # Run A: attn vs attn_mask needs both
+    assert defaults["ASA_PAIRED_ARCHS"] == ["attn"] and defaults["ASA_EXTRA_ARCHS"] == []
+    assert defaults["RUN_ASA"] is True and defaults["MASKING_BASELINE"] is False and defaults["ASA_SENSITIVITY"] is None
     # the masking check is one of a model's steps: planned and estimated with it, skipped once its summary exists
     assert "MODEL_STEPS" in _cell(11) and "EST['24_h']" in _cell(11)
     assert "'24': f'{MASKING}/summary_masking_{t}.json'" in _cell(12)
@@ -443,8 +474,9 @@ def test_aas_pgd_only_where_there_is_an_attention_pool(tmp_path):
                        "rows_per_target_kind": {"true_class": 1, "genuine": 1}}, f)
         return all(ok for _, ok, _, _ in ns["checks_asa"]("an_base"))
 
-    assert check(["fgsm", "pgd"], False) and check(["fgsm", "pgd", "aas_pgd"], True)
-    assert not check(["fgsm", "pgd", "aas_pgd"], False) and not check(["fgsm", "pgd"], True)
+    assert check(["fgsm", "pgd", "bpda_pgd"], False) and check(["fgsm", "pgd", "aas_pgd", "bpda_pgd"], True)
+    assert not check(["fgsm", "pgd", "aas_pgd", "bpda_pgd"], False) and not check(["fgsm", "pgd", "bpda_pgd"], True)
+    assert not check(["fgsm", "pgd"], False)                  # a run without the adaptive attack fails the check
 
 
 def test_masking_estimate_per_batch():
@@ -498,3 +530,79 @@ def test_masking_flags_warn_but_a_missing_or_foreign_summary_fails(tmp_path):
     with open(f"{ns['MASKING']}/summary_masking_{t}.json", "w") as f:
         json.dump(dict(summary, git_commit="1234567"), f)
     assert not ns["checks_masking"](t)[0][1]
+
+
+def _asa_cell(tmp_path, **overrides):
+    """Cells 2-4 for cell 13 (ASA), writing under tmp_path, with launch_all / wait / sh recorded instead of run."""
+    import pandas as pd
+    w = str(tmp_path)
+    base_ckpt = f"{w}/cs/trained_models/Xception_ArcFace_cs_s1.keras"
+    ns = _helpers(tmp_path, RUN_FULL=True, ASA_ARCH="attn_mask", W=w, MODELS=f"{w}/trained_models",
+                  EVAL=f"{w}/eval_clean", ASA=f"{w}/asa", ANALYSIS=f"{w}/analysis_asa", VERIF=f"{w}/verification",
+                  MASKING=f"{w}/masking", BASELINE_CKPT=base_ckpt, **overrides)
+    for folder in ("MODELS", "EVAL", "ASA", "MASKING"):
+        os.makedirs(ns[folder], exist_ok=True)
+    os.makedirs(os.path.dirname(base_ckpt), exist_ok=True)
+    for path in (ns["ckpt"](ns["MODELS"], "an_attn_mask_s1"), ns["ckpt"](ns["MODELS"], "an_attn_s1"), base_ckpt):
+        open(path, "w").close()
+    open(f"{ns['EVAL']}/summary_base_ext.json", "w").close()          # 04 on the baseline: done
+    # the pool: 6 classes x 2 images; every model classifies all correctly except attn, which misses 5_b
+    pool = pd.DataFrame({"relpath": [f"{c}_{k}.png" for c in range(6) for k in "ab"],
+                         "true_idx": [c for c in range(6) for _ in "ab"]})
+    pool.to_csv(ns["ASA_POOL"], index=False)
+    for t, frame in (("an_attn_mask_s1", pool), ("base_ext", pool), ("an_attn_s1", pool[pool.relpath != "5_b.png"])):
+        frame.to_csv(f"{ns['EVAL']}/correct_test_{t}.csv", index=False)
+    calls = {"launched": [], "sh": []}
+
+    def wait(chains, every=60, also=()):
+        return {step: 0 for steps in chains.values() for step in steps}
+    ns.update(EST={"04_h": 0.5, "22_min_per_image": 0.1, "24_h": {"attn_mask": 1.0}}, hours=lambda: 1.0, wait=wait,
+              launch_all=lambda chains: calls["launched"].append(chains) or chains,
+              sh=lambda cmd, check=True, gpu=None: calls["sh"].append(cmd) or 0)
+    return ns, calls
+
+
+def _finish(ns, *names):
+    for n in names:                   # 22 finished (summary, no resume folder) and 23's report written
+        open(f"{ns['ASA']}/summary_asa_an_{n}.json", "w").close()
+        os.makedirs(f"{ns['ANALYSIS']}/an_{n}", exist_ok=True)
+        open(f"{ns['ANALYSIS']}/an_{n}/report_asa.md", "w").close()
+
+
+def test_asa_images_are_paired_with_attn_and_a_later_session_runs_only_what_is_left(tmp_path):
+    """Run A chooses 22's images among those that attn (ASA_PAIRED_ARCHS) also classifies correctly, so the session
+    after Run A explains attn (ASA_EXTRA_ARCHS) on the very same images; it skips the finished 22 / 23 runs and
+    plans 22 on attn, 24 on the baseline (MASKING_BASELINE) and the lid-edge runs over both GPUs."""
+    import pandas as pd
+    run_a, calls = _asa_cell(tmp_path)                                  # Run A: 22 on the mask model and the baseline
+    exec(_cell(13), run_a)
+    chosen = pd.read_csv(run_a["ASA_LIST"])
+    assert sorted(chosen.relpath) == [f"{c}_{k}.png" for c in range(5) for k in "ab"]   # class 5 lost its template
+    [chains] = calls["launched"]
+    assert sorted(s for g in chains.values() for s in g) == ["22_base", "22_mask", "22_smoke_base", "22_smoke_mask"]
+    assert len([g for g in chains.values() if g]) == 2                  # one model per GPU
+    assert calls["sh"] == [run_a["CMD"]["23_mask"], run_a["CMD"]["23_base"]] or \
+        calls["sh"] == [run_a["CMD"]["23_base"], run_a["CMD"]["23_mask"]]
+    _finish(run_a, "mask", "base")
+
+    sens = {"part": "lid", "pixels": 3, "max_images": 100}
+    later, calls = _asa_cell(tmp_path, ASA_EXTRA_ARCHS=["attn"], MASKING_BASELINE=True, ASA_SENSITIVITY=sens)
+    exec(_cell(13), later)
+    pd.testing.assert_frame_equal(pd.read_csv(later["ASA_LIST"]), chosen)      # the same images as Run A
+    [chains] = calls["launched"]
+    steps = [s for g in chains.values() for s in g]
+    assert sorted(steps) == sorted(["22_smoke_attn", "22_attn", "24_base_ext"]
+                                   + [f"22_sens_{n}_{v}" for n in ("mask", "base", "attn")
+                                      for v in ("minus", "zero", "plus")])
+    gpu = next(g for g in chains.values() if "22_attn" in g)
+    assert gpu.index("22_smoke_attn") == gpu.index("22_attn") - 1 and later["NEEDS"]["22_attn"] == ["22_smoke_attn"]
+    assert all(later["A"][k] == 0 for k in ("22_mask", "23_mask", "22_base", "23_base"))   # not run again
+    assert calls["sh"] == [later["CMD"]["23_attn"]]                    # 04 on the baseline was done earlier
+
+    unpaired, _ = _asa_cell(tmp_path, ASA_PAIRED_ARCHS=[])               # without attn, class 5 would be in
+    exec(_cell(13), unpaired)
+    assert len(pd.read_csv(unpaired["ASA_LIST"])) == 12
+
+    training_only, calls = _asa_cell(tmp_path, RUN_ASA=False)
+    exec(_cell(13), training_only)
+    assert training_only["A"] == {} and calls == {"launched": [], "sh": []}

@@ -190,6 +190,38 @@ def group_masks(labels, class_names, groups):
     return masks
 
 
+def shift_part(labels, class_names, groups, part, pixels):
+    """The label map with the edge of part group *part* moved by *pixels* (Euclidean distance in mask pixels).
+
+    pixels > 0 grows the part: every labelled pixel of another class within that distance of the part takes the
+    class of the nearest part pixel. pixels < 0 shrinks it: every part pixel within that distance of a labelled
+    pixel of another class takes the class of the nearest such pixel. 0 changes nothing. Unknown pixels
+    (IGNORE_LABEL) never change and are never the nearest pixel. Used to test how much a part's attribution
+    depends on exactly where an imperfect mask puts the part's edge (22 --shift-part).
+    """
+    from scipy.ndimage import distance_transform_edt
+    groups = dict(normalise_groups(groups))
+    if part not in groups:
+        raise ValueError(f"no part group {part!r}; the groups are {list(groups)}")
+    class_names = [str(c) for c in class_names]
+    missing = [c for c in groups[part] if c not in class_names]
+    if missing:
+        raise ValueError(f"group {part!r}: classes {missing} are not in class_names {class_names}")
+    labels = np.asarray(labels)
+    out = labels.copy()
+    if int(pixels) == 0:
+        return out
+    inside = np.isin(labels, [class_names.index(c) for c in groups[part]])
+    other = (labels != IGNORE_LABEL) & ~inside
+    source, target = (inside, other) if pixels > 0 else (other, inside)
+    if not source.any() or not target.any():
+        return out
+    distance, (rows, cols) = distance_transform_edt(~source, return_indices=True)
+    change = target & (distance <= abs(int(pixels)))
+    out[change] = labels[rows[change], cols[change]]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Hiding
 # ---------------------------------------------------------------------------

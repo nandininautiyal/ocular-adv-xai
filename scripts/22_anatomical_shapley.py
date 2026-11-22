@@ -269,7 +269,8 @@ from src.xai.part_baselines import (DEFAULT_PART_SAMPLES, DEFAULT_PATCH, DEFAULT
 from src.xai.shapley import (DEFAULT_GROUPS, DEFAULT_WORKERS, METHODS, asa_order, canonical_indices,  # noqa: E402
                              coalition_images, deletion_from_values, exact_shapley, format_groups, group_masks,
                              groups_from_config, model_outputs, normalise_groups, order_from_scores,
-                             oriented_phi, parse_groups, part_masses, score_values, shapley_interactions)
+                             oriented_phi, parse_groups, part_masses, score_values, shapley_interactions,
+                             shift_part)
 
 from src.models.anatomy_model import attention_maps, model_arch, part_names, part_receipt  # noqa: E402
 
@@ -1027,6 +1028,11 @@ def main(argv=None):
     ap.add_argument("--groups", default=None,
                     help="part groups: a YAML config with anatomy.part_groups, or a spec such as "
                          f"'{format_groups(DEFAULT_GROUPS)}' (the default)")
+    ap.add_argument("--shift-part", default=None,
+                    help="PART:PIXELS, e.g. lid:3 or lid:-3: move the edge of that part group in every mask by that "
+                         "many mask pixels before anything is explained (grow > 0, shrink < 0, 0 = unchanged; "
+                         "src/xai/shapley.shift_part): how much do the attributions depend on exactly where an "
+                         "imperfect mask puts the edge")
     ap.add_argument("--data-root", default=None, help="VISOB root, used if link_path no longer exists")
     ap.add_argument("--per-class", type=int, default=1, help="images per class (1 = 300 images)")
     ap.add_argument("--max-images", type=int, default=None, help="smoke run: cap the number of images (e.g. 4)")
@@ -1162,6 +1168,15 @@ def main(argv=None):
     except (ValueError, OSError) as err:
         ap.error(f"--groups: {err}")
     names = [name for name, _ in groups]
+    shift = None
+    if args.shift_part is not None:
+        part, _, pixels = args.shift_part.partition(":")
+        try:
+            shift = (part.strip(), int(pixels))
+        except ValueError:
+            ap.error(f"--shift-part {args.shift_part!r}: expected PART:PIXELS, e.g. lid:3 or lid:-3")
+        if shift[0] not in names:
+            ap.error(f"--shift-part: no part group {shift[0]!r} (groups: {', '.join(names)})")
     if not os.path.isfile(args.masks):
         ap.error(f"--masks {args.masks}: no such file")
 
@@ -1194,6 +1209,11 @@ def main(argv=None):
     except ValueError as err:
         raise SystemExit(f"--groups do not fit the mask file: {err}")
     mask_labels = mask_file["labels"][[mask_file["index"][r] for r in df.relpath]]
+    if shift is not None:
+        before = mask_labels
+        mask_labels = np.stack([shift_part(lab, class_names, groups, *shift) for lab in mask_labels])
+        print(f"--shift-part {shift[0]}:{shift[1]}: {float((mask_labels != before).mean()):.4%} of the mask pixels "
+              f"changed class")
     templates = None
     if args.verif_pairs:
         try:
